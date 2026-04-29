@@ -128,7 +128,7 @@ class TestEpisodeStorage:
         cursor = conn.execute("SELECT * FROM facts WHERE subject = 'OwnerName'")
         row = cursor.fetchone()
         assert row is not None
-        assert "Southern California" in row[2]
+        assert "region" in row[2]
         conn.close()
 
     def test_patterns_table(self, memory_db):
