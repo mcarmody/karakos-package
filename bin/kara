@@ -150,7 +150,6 @@ def _tail(message_id: str, timeout: int, on_chunk):
     """Poll message_queue.response until processed != 0/1, streaming deltas."""
     deadline = time.monotonic() + timeout
     last_len = 0
-    last_status = 0
     db = _open_db_ro()
     try:
         while time.monotonic() < deadline:
@@ -164,7 +163,6 @@ def _tail(message_id: str, timeout: int, on_chunk):
                 if len(response) > last_len:
                     on_chunk(response[last_len:])
                     last_len = len(response)
-                last_status = processed
                 if processed == STATUS_COMPLETE:
                     return "complete"
                 if processed == STATUS_CRASHED:
@@ -265,8 +263,7 @@ def run_oneshot(content: str, agent: str, channel: str, timeout: int) -> int:
         sys.stdout.flush()
 
     status = _tail(message_id, timeout, on_chunk)
-    if not sys.stdout.isatty() or True:
-        sys.stdout.write("\n")
+    sys.stdout.write("\n")
     if status == "complete":
         return 0
     sys.stderr.write(f"[kara: {status}]\n")
