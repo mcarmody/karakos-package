@@ -27,6 +27,10 @@ export async function GET(request: NextRequest) {
   const encoder = new TextEncoder();
   const dbPath = join(WORKSPACE_ROOT, "data/memory/agent-server.db");
 
+  // Hoisted so cancel() can hit the same cleanup path as start() when
+  // the client disconnects mid-stream.
+  let cleanup: (reason: string) => Promise<void> = async () => {};
+
   const stream = new ReadableStream({
     async start(controller) {
       // Lazy-load to keep cold-start light.
@@ -34,7 +38,7 @@ export async function GET(request: NextRequest) {
       const { open } = await import("sqlite");
 
       // Single connection reused across polls — avoids file-handle churn
-      // and per-tick "open/close" cost. Closed in the cleanup() path.
+      // and per-tick "open/close" cost. Closed in cleanup().
       let db;
       try {
         db = await open({ filename: dbPath, driver: sqlite3.Database });
@@ -51,10 +55,15 @@ export async function GET(request: NextRequest) {
 
       const send = (payload: unknown) => {
         if (closed) return;
-        controller.enqueue(encoder.encode(`data: ${JSON.stringify(payload)}\n\n`));
+        try {
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(payload)}\n\n`));
+        } catch {
+          // Controller may be closed — caller has already disconnected.
+          // Cleanup will be triggered via the cancel handler.
+        }
       };
 
-      const cleanup = async (reason: "complete" | "crashed" | "timeout" | "error") => {
+      cleanup = async (_reason: string) => {
         if (closed) return;
         closed = true;
         if (pollHandle) clearInterval(pollHandle);
@@ -103,19 +112,15 @@ export async function GET(request: NextRequest) {
             await cleanup("crashed");
           } else if (processed === STATUS_SKIPPED) {
             send({ done: true, status: "skipped" });
-            await cleanup("complete");
+            await cleanup("skipped");
           } else {
             send({ done: true, status: `unknown:${processed}` });
-            await cleanup("complete");
+            await cleanup("unknown");
           }
         } catch (err) {
           if (closed) return;
           console.error("Stream poll error:", err);
-          try {
-            send({ done: true, status: "error", error: String(err) });
-          } catch {
-            // ignore
-          }
+          send({ done: true, status: "error", error: String(err) });
           await cleanup("error");
         } finally {
           polling = false;
@@ -132,6 +137,12 @@ export async function GET(request: NextRequest) {
 
       // Kick off an immediate first poll instead of waiting for the interval.
       void poll();
+    },
+
+    async cancel() {
+      // Client disconnected before we hit a terminal status — close the
+      // db handle and cancel the poll interval so we don't leak resources.
+      await cleanup("client-cancel");
     },
   });
 
