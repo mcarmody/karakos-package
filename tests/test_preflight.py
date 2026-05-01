@@ -477,6 +477,16 @@ class TestPortAvailable:
         assert "already in use" in result.stdout
         assert "3000" in result.stdout
 
+    def test_no_port_check_tools_warns(self, tmp_path):
+        """When neither ss nor lsof is available, emit warn instead of silently passing."""
+        mock = make_full_mock_bin(tmp_path, port_in_use=None)
+        (mock / "ss").unlink()  # Remove ss; lsof was never added
+        # Restrict PATH to mock_bin only so system ss/lsof cannot leak in
+        result = run(tmp_path, mock, extra_env={"PATH": str(mock)})
+        assert result.returncode == 0  # warn, not fail
+        assert "⚠ port_available" in result.stdout
+        assert "neither ss nor lsof" in result.stdout
+
 
 # =============================================================================
 # Check 8: disk_space

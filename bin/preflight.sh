@@ -349,6 +349,11 @@ _check_port_available() {
         ss -lnt 2>/dev/null | grep -q ":${port} " && in_use=true
     elif command -v lsof >/dev/null 2>&1; then
         lsof -i ":${port}" >/dev/null 2>&1 && in_use=true
+    else
+        _warn "port_available" \
+            "Cannot check port ${port}: neither ss nor lsof is installed." \
+            "Install iproute2 (ss) or lsof, or verify manually: lsof -i :${port}"
+        return
     fi
 
     if [ "$in_use" = true ]; then
