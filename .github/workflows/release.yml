@@ -31,10 +31,21 @@ jobs:
           # version source so metadata-action computes semver tags correctly.
           # For tag-triggered runs, github.ref_name already holds the tag (e.g. v1.3).
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.ref }}" ]; then
-            echo "value=${{ inputs.ref }}" >> $GITHUB_OUTPUT
+            VALUE="${{ inputs.ref }}"
           else
-            echo "value=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+            VALUE="${{ github.ref_name }}"
           fi
+
+          # Guard: must be a semver tag (vX.Y or vX.Y.Z). Without this, dispatching
+          # with ref=main (or any non-semver) silently produces no semver tags from
+          # metadata-action, and the image is pushed only as :latest, overwriting
+          # the current latest with an unversioned build.
+          if ! echo "$VALUE" | grep -qE '^v[0-9]+\.[0-9]+(\.[0-9]+)?$'; then
+            echo "::error::ref must be a semver tag like v1.3 or v1.3.1 (got: $VALUE)"
+            exit 1
+          fi
+
+          echo "value=$VALUE" >> $GITHUB_OUTPUT
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
