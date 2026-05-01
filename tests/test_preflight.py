@@ -480,10 +480,20 @@ class TestPortAvailable:
     def test_no_port_check_tools_warns(self, tmp_path):
         """When neither ss nor lsof is available, emit warn instead of silently passing."""
         mock = make_full_mock_bin(tmp_path, port_in_use=None)
-        (mock / "ss").unlink()  # Remove ss; lsof was never added
-        # Restrict PATH to mock_bin only so system ss/lsof cannot leak in
-        result = run(tmp_path, mock, extra_env={"PATH": str(mock)})
-        assert result.returncode == 0  # warn, not fail
+        # Override the 'command' builtin via BASH_ENV so that 'command -v ss'
+        # and 'command -v lsof' return 1 regardless of PATH, simulating a
+        # minimal host where neither port-checking tool is installed.
+        bash_env = tmp_path / "no_port_tools_env.sh"
+        bash_env.write_text(
+            "command() {\n"
+            "    if [ \"$1\" = \"-v\" ] && { [ \"$2\" = \"ss\" ] || [ \"$2\" = \"lsof\" ]; }; then\n"
+            "        return 1\n"
+            "    fi\n"
+            "    builtin command \"$@\"\n"
+            "}\n"
+        )
+        result = run(tmp_path, mock, extra_env={"BASH_ENV": str(bash_env)})
+        assert result.returncode == 0  # warn exits 0, not fail
         assert "⚠ port_available" in result.stdout
         assert "neither ss nor lsof" in result.stdout
 
