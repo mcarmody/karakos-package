@@ -1,25 +1,43 @@
 """
 Tests for issue #94 — hooks wiring via --settings on the claude spawn line.
 
-The full agent-server is heavy (event loop + sqlite + subprocesses), so the
-spawn-line assertions follow the source-parsing style already used in
-test_agent_server_routes.py rather than booting the server. The hook
-script itself is exercised for real: it's the acceptance test's "append a
-line to a file" behavior, just triggered directly instead of via a live
-Discord round trip through a real claude subprocess (neither is available
-on this box).
+PR #114 review (2026-08-06) flagged the original two acceptance tests here:
+  - test_agent_server_passes_settings_flag_on_spawn was a source-text grep
+    on agent-server.py — passes even if --settings is in a comment, breaks
+    on any cosmetic refactor.
+  - test_hook_script_appends_one_line_per_invocation ran
+    system/hooks/log-user-prompt.sh directly with bash. It never touches
+    bin/agent-server.py, so it passed unchanged with the entire #94 fix
+    reverted.
+
+Replacements below actually exercise the dispatch path:
+  - test_agent_server_wires_settings_flag_into_real_spawn_argv calls the
+    real start_agent_subprocess() with subprocess creation patched, and
+    asserts on the literal argv it builds.
+  - test_real_claude_dispatch_fires_user_prompt_submit_hook spawns the real
+    `claude` CLI with the package's shipped settings.json and asserts the
+    hook fires and appends exactly one line — the issue's actual
+    acceptance criterion, no mocks. Marked slow (needs the `claude` binary
+    and live credentials, absent on the GitHub Actions runner that CI's
+    unit-tests job runs on) so `-m "not slow"` keeps CI green; run directly
+    on hardware that has both, per the review.
 """
 
+import asyncio
 import json
 import os
+import shutil
 import stat
 import subprocess
 
-from conftest import PACKAGE_ROOT
+import pytest
+
+from conftest import PACKAGE_ROOT, import_script
 
 AGENT_SERVER = PACKAGE_ROOT / "bin" / "agent-server.py"
 SETTINGS_PATH = PACKAGE_ROOT / "config" / "claude-settings.json"
 HOOK_SCRIPT = PACKAGE_ROOT / "system" / "hooks" / "log-user-prompt.sh"
+CLAUDE_BIN = shutil.which("claude")
 
 
 def test_settings_file_exists_and_is_package_owned():
@@ -39,17 +57,53 @@ def test_settings_file_wires_user_prompt_submit_hook():
     assert any("log-user-prompt.sh" in cmd for cmd in commands)
 
 
-def test_agent_server_passes_settings_flag_on_spawn():
-    """The claude spawn line in start_agent_subprocess must pass --settings
-    pointing at the package-owned config, per issue #94's fix shape."""
-    src = AGENT_SERVER.read_text()
-    assert 'CLAUDE_SETTINGS_PATH = WORKSPACE_ROOT / "config" / "claude-settings.json"' in src
+def test_agent_server_wires_settings_flag_into_real_spawn_argv(tmp_workspace, monkeypatch):
+    """Calls the real start_agent_subprocess() — not a source-text grep —
+    with asyncio.create_subprocess_exec patched to capture argv instead of
+    actually spawning. Fails if the --settings flag is dropped from the
+    spawn line, unlike the grep it replaces (which passed even with
+    --settings sitting in a comment)."""
+    settings_path = tmp_workspace / "config" / "claude-settings.json"
+    settings_path.write_text(json.dumps({"hooks": {}}))
 
-    start_idx = src.index("async def start_agent_subprocess")
-    next_def = src.index("\nasync def ", start_idx + 1)
-    body = src[start_idx:next_def]
-    assert '"--settings"' in body
-    assert "CLAUDE_SETTINGS_PATH" in body
+    agent_dir = tmp_workspace / "agents" / "test-agent"
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    (agent_dir / "SYSTEM_PROMPT.md").write_text("You are a test agent.")
+
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_workspace))
+    agent_server = import_script("agent-server")
+
+    captured = {}
+
+    class FakeStderr:
+        async def readline(self):
+            return b""
+
+    class FakeProc:
+        pid = 4242
+        stderr = FakeStderr()
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        captured["cmd"] = list(args)
+        return FakeProc()
+
+    monkeypatch.setattr(
+        agent_server.asyncio, "create_subprocess_exec", fake_create_subprocess_exec
+    )
+
+    async def run():
+        await agent_server.init_db()
+        await agent_server.load_config()
+        await agent_server.start_agent_subprocess("test-agent")
+        await asyncio.sleep(0)  # let the stderr_reader task drain and exit
+
+    asyncio.run(run())
+
+    assert "cmd" in captured, "start_agent_subprocess never reached create_subprocess_exec"
+    cmd = captured["cmd"]
+    assert "--settings" in cmd, f"--settings missing from spawn argv: {cmd}"
+    idx = cmd.index("--settings")
+    assert cmd[idx + 1] == str(settings_path), cmd
 
 
 def test_hook_script_is_executable():
@@ -58,18 +112,46 @@ def test_hook_script_is_executable():
     assert mode & stat.S_IXUSR, "hook script must be executable for claude to invoke it"
 
 
-def test_hook_script_appends_one_line_per_invocation(tmp_workspace):
-    """This is the issue's stated acceptance test: firing the
-    UserPromptSubmit hook once must add exactly one line to a file."""
+@pytest.mark.slow
+@pytest.mark.skipif(CLAUDE_BIN is None, reason="claude CLI not installed on this box")
+def test_real_claude_dispatch_fires_user_prompt_submit_hook(tmp_workspace):
+    """The issue's actual acceptance test: a live `claude` process, given
+    the package's shipped settings.json, fires the UserPromptSubmit hook
+    and appends exactly one line — through the real CLI, not by invoking
+    system/hooks/log-user-prompt.sh directly with bash (which the old
+    version of this test did, and which passed even with the entire #94
+    fix reverted since it never goes near --settings or claude itself).
+
+    WORKSPACE_ROOT points at tmp_workspace so both halves of the shipped
+    settings.json's "$WORKSPACE_ROOT/system/hooks/log-user-prompt.sh"
+    command resolve there: the script (copied in below, matching how a
+    real install has system/hooks/ inside WORKSPACE_ROOT) and the log
+    output. --settings itself points at the actual repo-shipped
+    config/claude-settings.json, unmodified.
+    """
+    hooks_dir = tmp_workspace / "system" / "hooks"
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    copied_script = hooks_dir / "log-user-prompt.sh"
+    shutil.copy(HOOK_SCRIPT, copied_script)
+    copied_script.chmod(copied_script.stat().st_mode | stat.S_IXUSR)
+
     log_path = tmp_workspace / "logs" / "hook-events.log"
     assert not log_path.exists()
 
     env = dict(os.environ, WORKSPACE_ROOT=str(tmp_workspace))
-    subprocess.run(["bash", str(HOOK_SCRIPT)], env=env, check=True)
+    result = subprocess.run(
+        [CLAUDE_BIN, "-p", "Reply with the single word: hi",
+         "--settings", str(SETTINGS_PATH)],
+        env=env,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, (
+        f"claude -p exited {result.returncode}\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    )
 
-    lines_after_one = log_path.read_text().splitlines()
-    assert len(lines_after_one) == 1
-
-    subprocess.run(["bash", str(HOOK_SCRIPT)], env=env, check=True)
-    lines_after_two = log_path.read_text().splitlines()
-    assert len(lines_after_two) == 2
+    assert log_path.exists(), "UserPromptSubmit hook never fired: hook-events.log was never created"
+    lines = log_path.read_text().splitlines()
+    assert len(lines) == 1, f"expected exactly one hook-fired line, got: {lines!r}"
