@@ -88,65 +88,73 @@ def _patch_subprocess(mod, monkeypatch, processes):
     monkeypatch.setattr(mod.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
 
 
-@pytest.mark.asyncio
-async def test_start_tracks_stderr_reader_task(agent_server, monkeypatch):
+def test_start_tracks_stderr_reader_task(agent_server, monkeypatch):
     mod = agent_server
     _patch_subprocess(mod, monkeypatch, [FakeProcess(pid=1)])
 
-    await mod.start_agent_subprocess("testagent")
+    async def scenario():
+        await mod.start_agent_subprocess("testagent")
 
-    task = mod.stderr_reader_tasks.get("testagent")
-    assert task is not None
-    assert not task.done()
+        task = mod.stderr_reader_tasks.get("testagent")
+        assert task is not None
+        assert not task.done()
+
+    asyncio.run(scenario())
 
 
-@pytest.mark.asyncio
-async def test_respawn_cancels_stale_stderr_reader(agent_server, monkeypatch):
+def test_respawn_cancels_stale_stderr_reader(agent_server, monkeypatch):
     mod = agent_server
     _patch_subprocess(mod, monkeypatch, [FakeProcess(pid=1), FakeProcess(pid=2)])
 
-    await mod.start_agent_subprocess("testagent")
-    first_task = mod.stderr_reader_tasks["testagent"]
-    assert not first_task.done()
+    async def scenario():
+        await mod.start_agent_subprocess("testagent")
+        first_task = mod.stderr_reader_tasks["testagent"]
+        assert not first_task.done()
 
-    await mod.start_agent_subprocess("testagent")
-    second_task = mod.stderr_reader_tasks["testagent"]
+        await mod.start_agent_subprocess("testagent")
+        second_task = mod.stderr_reader_tasks["testagent"]
 
-    assert second_task is not first_task
-    await asyncio.sleep(0)  # let the cancellation propagate
-    assert first_task.cancelled()
-    assert not second_task.done()
+        assert second_task is not first_task
+        await asyncio.sleep(0)  # let the cancellation propagate
+        assert first_task.cancelled()
+        assert not second_task.done()
+
+    asyncio.run(scenario())
 
 
-@pytest.mark.asyncio
-async def test_kill_cancels_stderr_reader_and_clears_tracking(agent_server, monkeypatch):
+def test_kill_cancels_stderr_reader_and_clears_tracking(agent_server, monkeypatch):
     mod = agent_server
     _patch_subprocess(mod, monkeypatch, [FakeProcess(pid=1)])
 
-    await mod.start_agent_subprocess("testagent")
-    task = mod.stderr_reader_tasks["testagent"]
-    assert not task.done()
+    async def scenario():
+        await mod.start_agent_subprocess("testagent")
+        task = mod.stderr_reader_tasks["testagent"]
+        assert not task.done()
 
-    await mod.kill_agent_subprocess("testagent")
-    await asyncio.sleep(0)
+        await mod.kill_agent_subprocess("testagent")
+        await asyncio.sleep(0)
 
-    assert task.cancelled()
-    assert "testagent" not in mod.stderr_reader_tasks
-    assert "testagent" not in mod.agent_processes
+        assert task.cancelled()
+        assert "testagent" not in mod.stderr_reader_tasks
+        assert "testagent" not in mod.agent_processes
+
+    asyncio.run(scenario())
 
 
-@pytest.mark.asyncio
-async def test_fifty_respawns_leave_flat_task_count(agent_server, monkeypatch):
+def test_fifty_respawns_leave_flat_task_count(agent_server, monkeypatch):
     """Acceptance test from #108: force 50 respawns, task count stays flat
     (only the live reader for the current subprocess remains tracked)."""
     mod = agent_server
     _patch_subprocess(mod, monkeypatch, [FakeProcess(pid=n) for n in range(1, 51)])
 
-    for _ in range(50):
-        await mod.start_agent_subprocess("testagent")
+    async def scenario():
+        for _ in range(50):
+            await mod.start_agent_subprocess("testagent")
 
-    await asyncio.sleep(0)
+        await asyncio.sleep(0)
 
-    assert len(mod.stderr_reader_tasks) == 1
-    live = [t for t in mod.stderr_reader_tasks.values() if not t.done()]
-    assert len(live) == 1
+        assert len(mod.stderr_reader_tasks) == 1
+        live = [t for t in mod.stderr_reader_tasks.values() if not t.done()]
+        assert len(live) == 1
+
+    asyncio.run(scenario())
