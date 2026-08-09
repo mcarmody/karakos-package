@@ -419,7 +419,9 @@ def test_ask_routes_require_the_bearer_token(ags):
 def test_a_malformed_question_is_rejected_with_a_reason(ags):
     async def scenario():
         h = await _harness(ags)
-        for bad in ({"options": []}, {"options": ["a"] * 11}, {"question": "   "},
+        too_many = [f"option {i}" for i in range(11)]  # distinct: not caught as duplicates
+        for bad in ({"options": []}, {"options": too_many}, {"question": "   "},
+                    {"options": ["Same", "same"]},
                     {"options": [{"description": "no label"}]}):
             resp = await h.create(**bad)
             assert resp.status == 400, f"{bad} should have been rejected"
@@ -479,6 +481,13 @@ def test_a_question_nobody_answers_gives_the_turn_back(ags, workspace):
             "an expired question must hand the agent back to the wedge detector"
         )
         assert wedge.find_wedged(0), "wedge detection stayed disabled after the timeout"
+
+        # The buttons are still on screen after the timeout. Clicking one must
+        # not answer a question the agent has already stopped waiting for.
+        late = await (await h.answer(ask_id, 1)).json()
+        assert late["outcome"] == "expired"
+        assert late["answer"] is None
+        assert (await (await h.status(ask_id)).json())["status"] == "expired"
         await h.client.close()
 
     run(scenario)
@@ -629,7 +638,17 @@ def test_relay_ignores_components_that_are_not_ours(ags, relay):
                 raise AssertionError("a foreign component reached the agent server")
 
         adapter.http_session = Boom()
-        for custom_id in ("some-other-feature", "kask:onlytwo", "kask:abc:notanint", None):
+        foreign = (
+            "some-other-feature",
+            # Same three-part shape, different owner. Without a prefix check
+            # this one is indistinguishable from ours.
+            "poll:abc123:0",
+            "kask:onlytwo",
+            "kask:abc:notanint",
+            "kask::0",
+            None,
+        )
+        for custom_id in foreign:
             interaction = FakeInteraction(custom_id)
             await adapter.on_interaction(interaction)
             assert interaction.response.edited is None
@@ -757,6 +776,40 @@ def test_ask_user_reports_a_timeout_instead_of_blocking_forever(ags, tools):
         result = await asyncio.wait_for(call, timeout=10)
         assert result["status"] == "timeout"
         assert result["error"]
+        await h.client.close()
+
+    run(scenario)
+
+
+def test_ask_user_gives_up_if_the_server_never_resolves_the_question(ags, tools):
+    """The tool's own deadline, distinct from the server's expiry above.
+
+    If the agent server forgets to expire an ask — or is restarted into a
+    state where it reports `pending` forever — the poll loop must still end
+    the turn. The clock is injected rather than waited out: a fixed sleep
+    here would either be flaky or take the full timeout.
+    """
+    async def scenario():
+        h = await _harness(ags)
+        tools.AGENT_SERVER_URL = h.url
+
+        ticks = iter([0.0])  # first call sets the deadline; then jump past it
+
+        def fake_monotonic():
+            return next(ticks, 1e9)
+
+        slept = []
+
+        result = await asyncio.to_thread(
+            tools.ask_user,
+            {"question": "q", "options": ["a", "b"], "agent": "amos", "timeout": 3600},
+            slept.append,
+            fake_monotonic,
+        )
+        assert result["status"] == "timeout"
+        # The question itself is still pending server-side: this is the
+        # client giving up, not the server expiring it.
+        assert len(ags.ask_registry) == 1
         await h.client.close()
 
     run(scenario)
