@@ -358,16 +358,32 @@ def _run(command: str) -> int:
 
 
 def run_due(now: float | None = None, directory: Path | None = None,
-            runner=None, log=None) -> list[dict]:
+            runner=None, log=None, progress=None) -> list[dict]:
     """Fire every entry whose absolute deadline has passed. One pass.
 
     Called on every scheduler tick AND from replay() at startup — the same
     code path, so the reboot case cannot drift away from the steady-state case.
+
+    `progress` is called after each entry is processed. Firing is synchronous
+    and each command may burn the full ONESHOT_EXEC_TIMEOUT (60s), so a batch
+    of due entries blocks the caller for minutes. The scheduler's liveness
+    heartbeat is on that same thread, and health-monitor calls it dead at 300s
+    — five slow pokes would have the scheduler reported wedged while it is
+    doing exactly its job. The callback lets the caller stay alive mid-batch.
     """
     now = time.time() if now is None else now
     runner = _run if runner is None else runner
     directory = spool_dir() if directory is None else directory
     stale_cutoff = stale_after_seconds()
+
+    def tick():
+        if progress:
+            try:
+                progress()
+            except Exception:
+                # A liveness callback must never be able to abort the batch it
+                # is only observing.
+                pass
 
     results = []
     for entry in load_entries(directory):
@@ -392,6 +408,7 @@ def run_due(now: float | None = None, directory: Path | None = None,
                     "oneshot DROPPED (stale): %s was due %s, %ss late (> %ss cutoff)",
                     entry["id"], entry.get("fire_at_iso"), late, stale_cutoff)
             results.append(record)
+            tick()
             continue
 
         returncode = runner(entry["command"])
@@ -401,12 +418,13 @@ def run_due(now: float | None = None, directory: Path | None = None,
             log.info("oneshot FIRED: %s (%ss late, rc=%s)",
                      entry["id"], late, returncode)
         results.append(record)
+        tick()
 
     return results
 
 
 def replay(now: float | None = None, directory: Path | None = None,
-           runner=None, log=None) -> dict:
+           runner=None, log=None, progress=None) -> dict:
     """Startup pass. Re-reads the spool the previous container left behind,
     reports what is still pending, and fires (or drops) whatever came due
     while the process was down.
@@ -420,7 +438,8 @@ def replay(now: float | None = None, directory: Path | None = None,
     directory = spool_dir() if directory is None else directory
 
     pending_before = load_entries(directory)
-    fired = run_due(now=now, directory=directory, runner=runner, log=log)
+    fired = run_due(now=now, directory=directory, runner=runner, log=log,
+                    progress=progress)
 
     still_pending = [e for e in pending_before if e["fire_at"] > now]
     if log:

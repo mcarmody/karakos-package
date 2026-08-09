@@ -285,6 +285,82 @@ def test_scheduler_replay_runs_before_the_main_loop():
 
 
 # =============================================================================
+# Liveness during a slow batch
+#
+# Firing is synchronous and each command may burn the full 60s exec timeout
+# (bin/poke.sh calls curl with no --max-time, so an unreachable relay hits that
+# ceiling). The scheduler's liveness heartbeat shares the thread, and
+# health-monitor declares scheduler.json stale at 300s. Five slow pokes in one
+# batch therefore had the scheduler reported wedged while it was doing exactly
+# its job — and the batch is LARGEST right after the longest outage, which is
+# the scenario the whole feature exists to serve.
+# =============================================================================
+
+def _overdue(oneshot, spool, label, now, command="true"):
+    """Spool an entry and back-date it so it is already due."""
+    oneshot.schedule(label=label, when="1h", command=command,
+                     directory=spool, now=now)
+    path = oneshot.entry_path(label, spool)
+    entry = json.loads(path.read_text())
+    entry["fire_at"] = int(now - 10)
+    path.write_text(json.dumps(entry))
+
+
+def test_a_slow_batch_refreshes_liveness_between_entries(oneshot, tmp_path):
+    """The heartbeat must be refreshed per entry, not once after the batch."""
+    spool = _spool(tmp_path)
+    now = 1_700_000_000.0
+    for i in range(3):
+        _overdue(oneshot, spool, f"slow-{i}", now, command=f"echo {i}")
+
+    events = []
+    oneshot.run_due(
+        now=now, directory=spool,
+        runner=lambda cmd: (events.append("ran"), 0)[1],
+        progress=lambda: events.append("beat"),
+    )
+
+    assert events.count("ran") == 3, f"expected 3 commands to fire, got {events}"
+    # Interleaved, not all the beats bunched at the end.
+    assert events == ["ran", "beat"] * 3, (
+        "liveness was not refreshed between entries; a slow batch will let the "
+        f"heartbeat go stale mid-run. Sequence was {events}"
+    )
+
+
+def test_scheduler_declares_liveness_before_replaying_the_spool():
+    """Replay fires every missed deadline synchronously and can take minutes.
+    If the first heartbeat is written only after it, health-monitor reads the
+    health file as missing and calls the scheduler dead while it recovers."""
+    main = _main_function(SCHEDULER_BIN)
+
+    def first_call(name):
+        lines = [n.lineno for n in ast.walk(main)
+                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                 and n.func.id == name]
+        assert lines, f"main() never calls {name}()"
+        return min(lines)
+
+    assert first_call("write_health_timestamp") < first_call("replay_oneshots"), \
+        "scheduler replays the spool before writing its first heartbeat"
+
+
+def test_replay_forwards_the_liveness_callback(oneshot, tmp_path):
+    """The startup path is the one that matters most here, so the callback must
+    actually reach it — replay() must not drop `progress` on the floor."""
+    spool = _spool(tmp_path)
+    now = 1_700_000_000.0
+    _overdue(oneshot, spool, "missed", now, command="echo hi")
+
+    beats = []
+    result = oneshot.replay(now=now, directory=spool, runner=lambda cmd: 0,
+                            progress=lambda: beats.append(1))
+
+    assert len(result["fired"]) == 1
+    assert beats, "replay() did not forward progress to run_due()"
+
+
+# =============================================================================
 # Wiring: the agent-callable primitive
 # =============================================================================
 

@@ -123,7 +123,7 @@ def run_due_oneshots():
     job interval.
     """
     try:
-        oneshot.run_due(log=log)
+        oneshot.run_due(log=log, progress=write_health_timestamp)
     except Exception as e:
         log.error(f"Oneshot poll failed: {e}")
 
@@ -137,7 +137,7 @@ def replay_oneshots():
     at startup where it can be logged, not silently on the first tick.
     """
     try:
-        result = oneshot.replay(log=log)
+        result = oneshot.replay(log=log, progress=write_health_timestamp)
         log.info(
             "Oneshot spool restored: %d pending, %d fired late, %d dropped stale",
             len(result["rearmed"]), len(result["fired"]), len(result["dropped"]),
@@ -206,6 +206,14 @@ def main():
     schedule.every(1).minutes.do(run_wedge_check)
     schedule.every().day.at("04:30").do(purge_old_data)
     schedule.every().monday.at("05:00").do(check_updates)  # Weekly update check
+
+    # Declare liveness BEFORE the replay, not after. Replay fires every
+    # deadline missed while we were down, synchronously, and the longer the
+    # outage the more there are to fire — so the slowest replay is the one
+    # that happens right after the longest downtime. With no health file
+    # written yet, health-monitor reads "missing" and calls us dead at the
+    # exact moment we are recovering. The batch refreshes it per entry too.
+    write_health_timestamp()
 
     # Before the first tick: whatever the previous container left in the spool.
     replay_oneshots()
