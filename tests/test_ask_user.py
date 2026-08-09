@@ -798,12 +798,18 @@ def test_ask_user_gives_up_if_the_server_never_resolves_the_question(ags, tools)
         def fake_monotonic():
             return next(ticks, 1e9)
 
-        slept = []
+        def bounded_sleep(_seconds, budget=[6]):
+            """A poll loop that never consults its deadline would spin here
+            forever. Blow up instead, so the failure is a red test in a
+            second rather than a hung suite."""
+            budget[0] -= 1
+            if budget[0] < 0:
+                raise AssertionError("the poll loop never checked its deadline")
 
         result = await asyncio.to_thread(
             tools.ask_user,
             {"question": "q", "options": ["a", "b"], "agent": "amos", "timeout": 3600},
-            slept.append,
+            bounded_sleep,
             fake_monotonic,
         )
         assert result["status"] == "timeout"
