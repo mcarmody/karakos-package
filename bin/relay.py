@@ -26,39 +26,36 @@ from logging.handlers import RotatingFileHandler
 # =============================================================================
 
 def split_discord_message(text: str, max_length: int = 2000) -> List[str]:
-    """Split text into Discord-compatible chunks (max 2000 chars per message)"""
+    """Split text into chunks Discord will accept (max 2000 chars each).
+
+    Splits on the largest boundary that fits — paragraph, then line, then a
+    hard cut mid-line. The hard cut is the part that matters: a reply with no
+    blank line and no newline in it has no boundary to split on, and the
+    previous implementation returned it as a single oversize chunk. Discord
+    rejects anything over 2000 with a 400 and the message is lost.
+    """
     if len(text) <= max_length:
-        return [text]
+        return [text] if text else []
 
-    chunks = []
-    # Try to split on paragraph boundaries first
-    paragraphs = text.split('\n\n')
-    current_chunk = ""
+    chunks: List[str] = []
+    remaining = text
 
-    for paragraph in paragraphs:
-        # If single paragraph is too long, split on newlines
-        if len(paragraph) > max_length:
-            lines = paragraph.split('\n')
-            for line in lines:
-                if len(current_chunk) + len(line) + 2 > max_length:
-                    if current_chunk:
-                        chunks.append(current_chunk.strip())
-                    current_chunk = line
-                else:
-                    current_chunk += ('\n' if current_chunk else '') + line
-        else:
-            if len(current_chunk) + len(paragraph) + 2 > max_length:
-                if current_chunk:
-                    chunks.append(current_chunk.strip())
-                current_chunk = paragraph
-            else:
-                current_chunk += ('\n\n' if current_chunk else '') + paragraph
+    while len(remaining) > max_length:
+        window = remaining[:max_length]
+        cut = window.rfind("\n\n")
+        if cut <= 0:
+            cut = window.rfind("\n")
+        if cut <= 0:
+            # A solid wall of text. Cut it at the limit rather than handing
+            # Discord something it will refuse.
+            cut = max_length
+        chunks.append(remaining[:cut].rstrip())
+        remaining = remaining[cut:].lstrip("\n")
 
-    if current_chunk:
-        chunks.append(current_chunk.strip())
+    if remaining:
+        chunks.append(remaining)
 
     return chunks if chunks else [text]
-
 # =============================================================================
 # Configuration
 # =============================================================================
@@ -141,6 +138,30 @@ def load_config():
 
     log.info(f"Loaded config for {len(agent_config)} agents, {len(channels_config.get('channels', {}))} channels")
 
+
+def load_server_ids(config: Dict) -> set:
+    """Discord server IDs this relay will accept messages from.
+
+    `server_id` (a single string, what setup.sh writes) stays supported. A
+    system that also needs to reach a shared server — a second household, a
+    server where agents from different installs talk to each other — adds
+    `server_ids` alongside it, and both are honoured:
+
+        {"server_id": "111", "server_ids": ["222", "333"], "channels": {...}}
+
+    Channels are still matched by ID, so a channel only routes if it's listed
+    in `channels` regardless of which server it lives in.
+    """
+    ids = set()
+    single = config.get("server_id")
+    if single:
+        ids.add(str(single))
+    extra = config.get("server_ids") or []
+    if isinstance(extra, (str, int)):
+        extra = [extra]
+    ids.update(str(s) for s in extra if s)
+    return ids
+
 # =============================================================================
 # Discord Adapter
 # =============================================================================
@@ -156,14 +177,17 @@ class DiscordAdapter(discord.Client):
         super().__init__(intents=intents, *args, **kwargs)
 
         self.http_session = None
-        self.server_id = None
+        self.server_ids = set()
 
     async def setup_hook(self):
         """Initialize HTTP session"""
         import aiohttp
         self.http_session = aiohttp.ClientSession()
-        self.server_id = channels_config.get("server_id")
-        log.info("Discord adapter initialized")
+        self.server_ids = load_server_ids(channels_config)
+        log.info(
+            "Discord adapter initialized (servers: %s)",
+            ", ".join(sorted(self.server_ids)) or "none configured",
+        )
 
     async def on_ready(self):
         """Bot logged in"""
@@ -176,8 +200,8 @@ class DiscordAdapter(discord.Client):
         if message.author == self.user:
             return
 
-        # Ignore messages from other servers
-        if message.guild and str(message.guild.id) != self.server_id:
+        # Ignore messages from servers we aren't configured for
+        if message.guild and str(message.guild.id) not in self.server_ids:
             return
 
         # Capture message
