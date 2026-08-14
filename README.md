@@ -5,7 +5,18 @@
 [![Docker Required](https://img.shields.io/badge/Docker-required-2496ED?logo=docker&logoColor=white)](https://www.docker.com/)
 [![Anthropic Claude](https://img.shields.io/badge/Powered_by-Claude-orange)](https://www.anthropic.com/claude)
 
-A self-contained, installable multi-agent household assistant system powered by Claude.
+Running a persistent, Claude-powered agent well — one that remembers context
+across restarts, tracks its own API spend, reaches you where you already are,
+and can extend itself without corrupting its own process — normally means
+building session lifecycle management, memory consolidation, cost guards, and
+agent orchestration from scratch before you get to the part you actually
+wanted. Karakos packages that infrastructure into one self-contained,
+Docker-installable system: point it at a Discord server and an Anthropic
+account, and you get a standing assistant with a web dashboard, episodic
+memory with recall, configurable cost limits, and builder/reviewer agents
+that can modify the system's own code under guardrails (protected paths,
+tiered review) — instead of a one-off script you rebuild every time you want
+it to remember something.
 
 ## Install
 
