@@ -1,5 +1,6 @@
 # Karakos
 
+[![CI](https://github.com/mcarmody/karakos-package/actions/workflows/ci.yml/badge.svg)](https://github.com/mcarmody/karakos-package/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Docker Required](https://img.shields.io/badge/Docker-required-2496ED?logo=docker&logoColor=white)](https://www.docker.com/)
 [![Anthropic Claude](https://img.shields.io/badge/Powered_by-Claude-orange)](https://www.anthropic.com/claude)
@@ -99,7 +100,8 @@ MIT
 
 ## Contributing
 
-Contributions welcome! Please open an issue or pull request on GitHub.
+Contributions welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for how to get set up,
+run the test suite, and open a pull request.
 
 ---
 
