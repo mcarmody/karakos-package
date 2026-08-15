@@ -1773,6 +1773,15 @@ async def handle_message(request):
              int(mentions_agent), json.dumps(attachments) if attachments else None)
         )
         await db.commit()
+    except aiosqlite.IntegrityError:
+        # A message_id we already queued: the deferred-message flusher (#88)
+        # re-firing a payload whose first POST landed but whose response was
+        # lost, or any client retrying blind. The first copy is being handled;
+        # accepting the duplicate is the idempotent answer, and anything
+        # non-2xx here would make the flusher retry it until stale-out.
+        return web.json_response(
+            {"status": "duplicate", "message_id": message_id}, status=202
+        )
     except Exception as e:
         log.error(f"Error inserting message: {e}")
         return web.json_response({"error": "Database error"}, status=500)

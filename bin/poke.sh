@@ -103,21 +103,42 @@ PAYLOAD=$(jq -n \
         mentions_agent: true
     }')
 
-# Send to agent server
+# Spool the payload for bin/flush-deferred-messages.py (scheduler, every 5
+# minutes) to re-fire once the server is back (#88). The file is the exact
+# /message payload, so a spooled poke and a live poke are indistinguishable
+# server-side, and the server's duplicate handling makes refires idempotent.
+spool_deferred_message() {
+    local deferred_dir="${WORKSPACE_ROOT}/data/deferred-messages"
+    mkdir -p "$deferred_dir"
+    local deferred_file="${deferred_dir}/$(date +%s)-${MESSAGE_ID}.json"
+    printf '%s\n' "$PAYLOAD" > "$deferred_file"
+    echo "$deferred_file"
+}
+
+# Send to agent server. `|| true`: when the server is down entirely, curl
+# exits non-zero and `set -e` would kill the script before the spool branch
+# below ever runs; -w still emits http_code 000 in that case.
 RESPONSE=$(curl -s -w "\n%{http_code}" \
     -X POST \
     -H "Authorization: Bearer ${AGENT_SERVER_TOKEN}" \
     -H "Content-Type: application/json" \
     -d "$PAYLOAD" \
-    "http://localhost:${AGENT_SERVER_PORT}/message")
+    "http://localhost:${AGENT_SERVER_PORT}/message") || true
 
 HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+HTTP_CODE="${HTTP_CODE:-000}"
 BODY=$(echo "$RESPONSE" | head -n-1)
 
-if [ "$HTTP_CODE" != "202" ]; then
+if [ "$HTTP_CODE" = "202" ]; then
+    echo "Poked $AGENT (message_id: $MESSAGE_ID)"
+elif [ "$HTTP_CODE" = "000" ] || [ "$HTTP_CODE" = "429" ] || [ "${HTTP_CODE:0:1}" = "5" ]; then
+    # Transient: server down, cost-capped, or erroring. Exit 0 — the message
+    # is durably spooled for retry, not lost.
+    DEFERRED_FILE=$(spool_deferred_message)
+    echo "Agent server unreachable (HTTP ${HTTP_CODE}) — spooled for retry: $DEFERRED_FILE" >&2
+else
+    # Permanent (bad payload, bad token): a retry returns the same answer.
     echo "Error: HTTP $HTTP_CODE" >&2
     echo "$BODY" >&2
     exit 1
 fi
-
-echo "Poked $AGENT (message_id: $MESSAGE_ID)"

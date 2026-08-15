@@ -371,6 +371,11 @@ AGENTS_CONFIG_PATH = WORKSPACE_ROOT / "config" / "agents.json"
 CHANNELS_CONFIG_PATH = WORKSPACE_ROOT / "config" / "channels.json"
 MESSAGES_DIR = WORKSPACE_ROOT / "data" / "messages"
 ATTACHMENTS_DIR = WORKSPACE_ROOT / "data" / "attachments"
+# Inbound messages the agent server refused or never received spool here;
+# bin/flush-deferred-messages.py (scheduler, every 5 minutes) re-fires them
+# once the server is back (#88). Only transient failures spool — a 400 would
+# be refused identically on every refire.
+DEFERRED_MESSAGES_DIR = WORKSPACE_ROOT / "data" / "deferred-messages"
 HEALTH_FILE = WORKSPACE_ROOT / "data" / "health" / "relay.json"
 
 # Attachments the relay will pull down before handing a message to an agent.
@@ -416,6 +421,26 @@ channels_config: Dict = {}
 discord_id_to_agent: Dict[int, str] = {}
 active_dispatches: Dict[str, asyncio.Task] = {}
 dispatch_semaphores: Dict[str, asyncio.Semaphore] = {}
+
+def spool_deferred_message(payload: dict, reason: str) -> Optional[Path]:
+    """Write a /message payload that could not be delivered to the spool.
+
+    Returns the file path, or None — a spool failure must never take down
+    on_message, so this swallows everything and settles for the error log
+    the caller already wrote.
+    """
+    try:
+        DEFERRED_MESSAGES_DIR.mkdir(parents=True, exist_ok=True)
+        path = DEFERRED_MESSAGES_DIR / f"{int(time.time())}-{payload['message_id']}.json"
+        path.write_text(json.dumps(payload))
+        log.warning(
+            f"Spooled message {payload['message_id']} for retry ({reason}): {path}"
+        )
+        return path
+    except Exception as spool_err:
+        log.error(f"Failed to spool deferred message: {spool_err}")
+        return None
+
 
 # =============================================================================
 # Configuration Loading
@@ -1212,8 +1237,11 @@ class DiscordAdapter(discord.Client):
                 else:
                     text = await resp.text()
                     log.error(f"Agent server error {resp.status}: {text}")
+                    if resp.status == 429 or resp.status >= 500:
+                        spool_deferred_message(payload, f"HTTP {resp.status}")
         except Exception as e:
             log.error(f"Error sending to agent server: {e}")
+            spool_deferred_message(payload, repr(e))
 
     async def capture_message(self, message: discord.Message):
         """Capture message to JSONL"""
