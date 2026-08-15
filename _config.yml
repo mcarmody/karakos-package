@@ -1,0 +1,4 @@
+theme: jekyll-theme-cayman
+title: Karakos
+description: A self-contained, installable multi-agent household assistant system powered by Claude.
+show_downloads: false
