@@ -139,6 +139,24 @@ response_buffers: Dict[str, str] = {}
 agent_last_cost: Dict[str, float] = {}
 agent_sessions: Dict[str, str] = {}
 stderr_reader_tasks: Dict[str, asyncio.Task] = {}
+# One task per agent awaiting its subprocess's exit (#90). Fires a respawn and
+# a channel notice when the process dies on its own.
+respawn_watcher_tasks: Dict[str, asyncio.Task] = {}
+# monotonic timestamps of recent unexpected exits, per agent, for the
+# crashloop brake below.
+respawn_history: Dict[str, List[float]] = {}
+RESPAWN_WINDOW_SECONDS = 300
+RESPAWN_MAX_IN_WINDOW = 3
+# Agents whose subprocess is being ended on purpose — restart, reload,
+# interrupt, shutdown, or POST /kill. Lets the respawn watcher tell an
+# intentional kill from a crash. Set by kill_agent_subprocess before it
+# terminates anything, cleared by start_agent_subprocess. See the comment at
+# the set site: this is the secondary guard, behind the watcher-cancel.
+deliberate_kills: set = set()
+# Last channel each agent actually spoke in. The respawn notice has no turn of
+# its own to inherit a channel from — the process died between turns — so this
+# is the only record of where the user is waiting.
+agent_last_channel: Dict[str, str] = {}
 # Agents whose current turn was deliberately ended by /interrupt. Read (and
 # cleared) by read_agent_response so the half-written reply is discarded
 # instead of posted.
@@ -559,6 +577,13 @@ async def start_agent_subprocess(agent: str):
     if stale_reader and not stale_reader.done():
         stale_reader.cancel()
 
+    # Same for the respawn watcher (#90) — a watcher still awaiting the old
+    # process would fire a spurious "exited unexpectedly" the moment that
+    # process is reaped, describing a restart we are performing right here.
+    stale_watcher = respawn_watcher_tasks.pop(agent, None)
+    if stale_watcher and not stale_watcher.done():
+        stale_watcher.cancel()
+
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -570,9 +595,15 @@ async def start_agent_subprocess(agent: str):
         agent_processes[agent] = proc
         agent_states[agent] = "IDLE"
         agent_sessions[agent] = session_id
+        # A live process is by definition no longer deliberately dead. Clearing
+        # here rather than in the kill paths keeps the flag correct for the one
+        # kill that is *not* followed by a spawn — POST /kill, which is meant
+        # to leave the agent down.
+        deliberate_kills.discard(agent)
 
         # Start stderr reader, tracked so it can be cancelled on kill/respawn.
         stderr_reader_tasks[agent] = asyncio.create_task(stderr_reader(agent, proc))
+        respawn_watcher_tasks[agent] = asyncio.create_task(respawn_watcher(agent, proc))
 
         log.info(f"{agent} subprocess started (PID {proc.pid})")
     except Exception as e:
@@ -598,6 +629,16 @@ async def kill_agent_subprocess(agent: str):
     if not proc:
         return
 
+    # Secondary guard (#90). The primary one is the watcher-cancel at the
+    # bottom of this function, which wins every interleaving reachable in a
+    # test: the watcher is suspended on proc.wait() and cancellation lands
+    # before its scheduled wakeup runs. This flag covers the one window
+    # cancellation cannot — a watcher that has already resumed and run past
+    # its checks into start_agent_subprocess, where a cancel would abort a
+    # spawn half-done rather than prevent it. Set before terminating, since a
+    # flag set afterwards would lose that window by definition.
+    deliberate_kills.add(agent)
+
     log.info(f"Killing {agent} subprocess (PID {proc.pid})")
     try:
         proc.terminate()
@@ -613,7 +654,110 @@ async def kill_agent_subprocess(agent: str):
     if reader_task and not reader_task.done():
         reader_task.cancel()
 
+    watcher_task = respawn_watcher_tasks.pop(agent, None)
+    if watcher_task and not watcher_task.done():
+        watcher_task.cancel()
+
     log.info(f"{agent} subprocess terminated")
+
+
+async def notify_respawn(agent: str, reason: str, restarted: bool = True) -> None:
+    """Post a one-line notice that the subprocess restarted, so a context
+    reset is visible rather than reading as amnesia (#90).
+
+    Goes to the last channel the agent spoke in. Never raises: a failed notice
+    must not take down the respawn it is describing.
+
+    `restarted=False` is the crashloop case — the agent is down and staying
+    down, so the notice must not promise it is back.
+    """
+    channel_id = agent_last_channel.get(agent)
+    if not channel_id or channel_id == "0":
+        log.info(f"{agent} respawn event ({reason}); no known channel to notify")
+        return
+
+    if restarted:
+        notice = (
+            f"🔄 {agent} restarted — {reason}. Context was cleared; "
+            f"recent conversation may need a recap."
+        )
+    else:
+        notice = f"🛑 {agent} is down — {reason}."
+    try:
+        # Deliberately not dead_letter=True. This is an incidental notice, not
+        # a reply anyone is waiting on, and replaying it on a later boot would
+        # announce a restart that had already been announced.
+        await post_to_discord(agent, channel_id, notice)
+    except Exception as e:
+        log.warning(f"respawn notice for {agent} failed: {e}")
+
+
+async def respawn_watcher(agent: str, proc: asyncio.subprocess.Process):
+    """Await this subprocess's exit and, if nobody asked for it, bring the
+    agent back and say so (#90).
+
+    Before this, a subprocess that died while idle was simply gone: nothing
+    watched for it, so the agent stayed dead until the next message failed to
+    send, and the reply after that had no memory of the conversation with no
+    explanation offered. `stderr_reader` was the only task that observed the
+    exit and it discarded the fact.
+
+    The agent lock is held across the respawn so this cannot race a turn that
+    is still unwinding — a mid-turn crash makes read_agent_response return on
+    EOF, which releases the lock a moment later.
+    """
+    try:
+        returncode = await proc.wait()
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        log.error(f"respawn watcher for {agent} failed to await exit: {e}")
+        return
+
+    if shutting_down or agent in deliberate_kills:
+        return
+
+    lock = agent_locks.get(agent)
+    if lock is None:
+        return
+
+    async with lock:
+        # Re-check under the lock. Both conditions can become true while we
+        # waited for a turn to finish, and respawning after a deliberate kill
+        # would resurrect an agent an operator just took down.
+        if shutting_down or agent in deliberate_kills:
+            return
+        # Someone else already replaced this process; its lifecycle is theirs.
+        if agent_processes.get(agent) is not proc:
+            return
+
+        # Crashloop brake. A subprocess that dies immediately on spawn — bad
+        # model name, missing MCP binary, unreadable settings file — would
+        # otherwise respawn and announce itself forever, turning one broken
+        # config into an unbounded stream of Discord messages. Recovery is
+        # worth automating; an infinite loop is not.
+        recent = respawn_history.setdefault(agent, [])
+        now = time.monotonic()
+        recent[:] = [t for t in recent if now - t < RESPAWN_WINDOW_SECONDS]
+        recent.append(now)
+        if len(recent) > RESPAWN_MAX_IN_WINDOW:
+            log.error(
+                f"{agent} exited {len(recent)} times in {RESPAWN_WINDOW_SECONDS}s "
+                f"(code {returncode}) — not respawning again"
+            )
+            await notify_respawn(
+                agent,
+                f"it crashed {len(recent)} times in under "
+                f"{RESPAWN_WINDOW_SECONDS // 60} minutes and has been left down; "
+                f"this needs a look at the server logs",
+                restarted=False,
+            )
+            return
+
+        log.warning(f"{agent} subprocess exited unexpectedly (code {returncode}), respawning")
+        await start_agent_subprocess(agent)
+
+    await notify_respawn(agent, f"the subprocess exited unexpectedly (code {returncode})")
 
 async def restart_agent(agent: str):
     """Restart agent subprocess"""
@@ -1690,6 +1834,12 @@ async def process_agent_queue(agent: str):
             "author_ids": [msg["author_id"] for msg in messages if not msg["is_bot"]],
             "message_ids": message_ids,
         }
+
+        # Remember where this agent is talking. A subprocess that dies between
+        # turns has no turn context to borrow a channel from, so this is what
+        # the respawn notice is addressed to (#90).
+        if channel_id != "0":
+            agent_last_channel[agent] = channel_id
 
         # Start typing indicator
         await start_typing(agent, channel_id)
