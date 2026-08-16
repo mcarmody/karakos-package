@@ -76,6 +76,15 @@ BEACON_MIN_INTERVAL_SEC = 1.0
 QUEUE_DEPTH_LIMIT = 50
 TYPING_INTERVAL = 8  # seconds
 
+# Mid-turn tool activity lines (#91). A turn can make dozens of tool calls
+# in a few seconds; posting one Discord message each would rate-limit the
+# bot and bury the channel. These lines exist to answer "is it still
+# working?", not to be a complete log, so the first call posts immediately
+# (liveness is the whole point) and the rest are throttled and capped.
+TOOL_EVENT_MIN_INTERVAL = 5    # seconds between lines within one turn
+TOOL_EVENT_MAX_PER_TURN = 12   # hard ceiling per turn
+TOOL_EVENT_DETAIL_CHARS = 90   # truncation for the argument summary
+
 # Processing states
 STATUS_QUEUED = 0
 STATUS_IN_PROGRESS = 1
@@ -1294,6 +1303,68 @@ async def post_discord_payload(agent: str, channel_id: str,
         return None
 
 
+def should_post_tool_line(lines_posted: int, last_at: Optional[float],
+                          now: float) -> bool:
+    """Whether this turn may post another tool activity line right now (#91).
+
+    `last_at is None` means "nothing posted yet this turn", and that case is
+    never delayed: a turn that says nothing for the first interval is exactly
+    the silence the issue is about.
+
+    It is an explicit None and not a 0.0 sentinel, which is a distinction
+    with a real failure behind it. `now - 0.0 >= interval` is true only
+    because time.monotonic() is boot-relative and therefore large on a
+    long-running host — 26694.2 on the box this was written on, against a 5
+    second interval. In a container in its first minutes, the value the
+    package actually ships into, it is small, and the sentinel form
+    swallows the first line of the first turn. A mutation removing the
+    first-call exemption survived the test suite for precisely this reason
+    before the check was pulled out here where its inputs can be named.
+    """
+    if lines_posted >= TOOL_EVENT_MAX_PER_TURN:
+        return False
+    if last_at is None:
+        return True
+    return now - last_at >= TOOL_EVENT_MIN_INTERVAL
+
+
+def summarize_tool_call(tool_name: str, tool_input: Optional[Dict]) -> str:
+    """One-line "⚙ Bash — npm test" summary of a stream-json tool_use block.
+
+    The tool name alone does not answer the question these lines exist to
+    answer. "⚙ Bash" nine times is barely more informative than silence;
+    "⚙ Bash — npm test" tells the watcher the turn is moving and roughly
+    where it is (#91).
+
+    The argument picked per tool is the one a human would read first. An
+    unknown tool degrades to the bare name rather than dumping its input —
+    tool inputs carry file contents, patch bodies and credentials, and this
+    goes to a Discord channel.
+    """
+    name = str(tool_name or "unknown")
+    detail = ""
+
+    if isinstance(tool_input, dict):
+        # Ordered: first key present wins, so Edit reports its path rather
+        # than its patch body.
+        for key in ("command", "file_path", "path", "pattern", "url",
+                    "query", "description", "notebook_path"):
+            value = tool_input.get(key)
+            if isinstance(value, str) and value.strip():
+                detail = value.strip()
+                break
+
+    if detail:
+        detail = " ".join(detail.split())
+        if len(detail) > TOOL_EVENT_DETAIL_CHARS:
+            detail = detail[:TOOL_EVENT_DETAIL_CHARS - 1].rstrip() + "…"
+        # Backticks and newlines would break out of the subtext line.
+        detail = detail.replace("`", "'")
+        return f"-# ⚙ {name} — {detail}"
+
+    return f"-# ⚙ {name}"
+
+
 async def start_typing(agent: str, channel_id: str):
     """Start typing indicator in Discord channel"""
     if channel_id == "0" or channel_id in typing_tasks:
@@ -1393,9 +1464,21 @@ async def read_agent_response(
         return "", {}
 
     config = agent_config.get(agent, {})
-    tool_streaming = config.get("tool_streaming", False)
+    # Default ON as of #91. It was False and, more to the point, dead: no
+    # config file, template, doc or test in this repo ever set it, so the
+    # tool_use branch below could not fire on any install. The issue's
+    # acceptance test requires the lines to appear, and an opt-in nobody
+    # knows about does not answer "is it broken?" for the people asking.
+    # Set "tool_streaming": false in agents.json to go back to silence.
+    tool_streaming = config.get("tool_streaming", True)
     stream_to_channel = config.get("stream_to_channel", False)
     msg_ids = message_ids or []
+
+    # Throttle state is per-turn, not global: each turn starts with its
+    # first tool line free so a long turn says something quickly. None, not
+    # 0.0 — see should_post_tool_line().
+    tool_lines_posted = 0
+    last_tool_line_at: Optional[float] = None
 
     final_text = ""
     metadata = {}
@@ -1464,7 +1547,20 @@ async def read_agent_response(
                         tool_name = block.get("name", "unknown")
                         log.info(f"{agent} called tool: {tool_name}")
                         if tool_streaming and channel_id != "0":
-                            await post_to_discord(agent, channel_id, f"🔧 {tool_name}")
+                            now = time.monotonic()
+                            if should_post_tool_line(tool_lines_posted,
+                                                     last_tool_line_at, now):
+                                tool_lines_posted += 1
+                                last_tool_line_at = now
+                                # dead_letter stays False: a tool line is a
+                                # liveness signal, worthless once the turn
+                                # has ended, and replaying it later would be
+                                # noise. post_to_discord's own docstring
+                                # already names these as an incidental.
+                                await post_to_discord(
+                                    agent, channel_id,
+                                    summarize_tool_call(tool_name, block.get("input")),
+                                )
                     # `thinking` blocks are intentionally ignored here — they
                     # are stripped from the final text below as a belt-and-
                     # braces measure for any inline <thinking> tags.
