@@ -343,3 +343,45 @@ object to that agent's entry in `config/agents.json`:
 replacement) when spawning that agent's subprocess, so the agent still
 inherits `WORKSPACE_ROOT`, API credentials, etc. An agent with no `env` key
 spawns exactly as before this feature existed (`env=None`, plain inherit).
+
+### Mid-turn tool activity lines
+
+While a turn is running, the agent posts a subtext line naming each tool
+call and what it is working on:
+
+```
+-# ⚙ Bash — npm test
+-# ⚙ Read — /srv/app/main.py
+```
+
+This exists so a four-minute turn is distinguishable from a hung one — the
+typing indicator alone cannot tell you the difference. **It is on by
+default.** To silence it for an agent, set `tool_streaming` in that agent's
+`config/agents.json` entry:
+
+```json
+{
+  "agents": {
+    "researcher": {
+      "system_prompt": "agents/researcher/SYSTEM_PROMPT.md",
+      "tool_streaming": false
+    }
+  }
+}
+```
+
+The lines are throttled, and the throttle is what makes on-by-default safe:
+the first tool call of a turn always posts, then at most one line every
+`TOOL_EVENT_MIN_INTERVAL` seconds, with a hard ceiling of
+`TOOL_EVENT_MAX_PER_TURN` lines per turn (both in `bin/agent-server.py`). A
+turn making fifty rapid tool calls posts one line, not fifty. These are a
+liveness signal rather than an audit log — for a complete record of tool
+calls, read the agent's log or `mcp/tools-server.py`'s `tool_calls` table.
+
+Only a known argument is shown (`command`, `file_path`, `pattern`, `url`,
+and a few more); an unrecognised tool gets its bare name. Tool inputs carry
+file contents, patch bodies and credentials, and this line goes to a Discord
+channel, so the summary is an allow-list rather than a best-effort dump.
+
+Agents running with `channel_id` `"0"` (the local/headless lane) post
+nothing, as with every other Discord surface.
