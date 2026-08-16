@@ -18,9 +18,47 @@ interface ChatMessage {
   role: "user" | "assistant";
   content: string;
   ts: string;
+  // Terminal status of the turn that produced this message, as reported by
+  // /api/chat/stream. Absent on user messages and on history seeded from
+  // /api/chat, which does not record it.
+  status?: string;
+  error?: string;
 }
 
 const MAX_TEXTAREA_ROWS = 8;
+
+// The one terminal status that means the agent finished its turn. Every other
+// value the stream can send -- crashed, skipped, timeout, error, unknown:<n>
+// (see dashboard/app/api/chat/stream/route.ts) -- ended the turn early, and
+// the text already rendered above the banner is a partial answer.
+const STATUS_COMPLETE = "complete";
+
+// Client-side only: EventSource.onerror, i.e. the connection dropped before
+// any terminal status arrived. Distinct from the server's "error", which the
+// server was still alive enough to send.
+const STATUS_DISCONNECTED = "disconnected";
+
+/** Banner copy for a non-complete terminal status. */
+function terminalStatusMessage(status: string, error?: string): string {
+  switch (status) {
+    case "crashed":
+      return "The agent crashed mid-turn. The response above is partial.";
+    case "skipped":
+      return "This turn was skipped — the agent never processed it.";
+    case "timeout":
+      return "The stream timed out after 5 minutes. The agent may still be working; reload to see the stored response.";
+    case STATUS_DISCONNECTED:
+      return "Lost connection to the server before the turn finished. The response above is partial.";
+    case "error":
+      return error
+        ? `The stream failed: ${error}`
+        : "The stream failed before the turn finished.";
+    default:
+      // unknown:<n> — a status the server knows about and this client does
+      // not. Show it rather than swallowing it.
+      return `The turn ended with an unexpected status: ${status}.`;
+  }
+}
 
 export default function ChatPage() {
   const { data: agentData } = usePoll<AgentList>("/api/agents", 30000);
@@ -178,9 +216,32 @@ export default function ChatPage() {
       // Subscribe to SSE stream
       const eventSource = new EventSource(`/api/chat/stream?message_id=${messageId}`);
 
+      // Stamp a terminal status onto the assistant message currently being
+      // streamed. Guarded on role so a race that appended a user message
+      // first cannot mark the wrong bubble as crashed.
+      const markLastAssistant = (status: string, error?: string) => {
+        setMessages((prev) =>
+          prev.map((m, i) =>
+            i === prev.length - 1 && m.role === "assistant"
+              ? { ...m, status, error }
+              : m
+          )
+        );
+      };
+
+      // A terminal status may arrive with the response still empty (an agent
+      // that crashed before writing a byte). Tracked so onerror can tell a
+      // real transport drop from the close that follows a normal finish.
+      let sawTerminal = false;
+
       eventSource.onmessage = (event) => {
         const payload = JSON.parse(event.data);
         if (payload.done) {
+          // Previously this discarded payload.status, so a crash rendered
+          // identically to a clean finish -- the user saw a partial response
+          // and assumed the agent was done (#64, server side fixed in #56).
+          sawTerminal = true;
+          markLastAssistant(payload.status ?? STATUS_COMPLETE, payload.error);
           eventSource.close();
           setStreaming(false);
         } else if (payload.chunk) {
@@ -195,6 +256,12 @@ export default function ChatPage() {
       };
 
       eventSource.onerror = () => {
+        // EventSource fires onerror on a normal close too. Only surface a
+        // banner if no terminal status ever arrived -- otherwise this would
+        // overwrite the real status with "disconnected" on every clean turn.
+        if (!sawTerminal) {
+          markLastAssistant(STATUS_DISCONNECTED);
+        }
         eventSource.close();
         setStreaming(false);
       };
@@ -351,6 +418,15 @@ export default function ChatPage() {
                   </ReactMarkdown>
                   {isLastStreaming && (
                     <span className="opacity-50 inline-block">▌</span>
+                  )}
+                  {msg.status && msg.status !== STATUS_COMPLETE && (
+                    <div
+                      role="alert"
+                      className="mt-2 flex items-start gap-2 rounded border border-red-900 bg-red-950/50 px-3 py-2 text-xs text-red-300"
+                    >
+                      <span aria-hidden="true">⚠</span>
+                      <span>{terminalStatusMessage(msg.status, msg.error)}</span>
+                    </div>
                   )}
                 </div>
               )}
