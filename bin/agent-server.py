@@ -1611,8 +1611,19 @@ async def process_agent_queue(agent: str):
             ask_registry.discard_agent(agent)
             agent_turn_context.pop(agent, None)
 
-        # Stop typing
-        await stop_typing(channel_id)
+            # Stop typing. A batch can span multiple channels when messages
+            # queued up behind this turn in a channel other than channel_id
+            # (see the elif in handle_message, #121) — each of those got its
+            # own start_typing() call at arrival time, so each needs to be
+            # stopped here too, not just the reply channel, or that
+            # indicator spins forever with no reply landing to end it.
+            #
+            # In the finally, not after it: read_agent_response raising is
+            # the one case where nothing downstream will ever clear these,
+            # and #121 turned that from one stuck indicator into one per
+            # channel in the batch.
+            for cid in {msg["channel_id"] for msg in messages}:
+                await stop_typing(cid)
 
         # Post cost update
         if metadata:
@@ -1637,6 +1648,30 @@ async def process_agent_queue(agent: str):
         await db.commit()
 
         log.info(f"{agent} processed {len(message_ids)} messages")
+
+        # Anything that arrived while this turn was running is still QUEUED,
+        # and handle_message is the ONLY caller of this function — it fires
+        # solely on the IDLE branch. So without this, a message that landed
+        # mid-turn waits not for the turn to end but for the *next* inbound
+        # message to arrive and happen to sweep it up. That is the second
+        # half of #121: the first half puts a typing indicator in the
+        # waiting channel, and this is what makes it a promise the server
+        # can keep rather than an indicator that spins until someone else
+        # speaks.
+        #
+        # create_task, not a direct call: the lock is still held here and it
+        # is not reentrant. The new task blocks on it until this `async
+        # with` exits. It cannot spin — every drain moves its batch out of
+        # STATUS_QUEUED, so the count strictly decreases, and the `if not
+        # messages: return` above is the floor.
+        async with db.execute(
+            "SELECT COUNT(*) AS count FROM message_queue WHERE agent = ? AND processed = ?",
+            (agent, STATUS_QUEUED)
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row and row["count"]:
+            log.info(f"{agent} has {row['count']} messages still queued — draining again")
+            asyncio.create_task(process_agent_queue(agent))
 
 # =============================================================================
 # Crash Recovery
@@ -1780,6 +1815,21 @@ async def handle_message(request):
     # Trigger processing if agent is idle
     if agent_states.get(agent) == "IDLE":
         asyncio.create_task(process_agent_queue(agent))
+    elif agent_states.get(agent) == "PROCESSING":
+        # Agent is mid-turn in another channel. Without this, a message
+        # landing behind a busy turn shows no typing indicator and no ack
+        # until the drain happens to reach it — indistinguishable from being
+        # ignored (#121). start_typing() is a no-op for channel_id "0" and
+        # for a channel that already has a task running, so it composes
+        # safely with the drain's own start_typing() once this channel is
+        # picked up.
+        #
+        # PROCESSING specifically, not "anything but IDLE": the indicator is
+        # a promise that a turn is in flight and will end. In ERROR_RECOVERY
+        # — or for an agent with no state at all, i.e. one that never
+        # started — no turn is running, nothing will call stop_typing(), and
+        # the indicator would spin until the process restarts.
+        asyncio.create_task(start_typing(agent, channel_id))
 
     return web.json_response({"status": "queued", "message_id": message_id}, status=202)
 
