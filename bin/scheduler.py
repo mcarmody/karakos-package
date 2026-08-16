@@ -171,6 +171,24 @@ def run_cli_upgrade_watchdog():
     except OSError as e:
         log.error(f"CLI upgrade watchdog could not run: {e}")
 
+def run_flush_deferred_messages():
+    """Re-fire inbound messages spooled while the agent server was down (#88).
+
+    relay.py and poke.sh spool undeliverable /message payloads to
+    data/deferred-messages/; this delivers them once the server is back. The
+    cadence bounds how long a message sent during an outage waits after
+    recovery.
+    """
+    try:
+        subprocess.run(
+            ["python3", f"{WORKSPACE_ROOT}/bin/flush-deferred-messages.py"],
+            check=True,
+            capture_output=True,
+            text=True
+        )
+    except subprocess.CalledProcessError as e:
+        log.error(f"Deferred-message flush failed: {e.stderr}")
+
 def check_updates():
     """Check for Karakos updates"""
     log.info("Checking for updates")
@@ -234,6 +252,10 @@ def main():
     # unanswered messages. The tick itself is a version read — it only spends
     # an API turn when the version actually moved.
     schedule.every().hour.do(run_cli_upgrade_watchdog)
+    # Every 5 minutes: a message spooled during an agent-server outage (#88)
+    # should arrive shortly after the server returns, not at the next daily
+    # sweep. A pass over an empty spool directory is a directory listing.
+    schedule.every(5).minutes.do(run_flush_deferred_messages)
     schedule.every().day.at("04:30").do(purge_old_data)
     schedule.every().monday.at("05:00").do(check_updates)  # Weekly update check
 
