@@ -85,6 +85,20 @@ TOOL_EVENT_MIN_INTERVAL = 5    # seconds between lines within one turn
 TOOL_EVENT_MAX_PER_TURN = 12   # hard ceiling per turn
 TOOL_EVENT_DETAIL_CHARS = 90   # truncation for the argument summary
 
+# Bottom-of-turn activity indicator (#76). The dashboard chat page has one
+# liveness signal — a blinking cursor — and it says the same thing during a
+# 40ms gap and a four-minute Bash call. #91 answered that for Discord and
+# only for Discord; this is the same observation point reaching the other
+# surface.
+#
+# Deferred rather than immediate: a note is scheduled this far out and
+# cancelled if the next stream event lands first, so only gaps a human would
+# actually notice ever reach the database. Without that, a turn making fifty
+# fast tool calls flickers fifty pills through a 200ms poll and reads as
+# noise, not as progress.
+ACTIVITY_DELAY_S = 0.5
+ACTIVITY_THINKING = "thinking…"
+
 # Processing states
 STATUS_QUEUED = 0
 STATUS_IN_PROGRESS = 1
@@ -210,6 +224,7 @@ async def init_db():
             attachments TEXT,
             processed INTEGER DEFAULT 0,
             response TEXT,
+            activity TEXT,
             discord_response_id TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             processing_started_at TIMESTAMP,
@@ -271,6 +286,13 @@ async def init_db():
     # IF NOT EXISTS is a no-op against an existing table, so a new column in
     # the definition above reaches upgraded installs only through here.
     await ensure_column("message_queue", "attachments", "TEXT")
+    # #76. Deliberately not named `status`: `processed` is already this
+    # row's lifecycle status, the dashboard route already calls its values
+    # STATUS_*, and the chat page already has a *third* `status` meaning the
+    # terminal outcome of the turn. A fourth would be free confusion.
+    # `activity` says what it holds — transient, in-turn, always NULL
+    # between turns.
+    await ensure_column("message_queue", "activity", "TEXT")
 
     await db.commit()
     log.info("Database initialized")
@@ -1472,7 +1494,7 @@ def should_post_tool_line(lines_posted: int, last_at: Optional[float],
     return now - last_at >= TOOL_EVENT_MIN_INTERVAL
 
 
-def summarize_tool_call(tool_name: str, tool_input: Optional[Dict]) -> str:
+def describe_tool_call(tool_name: str, tool_input: Optional[Dict]) -> str:
     """One-line "⚙ Bash — npm test" summary of a stream-json tool_use block.
 
     The tool name alone does not answer the question these lines exist to
@@ -1483,7 +1505,9 @@ def summarize_tool_call(tool_name: str, tool_input: Optional[Dict]) -> str:
     The argument picked per tool is the one a human would read first. An
     unknown tool degrades to the bare name rather than dumping its input —
     tool inputs carry file contents, patch bodies and credentials, and this
-    goes to a Discord channel.
+    reaches both a Discord channel (#91) and the dashboard chat page (#76).
+    Both surfaces go through here so neither can be redacted less than the
+    other.
     """
     name = str(tool_name or "unknown")
     detail = ""
@@ -1504,9 +1528,19 @@ def summarize_tool_call(tool_name: str, tool_input: Optional[Dict]) -> str:
             detail = detail[:TOOL_EVENT_DETAIL_CHARS - 1].rstrip() + "…"
         # Backticks and newlines would break out of the subtext line.
         detail = detail.replace("`", "'")
-        return f"-# ⚙ {name} — {detail}"
+        return f"⚙ {name} — {detail}"
 
-    return f"-# ⚙ {name}"
+    return f"⚙ {name}"
+
+
+def summarize_tool_call(tool_name: str, tool_input: Optional[Dict]) -> str:
+    """describe_tool_call() as a Discord subtext line (#91).
+
+    The `-# ` prefix is Discord markup and belongs to that surface only —
+    the dashboard pill (#76) renders describe_tool_call() directly and would
+    otherwise show a literal "-#".
+    """
+    return f"-# {describe_tool_call(tool_name, tool_input)}"
 
 
 async def start_typing(agent: str, channel_id: str):
@@ -1593,6 +1627,91 @@ async def write_streaming_response(message_ids: List[str], text: str) -> None:
         log.warning(f"streaming response write failed: {e}")
 
 
+async def write_activity(message_ids: List[str], note: Optional[str]) -> None:
+    """Set (or clear, with note=None) the in-turn activity note on a batch.
+
+    Read back by /api/chat/stream, which is already polling these rows every
+    200ms for response deltas — this rides the poll that exists rather than
+    adding a channel. Wrapped like write_streaming_response: a bookkeeping
+    failure must never cost the agent's actual reply, which is still arriving
+    on the same loop.
+    """
+    if not message_ids or db is None:
+        return
+    placeholders = ",".join("?" * len(message_ids))
+    try:
+        await db.execute(
+            f"UPDATE message_queue SET activity = ? WHERE message_id IN ({placeholders})",
+            (note, *message_ids),
+        )
+        await db.commit()
+    except Exception as e:
+        log.warning(f"activity write failed: {e}")
+
+
+class ActivityIndicator:
+    """Deferred, self-cancelling activity note for one turn's rows.
+
+    The mechanism the issue actually asks for, and the reusable half: any
+    future post-turn work (indexing, embedding, audit logging) gets a pill
+    by calling set() and clear() around it.
+
+    set() does not write. It schedules a write `delay` seconds out and
+    cancels whatever was pending, so a state that resolves faster than a
+    human can read never appears at all. clear() erases a note that did make
+    it to screen and is a no-op otherwise.
+
+    Ordering is the fiddly part: a pending task cancelled mid-UPDATE could
+    otherwise land *after* the clear that was meant to supersede it and
+    strand a stale pill for the rest of the turn. So every transition
+    settles the previous task — cancel *and await* — before writing.
+    """
+
+    def __init__(self, message_ids, delay: Optional[float] = None, writer=None):
+        self._ids = list(message_ids or [])
+        # Read at construction, not bound as a default argument: a default is
+        # evaluated once at class-definition time, so the module global would
+        # be frozen at import and no test could shorten it — which would look
+        # exactly like a passing test of a delay nobody set.
+        self._delay = ACTIVITY_DELAY_S if delay is None else delay
+        self._write = writer or write_activity
+        self._task: Optional[asyncio.Task] = None
+        # True once a note has been (or is being) written. Set *before* the
+        # await, not after: a cancellation landing inside the write leaves
+        # the row's true state unknown, and clearing a column that is
+        # already NULL is free, while leaving a live one set is the bug.
+        self._shown = False
+
+    async def _settle(self) -> None:
+        task, self._task = self._task, None
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    async def _show_later(self, note: str) -> None:
+        await asyncio.sleep(self._delay)
+        self._shown = True
+        await self._write(self._ids, note)
+
+    async def set(self, note: str) -> None:
+        """Schedule `note`, replacing anything pending or on screen."""
+        await self._settle()
+        if not self._ids or not note:
+            return
+        self._task = asyncio.create_task(self._show_later(note))
+
+    async def clear(self) -> None:
+        """Drop any pending note and erase one already on screen."""
+        await self._settle()
+        if self._shown:
+            self._shown = False
+            await self._write(self._ids, None)
+
+
 def extract_permission_denials(result_event: Dict) -> List[Dict]:
     """Pull the `permission_denials` list off a stream-json `result` event.
     Always a list, never None, so callers can iterate unconditionally."""
@@ -1627,6 +1746,14 @@ async def read_agent_response(
     final_text = ""
     metadata = {}
     last_posted_chunk = ""
+
+    # #76. Not gated on tool_streaming or on channel_id: that flag silences a
+    # *Discord channel*, and the headless lane (channel_id "0") is precisely
+    # where the dashboard is the only window onto the turn. The gap before
+    # the first token is a real one — nothing has been written to the row
+    # yet, so the page shows an empty bubble and a blinking cursor.
+    activity = ActivityIndicator(msg_ids)
+    await activity.set(ACTIVITY_THINKING)
 
     try:
         while True:
@@ -1690,6 +1817,14 @@ async def read_agent_response(
                     elif btype == "tool_use":
                         tool_name = block.get("name", "unknown")
                         log.info(f"{agent} called tool: {tool_name}")
+                        # The dashboard pill is not throttled the way the
+                        # channel lines are: it is one cell that gets
+                        # overwritten, not a stream of messages, so fifty
+                        # calls cost fifty UPDATEs and no noise. The delay
+                        # in set() is what keeps fast calls off the screen.
+                        await activity.set(
+                            describe_tool_call(tool_name, block.get("input"))
+                        )
                         if tool_streaming and channel_id != "0":
                             now = time.monotonic()
                             if should_post_tool_line(tool_lines_posted,
@@ -1710,6 +1845,11 @@ async def read_agent_response(
                     # braces measure for any inline <thinking> tags.
 
                 if got_text:
+                    # Text arriving IS the liveness signal — a pill beside
+                    # it would be saying the same thing twice. Cleared
+                    # before the write so the poll that sees new text never
+                    # also sees a stale note.
+                    await activity.clear()
                     cleaned = THINKING_BLOCK_RE.sub("", final_text)
                     await write_streaming_response(msg_ids, cleaned)
 
@@ -1747,6 +1887,12 @@ async def read_agent_response(
 
     except Exception as e:
         log.error(f"Error reading response from {agent}: {e}")
+
+    # Unconditional, and outside the try on purpose: the turn is over by
+    # every exit — result, EOF, a crash mid-stream, an /interrupt — and a
+    # note that outlives its turn is worse than none. It is the one thing on
+    # the page still claiming the agent is working (#76).
+    await activity.clear()
 
     # Strip any inline thinking blocks (defense in depth)
     final_text = THINKING_BLOCK_RE.sub("", final_text).strip()

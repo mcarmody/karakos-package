@@ -48,6 +48,10 @@ export async function GET(request: NextRequest) {
       }
 
       let lastSize = 0;
+      // Last activity note forwarded (#76). Tracked so the poll sends an
+      // event on *change* rather than five identical ones a second for the
+      // whole of a four-minute tool call.
+      let lastActivity: string | null = null;
       let polling = false;     // overlap guard — skip ticks if previous still in flight
       let closed = false;
       let pollHandle: ReturnType<typeof setInterval> | null = null;
@@ -85,7 +89,7 @@ export async function GET(request: NextRequest) {
         polling = true;
         try {
           const row = await db.get(
-            "SELECT response, processed FROM message_queue WHERE message_id = ?",
+            "SELECT response, processed, activity FROM message_queue WHERE message_id = ?",
             messageId
           );
 
@@ -95,6 +99,15 @@ export async function GET(request: NextRequest) {
           if (response.length > lastSize) {
             send({ chunk: response.substring(lastSize) });
             lastSize = response.length;
+          }
+
+          // Sent before the terminal check below, so the pill that a turn
+          // ends by clearing gets its null delivered rather than dropped on
+          // the same tick the stream closes.
+          const activity: string | null = row.activity || null;
+          if (activity !== lastActivity) {
+            send({ activity });
+            lastActivity = activity;
           }
 
           const processed = row.processed as number;

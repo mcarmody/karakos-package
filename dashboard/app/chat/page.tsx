@@ -23,6 +23,10 @@ interface ChatMessage {
   // /api/chat, which does not record it.
   status?: string;
   error?: string;
+  // Transient in-turn activity note ("⚙ Bash — npm test", "thinking…"), also
+  // from /api/chat/stream (#76). Lives only while the turn is streaming; the
+  // server clears it by every exit and the terminal event drops it here too.
+  activity?: string;
 }
 
 const MAX_TEXTAREA_ROWS = 8;
@@ -223,7 +227,23 @@ export default function ChatPage() {
         setMessages((prev) =>
           prev.map((m, i) =>
             i === prev.length - 1 && m.role === "assistant"
-              ? { ...m, status, error }
+              // activity is dropped with the same update that stamps the
+              // terminal status: the turn is over, so any note still set is
+              // by definition stale — including on the paths where the
+              // server never got to clear it (a crash, a dropped stream).
+              ? { ...m, status, error, activity: undefined }
+              : m
+          )
+        );
+      };
+
+      // Replace the streaming bubble's activity note. Same last-assistant
+      // guard as markLastAssistant, for the same reason.
+      const setLastActivity = (activity?: string) => {
+        setMessages((prev) =>
+          prev.map((m, i) =>
+            i === prev.length - 1 && m.role === "assistant"
+              ? { ...m, activity }
               : m
           )
         );
@@ -252,6 +272,11 @@ export default function ChatPage() {
                 : m
             )
           );
+        } else if ("activity" in payload) {
+          // Keyed on presence, not truthiness: `{activity: null}` is how the
+          // server says the note is gone, and a truthiness test would leave
+          // the last pill on screen for the rest of the turn.
+          setLastActivity(payload.activity ?? undefined);
         }
       };
 
@@ -418,6 +443,19 @@ export default function ChatPage() {
                   </ReactMarkdown>
                   {isLastStreaming && (
                     <span className="opacity-50 inline-block">▌</span>
+                  )}
+                  {isLastStreaming && msg.activity && (
+                    <div
+                      role="status"
+                      aria-live="polite"
+                      className="mt-2 inline-flex items-center gap-2 rounded-full border border-gray-800 bg-gray-950 px-2.5 py-1 text-xs text-gray-400"
+                    >
+                      <span
+                        aria-hidden="true"
+                        className="inline-block h-1.5 w-1.5 rounded-full bg-blue-400 animate-pulse"
+                      />
+                      <span>{msg.activity}</span>
+                    </div>
                   )}
                   {msg.status && msg.status !== STATUS_COMPLETE && (
                     <div
