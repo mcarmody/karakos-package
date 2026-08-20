@@ -4,6 +4,7 @@ import { useState, useEffect, useRef, useCallback, FormEvent, KeyboardEvent } fr
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { usePoll } from "@/lib/hooks";
+import { formatDuration, formatTokens } from "@/lib/format";
 
 interface AgentList {
   // /api/agents returns { agents: [...] }, an array of { name, state, ... }
@@ -135,6 +136,40 @@ function InterstitialRow({ label, body }: { label: string; body: string }) {
   );
 }
 
+// One row per (agent, session_id) from GET /cost/conversations — see
+// handle_cost_conversations in bin/agent-server.py. Only the fields the
+// badge needs are declared here.
+interface ConversationSummary {
+  agent: string;
+  session_id: string;
+  cost: number;
+  input_tokens: number;
+  output_tokens: number;
+  duration_ms: number;
+  turns: number;
+  current: boolean;
+}
+
+/** Badge next to the agent picker showing spend/tokens/duration for the
+ * conversation (context window) currently live for this agent — not the
+ * lifetime or daily total shown on the Costs page. */
+function ConversationBadge({ conv }: { conv: ConversationSummary }) {
+  return (
+    <span
+      className="inline-flex items-center gap-1.5 px-2 py-1 rounded border border-gray-800 bg-gray-900 text-xs text-gray-400"
+      title={`Session ${conv.session_id} · ${conv.turns} turn${conv.turns === 1 ? "" : "s"}`}
+    >
+      <span className="text-gray-500">this conversation</span>
+      <span className="text-gray-600">·</span>
+      <span className="text-gray-200">${conv.cost.toFixed(2)}</span>
+      <span className="text-gray-600">·</span>
+      <span>{formatTokens(conv.input_tokens + conv.output_tokens)} tok</span>
+      <span className="text-gray-600">·</span>
+      <span>{formatDuration(conv.duration_ms)}</span>
+    </span>
+  );
+}
+
 type DotState = "idle" | "replying" | "busy" | "recovering";
 
 // What each agent is doing, by name -> color + label. idle
@@ -168,6 +203,13 @@ function StatusDot({ state }: { state: DotState }) {
 
 export default function ChatPage() {
   const { data: agentData } = usePoll<AgentList>("/api/agents", 30000);
+  // Polled unfiltered (same endpoint the Costs page uses) and matched
+  // client-side to the selected agent's live session below — avoids a
+  // second query param path for what /cost/conversations already returns.
+  const { data: conversationsData } = usePoll<{ conversations: ConversationSummary[] }>(
+    "/api/cost/conversations",
+    30000
+  );
   const [agent, setAgent] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
@@ -195,6 +237,9 @@ export default function ChatPage() {
 
   const currentAgentInfo = chattable.find((a) => a.name === agent);
   const agentLabel = currentAgentInfo?.label || agent;
+  const currentConversation = conversationsData?.conversations.find(
+    (c) => c.agent === agent && c.current
+  );
   const dotState: DotState = streaming
     ? "replying"
     : currentAgentInfo?.state === "PROCESSING"
@@ -473,6 +518,7 @@ export default function ChatPage() {
           ))}
         </select>
         {agent && <StatusDot state={dotState} />}
+        {currentConversation && <ConversationBadge conv={currentConversation} />}
         <button
           type="button"
           onClick={handleReload}
