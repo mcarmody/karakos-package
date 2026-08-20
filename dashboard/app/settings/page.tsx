@@ -1,6 +1,7 @@
 "use client";
 
 import { usePoll } from "@/lib/hooks";
+import ThemeToggle from "@/app/components/ThemeToggle";
 
 interface ConfigData {
   system_name: string;
@@ -46,6 +47,14 @@ export default function SettingsPage() {
             <Row label="Timeout" value={cfg.timeout == null ? "—" : `${cfg.timeout}s`} />
           </div>
         ))}
+      </Section>
+
+      <Section title="Theme">
+        <p style={{ fontSize: "0.8rem", color: "#888", margin: "0 0 0.75rem" }}>
+          Lamplight time-of-day palette. Dark/Light pin night/day; Auto follows
+          the clock.
+        </p>
+        <ThemeToggle />
       </Section>
 
       <Section title="Integrations">

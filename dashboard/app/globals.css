@@ -9,3 +9,235 @@ body {
 html, body, #root {
   height: 100%;
 }
+
+/*
+ * Lamplight — hour-driven palette.
+ * data-hour is set pre-paint by the inline script in app/layout.tsx and
+ * re-checked every minute by LampShell (app/components/LampShell.tsx).
+ *
+ * This is additive infrastructure: it defines the custom properties and
+ * makes them live, but doesn't reskin the existing gray-950 Tailwind chrome
+ * (that would be a much bigger, riskier visual pass than "wire up the
+ * theming system"). Components that want the time-of-day palette — the
+ * chat speech-hierarchy materials, LampShell's own glow, ThemeToggle —
+ * opt in explicitly via var(--bg), var(--ink), etc.
+ */
+
+/* --sh-sign flips a shadow's x-offset at the desktop/tablet boundary: a
+   narrow phone column reads light from the top-right (negative x), a wide
+   desktop column reads it from the other side (positive x). Every
+   bucket's --sh-near/--sh-far wraps its x-offset in calc(...* var(--sh-sign))
+   so this one flip re-derives all eight palettes instead of duplicating
+   them. */
+:root { --sh-sign: 1; }
+
+:root,
+[data-hour="dusk"] {
+  --bg: #241c17; --ink: #f2e3d1; --accent: #e0a35c; --on-accent: #2a1c10; --hand: #f6dfc0;
+  --slip-near: linear-gradient(158deg, #463629, #382b21);
+  --slip-far: linear-gradient(158deg, #3a2d23, #2f251d);
+  --shelf: linear-gradient(to bottom, #1e1712, #171109);
+  --lamp: radial-gradient(circle, rgba(255, 206, 143, 0.52), rgba(255, 188, 118, 0.14) 55%, transparent 72%);
+  --cone: linear-gradient(202deg, rgba(255, 208, 150, 0.2), rgba(255, 190, 120, 0.05) 46%, transparent 70%);
+  --floor: linear-gradient(to bottom, transparent, rgba(9, 5, 3, 0.6));
+  --sh-near: calc(-6px * var(--sh-sign)) 10px 20px rgba(0, 0, 0, 0.24);
+  --sh-far: calc(-4px * var(--sh-sign)) 7px 14px rgba(0, 0, 0, 0.18);
+  --surface: #2f251d; --elevated: #463629;
+  --lit: rgba(255, 236, 205, 0.18);
+}
+
+[data-hour="dawn"] {
+  --bg: #f0e6dd; --ink: #3a2e26; --accent: #c2724a; --on-accent: #fff7f1; --hand: #6b503a;
+  --slip-near: linear-gradient(158deg, #fffaf4, #f2e7db);
+  --slip-far: linear-gradient(158deg, #f2e7db, #e8dbcd);
+  --shelf: linear-gradient(to bottom, #fdf8f3, #f1e6da);
+  --lamp: radial-gradient(circle, rgba(255, 206, 168, 0.5), rgba(240, 180, 140, 0.14) 55%, transparent 72%);
+  --cone: linear-gradient(202deg, rgba(255, 214, 180, 0.34), rgba(240, 190, 150, 0.08) 46%, transparent 70%);
+  --floor: linear-gradient(to bottom, transparent, rgba(120, 90, 70, 0.12));
+  --sh-near: calc(-5px * var(--sh-sign)) 9px 18px rgba(90, 64, 44, 0.16);
+  --sh-far: 0 4px 10px rgba(90, 64, 44, 0.1);
+  --surface: #e8dbcd; --elevated: #fffaf4;
+  --lit: rgba(255, 255, 255, 0.6);
+}
+
+[data-hour="morning"] {
+  --bg: #fbf7f0; --ink: #2b241c; --accent: #bf7433; --on-accent: #fff9f2; --hand: #7a5a34;
+  --slip-near: linear-gradient(158deg, #fffefb, #f5efe5);
+  --slip-far: linear-gradient(158deg, #f5efe5, #ece4d7);
+  --shelf: linear-gradient(to bottom, #fffefc, #f7f1e7);
+  --lamp: radial-gradient(circle, rgba(255, 244, 214, 0.72), rgba(255, 232, 186, 0.2) 55%, transparent 74%);
+  --cone: linear-gradient(202deg, rgba(255, 246, 222, 0.5), rgba(255, 236, 196, 0.12) 48%, transparent 72%);
+  --floor: linear-gradient(to bottom, transparent, rgba(120, 95, 60, 0.08));
+  --sh-near: 0 5px 14px rgba(124, 98, 62, 0.11);
+  --sh-far: 0 3px 9px rgba(124, 98, 62, 0.07);
+  --surface: #ece4d7; --elevated: #fffefb;
+  --lit: rgba(255, 255, 255, 0.65);
+}
+
+[data-hour="day"] {
+  --bg: #f8f2e8; --ink: #2b231b; --accent: #c07636; --on-accent: #fff8f0; --hand: #7a5a34;
+  --slip-near: linear-gradient(158deg, #fffdf8, #f4ece0);
+  --slip-far: linear-gradient(158deg, #f4ece0, #ebe1d3);
+  --shelf: linear-gradient(to bottom, #fffdf9, #f6efe4);
+  --lamp: radial-gradient(circle, rgba(255, 235, 190, 0.66), rgba(255, 225, 170, 0.18) 55%, transparent 74%);
+  --cone: linear-gradient(202deg, rgba(255, 238, 200, 0.44), rgba(255, 230, 180, 0.1) 48%, transparent 72%);
+  --floor: linear-gradient(to bottom, transparent, rgba(120, 95, 60, 0.09));
+  --sh-near: 0 5px 14px rgba(124, 98, 62, 0.12);
+  --sh-far: 0 3px 9px rgba(124, 98, 62, 0.08);
+  --surface: #ebe1d3; --elevated: #fffdf8;
+  --lit: rgba(255, 255, 255, 0.65);
+}
+
+[data-hour="afternoon"] {
+  --bg: #f7ece0; --ink: #31261d; --accent: #c26f2f; --on-accent: #fff7ee; --hand: #75512c;
+  --slip-near: linear-gradient(158deg, #fffaf2, #f2e6d7);
+  --slip-far: linear-gradient(158deg, #f2e6d7, #e9dbc9);
+  --shelf: linear-gradient(to bottom, #fdf7ee, #f3e8da);
+  --lamp: radial-gradient(circle, rgba(255, 220, 160, 0.6), rgba(250, 200, 140, 0.16) 55%, transparent 73%);
+  --cone: linear-gradient(202deg, rgba(255, 224, 172, 0.4), rgba(250, 205, 150, 0.1) 48%, transparent 71%);
+  --floor: linear-gradient(to bottom, transparent, rgba(110, 80, 50, 0.12));
+  --sh-near: calc(-3px * var(--sh-sign)) 7px 16px rgba(110, 80, 50, 0.14);
+  --sh-far: 0 4px 10px rgba(110, 80, 50, 0.09);
+  --surface: #e9dbc9; --elevated: #fffaf2;
+  --lit: rgba(255, 255, 255, 0.6);
+}
+
+[data-hour="golden"] {
+  --bg: #4a352a; --ink: #fbe9d4; --accent: #e59a4e; --on-accent: #33210f; --hand: #f8dcb8;
+  --slip-near: linear-gradient(158deg, #6a4c39, #57402f);
+  --slip-far: linear-gradient(158deg, #5a4232, #4a3628);
+  --shelf: linear-gradient(to bottom, #3d2b21, #2f2018);
+  --lamp: radial-gradient(circle, rgba(255, 196, 120, 0.6), rgba(255, 178, 100, 0.18) 55%, transparent 72%);
+  --cone: linear-gradient(202deg, rgba(255, 204, 140, 0.28), rgba(255, 184, 110, 0.07) 46%, transparent 70%);
+  --floor: linear-gradient(to bottom, transparent, rgba(30, 16, 8, 0.4));
+  --sh-near: calc(-7px * var(--sh-sign)) 11px 20px rgba(40, 22, 10, 0.24);
+  --sh-far: calc(-5px * var(--sh-sign)) 8px 14px rgba(40, 22, 10, 0.16);
+  --surface: #4a3628; --elevated: #6a4c39;
+  --lit: rgba(255, 236, 205, 0.2);
+}
+
+[data-hour="night"] {
+  --bg: #16110d; --ink: #e8d5be; --accent: #e0a35c; --on-accent: #1d1410; --hand: #f0dabb;
+  --slip-near: linear-gradient(158deg, #302419, #261c14);
+  --slip-far: linear-gradient(158deg, #251b14, #1e150f);
+  --shelf: linear-gradient(to bottom, #120d09, #0c0806);
+  --lamp: radial-gradient(circle, rgba(255, 196, 128, 0.42), rgba(240, 175, 105, 0.1) 55%, transparent 72%);
+  --cone: linear-gradient(202deg, rgba(255, 198, 136, 0.15), rgba(240, 175, 105, 0.04) 46%, transparent 70%);
+  --floor: linear-gradient(to bottom, transparent, rgba(0, 0, 0, 0.72));
+  --sh-near: calc(-5px * var(--sh-sign)) 9px 18px rgba(0, 0, 0, 0.28);
+  --sh-far: calc(-4px * var(--sh-sign)) 7px 13px rgba(0, 0, 0, 0.2);
+  --surface: #1e150f; --elevated: #302419;
+  --lit: rgba(255, 236, 205, 0.16);
+}
+
+[data-hour="late"] {
+  --bg: #0f0d0c; --ink: #cdbca9; --accent: #c98f4e; --on-accent: #17100b; --hand: #dcc5a6;
+  --slip-near: linear-gradient(158deg, #241a12, #1c140e);
+  --slip-far: linear-gradient(158deg, #1a130e, #150f0b);
+  --shelf: linear-gradient(to bottom, #0c0908, #070505);
+  --lamp: radial-gradient(circle, rgba(226, 170, 105, 0.3), rgba(200, 145, 85, 0.07) 55%, transparent 72%);
+  --cone: linear-gradient(202deg, rgba(226, 170, 105, 0.1), transparent 62%);
+  --floor: linear-gradient(to bottom, transparent, rgba(0, 0, 0, 0.8));
+  --sh-near: calc(-4px * var(--sh-sign)) 8px 15px rgba(0, 0, 0, 0.3);
+  --sh-far: calc(-3px * var(--sh-sign)) 6px 11px rgba(0, 0, 0, 0.22);
+  --surface: #150f0b; --elevated: #241a12;
+  --lit: rgba(255, 236, 205, 0.14);
+}
+
+/* Desktop/tablet boundary: the lamp graphic (LampShell) hangs top-right of
+   the content area at every width, but a wider column reads the light from
+   the other side — flip every bucket's shadow x-offset in one place. */
+@media (min-width: 768px) {
+  :root { --sh-sign: -1; }
+}
+
+/* ---- Lamplight materials — used by the chat speech-hierarchy rows ------ */
+
+/* Near slip: catches the lamp. Lit top edge + near shadow. */
+.slip-near {
+  background: var(--slip-near);
+  box-shadow: var(--sh-near);
+  border-radius: 4px 16px 16px 15px;
+}
+.slip-near.lit, .lit {
+  border-top: 1px solid var(--lit);
+}
+
+/* Far slip: sits in the falloff. No lit edge. */
+.slip-far {
+  background: var(--slip-far);
+  box-shadow: var(--sh-far);
+  border-radius: 4px 14px 14px 13px;
+}
+
+/* Agent prose never stretches past this measure, no matter the window. */
+.prose-measure {
+  max-width: 720px;
+}
+
+/* Press feedback on tappable elements. */
+.press {
+  transition: transform 130ms ease;
+}
+.press:active {
+  transform: scale(0.91);
+}
+
+/* ---- Motion --------------------------------------------------------- */
+
+@keyframes rise {
+  from { opacity: 0; transform: translateY(14px); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes lift {
+  from { opacity: 0; transform: translateY(26px) scale(0.96); }
+  to { opacity: 1; transform: none; }
+}
+/* Entrance keyframes for dimmed speech levels: MUST land on the target
+   opacity — a keyframe ending at 1 with fill-mode:both permanently
+   overrides the element's own dimming. */
+@keyframes liftD66 {
+  from { opacity: 0; transform: translateY(22px); }
+  to { opacity: 0.66; transform: none; }
+}
+@keyframes liftD34 {
+  from { opacity: 0; transform: translateY(22px); }
+  to { opacity: 0.34; transform: none; }
+}
+@keyframes breathe {
+  0%, 100% { opacity: 0.35; transform: scale(0.82); }
+  50% { opacity: 1; transform: scale(1.12); }
+}
+@keyframes caret {
+  0%, 49% { opacity: 1; }
+  50%, 100% { opacity: 0; }
+}
+/* currentColor, not a fixed token, so a halo dot can be accent (idle) or
+   an alert tone (something's wrong) by setting the element's own `color`. */
+@keyframes halo {
+  0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, currentColor 50%, transparent); }
+  70% { box-shadow: 0 0 0 11px transparent; }
+}
+/* Opacity-only: animating transform (or any property) on a filtered/large
+   layer forces continuous re-rasterization — unusably slow on phones.
+   Opacity composites on the GPU. */
+@keyframes flicker {
+  0%, 100% { opacity: 0.88; }
+  38% { opacity: 1; }
+  64% { opacity: 0.93; }
+}
+
+.anim-lift { animation: lift 0.7s cubic-bezier(0.16, 0.84, 0.24, 1) both; }
+.anim-rise { animation: rise 0.55s cubic-bezier(0.16, 0.84, 0.24, 1) both; }
+/* Interstitial / thinking entrances — land on the dimmed target opacity,
+   never on 1 (see the "trap" note above liftD66/liftD34). */
+.anim-liftD66 { animation: liftD66 0.6s cubic-bezier(0.16, 0.84, 0.24, 1) both; }
+.anim-liftD34 { animation: liftD34 0.6s cubic-bezier(0.16, 0.84, 0.24, 1) both; }
+
+@media (prefers-reduced-motion: reduce) {
+  .anim-lift, .anim-rise { animation: none; }
+  /* Dropping the animation must not drop the dimming it was landing on. */
+  .anim-liftD66 { animation: none; opacity: 0.66; }
+  .anim-liftD34 { animation: none; opacity: 0.34; }
+  .press:active { transform: none; }
+}
