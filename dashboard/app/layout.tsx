@@ -1,10 +1,34 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import "./globals.css";
 import LampShell from "./components/LampShell";
+import TabShelf from "./components/TabShelf";
+import { MANIFEST_THEME_COLOR } from "./lib/theme-tokens";
 
 export const metadata: Metadata = {
   title: "Karakos Dashboard",
   description: "Agent system monitoring and control",
+  manifest: "/manifest.webmanifest",
+  appleWebApp: {
+    capable: true,
+    statusBarStyle: "black-translucent",
+    title: "Karakos",
+  },
+  icons: {
+    apple: "/icons/apple-touch-icon.png",
+  },
+  other: {
+    // Next's appleWebApp.capable emits title + status-bar-style but not
+    // this legacy tag, and iOS ignores apple-mobile-web-app-status-bar-style
+    // without it present.
+    "apple-mobile-web-app-capable": "yes",
+  },
+};
+
+export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
+  viewportFit: "cover",
+  themeColor: MANIFEST_THEME_COLOR,
 };
 
 export default function RootLayout({
@@ -64,8 +88,15 @@ export default function RootLayout({
       </head>
       <body className="m-0 font-sans bg-gray-950 text-gray-100">
         <LampShell />
-        <div className="flex h-screen">
-          <nav className="w-52 p-4 border-r border-gray-800 flex-shrink-0">
+        {/* Sized off --app-height (globals.css), not h-screen -- 100dvh
+            reads short and inconsistently on mobile browsers, 100lvh
+            reads correctly against the real screen every time. */}
+        <div className="flex" style={{ height: "var(--app-height, 100dvh)" }}>
+          {/* Desktop/tablet persistent sidebar -- hidden below lg, where
+              TabShelf (a fixed bottom bar, portaled to document.body)
+              takes over instead of squeezing this 208px column onto a
+              phone screen. */}
+          <nav className="hidden lg:block w-52 p-4 border-r border-gray-800 flex-shrink-0">
             <h2 className="text-lg mb-6 text-white font-semibold">Karakos</h2>
             <ul className="list-none p-0 m-0 space-y-2">
               {[
@@ -87,10 +118,20 @@ export default function RootLayout({
               ))}
             </ul>
           </nav>
-          <main className="flex-1 p-6 overflow-auto h-screen">
+          {/* pb-24 on phone clears TabShelf's fixed bottom bar; lg:pb-6
+              matches the original padding once the shelf is hidden. Not
+              adding a top safe-area spacer here -- chat/page.tsx owns a
+              non-scrolling h-full column and a sibling spacer would push
+              its footer past main's box on notch phones instead of
+              clearing it (main isn't a flex container, so the two
+              children's heights would simply stack and overflow). Pages
+              that want top safe-area clearance can opt in with pt-safe
+              themselves (defined in globals.css). */}
+          <main className="flex-1 p-6 pb-24 lg:pb-6 overflow-auto">
             {children}
           </main>
         </div>
+        <TabShelf />
       </body>
     </html>
   );

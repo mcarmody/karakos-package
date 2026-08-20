@@ -10,6 +10,28 @@ html, body, #root {
   height: 100%;
 }
 
+/* App-shell height. Browser chrome (address bar, home-indicator strip)
+   makes 100dvh measure short and inconsistently so across mobile browsers
+   and reloads. 100lvh (the "largest" viewport unit — chrome collapsed) is
+   the one value that reads correctly against the real screen height every
+   time; --app-height is what the body shell in app/layout.tsx sizes
+   against, with 100dvh as the fallback for browsers that don't support
+   lvh yet. */
+:root { --app-height: 100lvh; }
+
+html, body {
+  /* The body shell sizes itself independently via --app-height, so
+     html/body only need to not be SHORTER than the viewport, not match it
+     exactly. Scroll containment: html/body are never meant to scroll
+     themselves — each page's own overflow-auto region is the only scroll
+     surface — but mobile Safari's elastic rubber-band drags the whole
+     document unless told not to. Scroll containers opt back in
+     individually. */
+  min-height: 100dvh;
+  overflow: hidden;
+  overscroll-behavior: none;
+}
+
 /*
  * Lamplight — hour-driven palette.
  * data-hour is set pre-paint by the inline script in app/layout.tsx and
@@ -182,6 +204,16 @@ html, body, #root {
 .press:active {
   transform: scale(0.91);
 }
+
+/* Mobile bottom tab shelf (TabShelf.tsx) — furniture tone + lit top edge. */
+.shelf {
+  background: var(--shelf);
+  border-top: 1px solid color-mix(in srgb, var(--lit) 55%, transparent);
+}
+
+/* Safe-area helpers — no-ops without viewport-fit=cover, harmless either way. */
+.pt-safe { padding-top: env(safe-area-inset-top); }
+.pb-safe { padding-bottom: env(safe-area-inset-bottom); }
 
 /* ---- Motion --------------------------------------------------------- */
 
