@@ -85,6 +85,23 @@ TOOL_EVENT_MIN_INTERVAL = 5    # seconds between lines within one turn
 TOOL_EVENT_MAX_PER_TURN = 12   # hard ceiling per turn
 TOOL_EVENT_DETAIL_CHARS = 90   # truncation for the argument summary
 
+# Live turn events for the dashboard chat: every thinking / interstitial-
+# text / tool_use block in a turn is persisted as a typed row keyed by the
+# queue message_id, which /api/chat/stream relays as typed SSE events. #91
+# (above) answered "is it still working?" for Discord; this is the same
+# observation point reaching the dashboard chat page, which otherwise only
+# ever sees the final response text at processed=2.
+TURN_EVENTS_DDL = """
+CREATE TABLE IF NOT EXISTS turn_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    content TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+)
+"""
+
 # Processing states
 STATUS_QUEUED = 0
 STATUS_IN_PROGRESS = 1
@@ -267,10 +284,20 @@ async def init_db():
         )
     """)
 
+    await db.execute(TURN_EVENTS_DDL)
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_turn_events_msg ON turn_events(message_id, seq)"
+    )
+
     # Migrations for databases created before a column existed. CREATE TABLE
     # IF NOT EXISTS is a no-op against an existing table, so a new column in
     # the definition above reaches upgraded installs only through here.
     await ensure_column("message_queue", "attachments", "TEXT")
+    # Conversation metrics: which session (== one context window; a cleared
+    # or respawned session is a new conversation) a cost row belongs to, so
+    # spend/tokens can be rolled up per conversation rather than only per
+    # agent. NULL on rows written before this column existed.
+    await ensure_column("cost_events", "session_id", "TEXT")
 
     await db.commit()
     log.info("Database initialized")
@@ -842,6 +869,11 @@ async def post_cost_update(agent: str, metadata: Dict):
     input_tokens = metadata.get("input_tokens", 0)
     output_tokens = metadata.get("output_tokens", 0)
     duration_ms = metadata.get("duration_ms", 0)
+    # A conversation is one context window: the CLI's own session_id, which
+    # only changes on a clear/respawn (see get_or_create_session /
+    # clear_session). The result event carries it, but fall back to the
+    # in-memory session map so a cost row is never left unattributed.
+    session_id = metadata.get("session_id") or agent_sessions.get(agent)
 
     # Calculate delta
     last_cost = agent_last_cost.get(agent, 0.0)
@@ -851,10 +883,10 @@ async def post_cost_update(agent: str, metadata: Dict):
     # Store in database
     await db.execute(
         """
-        INSERT INTO cost_events (agent, cost_delta, session_total, input_tokens, output_tokens, duration_ms)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO cost_events (agent, cost_delta, session_total, input_tokens, output_tokens, duration_ms, session_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
-        (agent, cost_delta, session_total, input_tokens, output_tokens, duration_ms)
+        (agent, cost_delta, session_total, input_tokens, output_tokens, duration_ms, session_id)
     )
     await db.commit()
 
@@ -1472,7 +1504,7 @@ def should_post_tool_line(lines_posted: int, last_at: Optional[float],
     return now - last_at >= TOOL_EVENT_MIN_INTERVAL
 
 
-def summarize_tool_call(tool_name: str, tool_input: Optional[Dict]) -> str:
+def describe_tool_call(tool_name: str, tool_input: Optional[Dict]) -> str:
     """One-line "⚙ Bash — npm test" summary of a stream-json tool_use block.
 
     The tool name alone does not answer the question these lines exist to
@@ -1483,7 +1515,8 @@ def summarize_tool_call(tool_name: str, tool_input: Optional[Dict]) -> str:
     The argument picked per tool is the one a human would read first. An
     unknown tool degrades to the bare name rather than dumping its input —
     tool inputs carry file contents, patch bodies and credentials, and this
-    goes to a Discord channel.
+    reaches both a Discord channel (#91) and the dashboard chat page. Both
+    surfaces go through here so neither can be redacted less than the other.
     """
     name = str(tool_name or "unknown")
     detail = ""
@@ -1504,9 +1537,42 @@ def summarize_tool_call(tool_name: str, tool_input: Optional[Dict]) -> str:
             detail = detail[:TOOL_EVENT_DETAIL_CHARS - 1].rstrip() + "…"
         # Backticks and newlines would break out of the subtext line.
         detail = detail.replace("`", "'")
-        return f"-# ⚙ {name} — {detail}"
+        return f"⚙ {name} — {detail}"
 
-    return f"-# ⚙ {name}"
+    return f"⚙ {name}"
+
+
+def summarize_tool_call(tool_name: str, tool_input: Optional[Dict]) -> str:
+    """describe_tool_call() as a Discord subtext line (#91).
+
+    The `-# ` prefix is Discord markup and belongs to that surface only —
+    the dashboard's turn-events pill renders describe_tool_call() directly
+    and would otherwise show a literal "-#".
+    """
+    return f"-# {describe_tool_call(tool_name, tool_input)}"
+
+
+async def write_turn_event(message_ids: List[str], seq: int, kind: str, content: str) -> None:
+    """Insert one turn_events row per message_id in this turn's batch.
+
+    A "turn" can cover several queued message_ids at once (#121); writing
+    the row once per id means whichever message_id the dashboard is polling
+    with (see /api/chat/stream) sees it, the same broadcast pattern
+    write_streaming_response uses for the response text itself. Best-effort:
+    a bookkeeping failure must never cost the agent's actual reply, which is
+    still arriving on this same loop.
+    """
+    if not message_ids or db is None:
+        return
+    try:
+        for mid in message_ids:
+            await db.execute(
+                "INSERT INTO turn_events (message_id, seq, kind, content) VALUES (?, ?, ?, ?)",
+                (mid, seq, kind, content),
+            )
+        await db.commit()
+    except Exception as e:
+        log.warning(f"turn_events insert failed: {e}")
 
 
 async def start_typing(agent: str, channel_id: str):
@@ -1628,6 +1694,15 @@ async def read_agent_response(
     metadata = {}
     last_posted_chunk = ""
 
+    # turn_events sequence number for this turn, and burst-collapse state
+    # for content-less thinking blocks. Some builds strip thinking TEXT from
+    # the transcript (signature only, empty body) — that still means "the
+    # agent is thinking," so it's surfaced as presence: one empty row per
+    # burst rather than one per block, which the chat page renders as a
+    # pulsing "thinking" label instead of a flood of identical empty rows.
+    event_seq = 0
+    in_empty_think_burst = False
+
     try:
         while True:
             line = await proc.stdout.readline()
@@ -1678,18 +1753,44 @@ async def read_agent_response(
                 got_text = False
                 for block in message.get("content", []) or []:
                     btype = block.get("type")
-                    if btype == "text":
+                    if btype == "thinking":
+                        body = (block.get("thinking") or "").strip()
+                        if body:
+                            event_seq += 1
+                            await write_turn_event(msg_ids, event_seq, "thinking", body)
+                            in_empty_think_burst = False
+                        elif not in_empty_think_burst:
+                            event_seq += 1
+                            await write_turn_event(msg_ids, event_seq, "thinking", "")
+                            in_empty_think_burst = True
+                    elif btype == "text":
                         text = block.get("text", "")
                         if text:
                             final_text += text
                             response_buffers[agent] = final_text
                             got_text = True
+                            in_empty_think_burst = False
                             if stream_to_channel and channel_id != "0":
                                 # TODO: Implement chunked streaming
                                 pass
+                            # Recorded as a turn event too, even though this
+                            # may turn out to BE the final answer — a block
+                            # can't be known final until the turn ends. The
+                            # dashboard chat page dedupes an interstitial
+                            # against the final body it matches.
+                            stripped = text.strip()
+                            if stripped and stripped.upper() != "PASS":
+                                event_seq += 1
+                                await write_turn_event(msg_ids, event_seq, "interstitial", stripped)
                     elif btype == "tool_use":
                         tool_name = block.get("name", "unknown")
                         log.info(f"{agent} called tool: {tool_name}")
+                        in_empty_think_burst = False
+                        event_seq += 1
+                        await write_turn_event(
+                            msg_ids, event_seq, "tool",
+                            describe_tool_call(tool_name, block.get("input")),
+                        )
                         if tool_streaming and channel_id != "0":
                             now = time.monotonic()
                             if should_post_tool_line(tool_lines_posted,
@@ -1705,9 +1806,6 @@ async def read_agent_response(
                                     agent, channel_id,
                                     summarize_tool_call(tool_name, block.get("input")),
                                 )
-                    # `thinking` blocks are intentionally ignored here — they
-                    # are stripped from the final text below as a belt-and-
-                    # braces measure for any inline <thinking> tags.
 
                 if got_text:
                     cleaned = THINKING_BLOCK_RE.sub("", final_text)
@@ -2144,7 +2242,14 @@ async def handle_agents(request):
             "max_turns": config.get("max_turns", 200),
             "timeout": config.get("timeout"),
             "state": agent_states.get(agent, "UNKNOWN"),
-            "has_discord_token": agent in AGENT_TOKENS
+            "has_discord_token": agent in AGENT_TOKENS,
+            # Chat-picker hygiene: not every configured agent is meant to be
+            # talked to directly from the dashboard (a low-capability relay
+            # exists to route, not converse). Defaults true so existing
+            # agents.json files with no opinion keep showing up. "label" is
+            # a human-friendly display name, defaulting to the raw agent key.
+            "dashboard_chat": config.get("dashboard_chat", True),
+            "label": config.get("label", agent),
         })
 
     return web.json_response({"agents": agents_list})
@@ -2352,6 +2457,51 @@ async def handle_usage(request):
     return web.json_response({"agents": agents})
 
 
+async def handle_cost_get_all(request):
+    """GET /cost - Get cost summary for every agent.
+
+    dashboard/app/api/cost/route.ts (and the Costs page behind it) has
+    called this shape since the dashboard's first commit, but nothing ever
+    registered a GET handler for the bare /cost path -- only POST /cost
+    (ingest, handle_cost) and GET /cost/{agent} (single-agent summary,
+    handle_cost_get below) existed. Every no-agent request 405'd, which
+    usePoll() treats as a failed fetch, so the whole Costs page rendered
+    "Unable to fetch cost data" on every install.
+    """
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer ") or auth_header[7:] != AGENT_SERVER_TOKEN:
+        return web.json_response({"error": "Unauthorized"}, status=401)
+
+    daily: Dict[str, float] = {}
+    async with db.execute(
+        """
+        SELECT agent, SUM(cost_delta) as total FROM cost_events
+        WHERE timestamp > datetime('now', '-1 day') GROUP BY agent
+        """
+    ) as cursor:
+        async for row in cursor:
+            daily[row["agent"]] = row["total"] or 0.0
+
+    monthly: Dict[str, float] = {}
+    async with db.execute(
+        """
+        SELECT agent, SUM(cost_delta) as total FROM cost_events
+        WHERE timestamp > datetime('now', '-30 days') GROUP BY agent
+        """
+    ) as cursor:
+        async for row in cursor:
+            monthly[row["agent"]] = row["total"] or 0.0
+
+    return web.json_response({
+        "daily": daily,
+        "monthly": monthly,
+        "limits": {
+            "daily_limit": COST_DAILY_LIMIT,
+            "monthly_limit": COST_MONTHLY_LIMIT,
+        },
+    })
+
+
 async def handle_cost_get(request):
     """GET /cost/{agent} - Get cost summary"""
     # Check bearer token
@@ -2391,6 +2541,67 @@ async def handle_cost_get(request):
         "monthly": monthly,
         "session": agent_last_cost.get(agent, 0.0)
     })
+
+
+async def handle_cost_conversations(request):
+    """GET /cost/conversations[?agent=X] - Roll cost_events up by conversation.
+
+    A conversation is one context window: (agent, session_id). Rows written
+    before the session_id column existed group under session_id NULL, shown
+    to callers as "unknown" rather than silently dropped.
+    """
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer ") or auth_header[7:] != AGENT_SERVER_TOKEN:
+        return web.json_response({"error": "Unauthorized"}, status=401)
+
+    agent_filter = request.rel_url.query.get("agent")
+    where = "WHERE agent = ?" if agent_filter else ""
+    params = (agent_filter,) if agent_filter else ()
+
+    async with db.execute(
+        f"""
+        SELECT agent, session_id,
+               SUM(cost_delta) as cost,
+               SUM(input_tokens) as input_tokens,
+               SUM(output_tokens) as output_tokens,
+               SUM(duration_ms) as duration_ms,
+               COUNT(*) as turns,
+               MIN(timestamp) as started_at,
+               MAX(timestamp) as ended_at
+        FROM cost_events
+        {where}
+        GROUP BY agent, session_id
+        ORDER BY ended_at DESC
+        LIMIT 200
+        """,
+        params,
+    ) as cursor:
+        rows = await cursor.fetchall()
+
+    conversations = []
+    for row in rows:
+        session_id = row["session_id"]
+        conversations.append({
+            "agent": row["agent"],
+            # Truncated for display, same convention as /health's
+            # session_id field — the full id is a bearer-token-adjacent
+            # secret (--resume takes it) and callers never need the whole
+            # thing to tell conversations apart in a list.
+            "session_id": (session_id[:8] if session_id else "unknown"),
+            "cost": row["cost"] or 0.0,
+            "input_tokens": row["input_tokens"] or 0,
+            "output_tokens": row["output_tokens"] or 0,
+            "duration_ms": row["duration_ms"] or 0,
+            "turns": row["turns"] or 0,
+            "started_at": row["started_at"],
+            "ended_at": row["ended_at"],
+            # The session currently live for this agent -- lets the
+            # dashboard badge the in-progress conversation without ever
+            # seeing the real session_id itself.
+            "current": bool(session_id) and session_id == agent_sessions.get(row["agent"]),
+        })
+
+    return web.json_response({"conversations": conversations})
 
 # =============================================================================
 # Graceful Shutdown
@@ -2661,6 +2872,10 @@ def create_app(with_lifecycle: bool = True) -> web.Application:
     app.router.add_post("/agents/{name}/kill", handle_agent_kill)
     app.router.add_post("/agents/{name}/flush", handle_agent_flush)
     app.router.add_post("/cost", handle_cost)
+    app.router.add_get("/cost", handle_cost_get_all)
+    # Registered before the /cost/{agent} pattern below so "conversations"
+    # is never captured as an agent name.
+    app.router.add_get("/cost/conversations", handle_cost_conversations)
     app.router.add_get("/cost/{agent}", handle_cost_get)
     app.router.add_get("/usage", handle_usage)
     app.router.add_post("/ask", handle_ask_create)

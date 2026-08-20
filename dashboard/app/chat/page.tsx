@@ -1,9 +1,10 @@
 "use client";
 
-import { useState, useEffect, useRef, FormEvent, KeyboardEvent } from "react";
+import { useState, useEffect, useRef, useCallback, FormEvent, KeyboardEvent } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { usePoll } from "@/lib/hooks";
+import { formatDuration, formatTokens } from "@/lib/format";
 
 interface AgentList {
   // /api/agents returns { agents: [...] }, an array of { name, state, ... }
@@ -11,7 +12,21 @@ interface AgentList {
   // Record<string, {state}> and read via Object.keys(agentData.agents),
   // which on an array yields numeric indices ("0", "1", ...) instead of
   // agent names. The dropdown looked populated but was silently wrong.
-  agents: { name: string; state: string }[];
+  agents: { name: string; state: string; label?: string; dashboard_chat?: boolean }[];
+}
+
+// Typed mid-turn event written by bin/agent-server.py's read_agent_response
+// and relayed by /api/chat/stream as `{event: {...}}` SSE payloads. Thinking
+// renders collapsible and dim, interstitials (text-before-the-final-answer,
+// and tool calls) render as their own subdued rows — neither is ever the
+// turn's conclusion; the final answer is the accumulating `content` field,
+// same as before this existed.
+interface TurnEvent {
+  kind: "thinking" | "interstitial" | "tool";
+  content: string;
+  seq: number;
+  /** Client-side arrival time (ms) — drives the frozen "thinking · Ns" label. */
+  arrivedAt?: number;
 }
 
 interface ChatMessage {
@@ -23,6 +38,10 @@ interface ChatMessage {
   // /api/chat, which does not record it.
   status?: string;
   error?: string;
+  // message_queue.message_id for this turn — lets the client reconcile a
+  // bubble against /api/chat/result if the SSE stream dies mid-turn.
+  messageId?: string;
+  events?: TurnEvent[];
 }
 
 const MAX_TEXTAREA_ROWS = 8;
@@ -60,8 +79,137 @@ function terminalStatusMessage(status: string, error?: string): string {
   }
 }
 
+/** Collapsible, dimmed row for a "thinking" turn event. Auto-collapses once
+ * the whole turn finishes streaming, not just when this segment ends -- the
+ * answer may still be arriving below it. */
+function ThinkingRow({
+  text,
+  breathing,
+  turnStreaming,
+  seconds,
+}: {
+  text: string;
+  /** Show the pulse dot -- this thinking segment itself is still arriving. */
+  breathing: boolean;
+  /** Whole assistant turn, not just this segment -- drives auto-collapse. */
+  turnStreaming: boolean;
+  /** Frozen elapsed time once the next event has arrived ("thinking · 4s"). */
+  seconds?: number;
+}) {
+  const [collapsed, setCollapsed] = useState(false);
+  const wasStreaming = useRef(turnStreaming);
+
+  useEffect(() => {
+    if (wasStreaming.current && !turnStreaming) setCollapsed(true);
+    wasStreaming.current = turnStreaming;
+  }, [turnStreaming]);
+
+  return (
+    <button
+      type="button"
+      onClick={() => setCollapsed((c) => !c)}
+      className="anim-liftD34 block text-left max-w-[88%] mb-2 border-l-2 border-gray-700 pl-3 py-1 text-xs italic text-gray-500 bg-transparent cursor-pointer"
+    >
+      <span className="flex items-center gap-1.5 not-italic text-[10px] uppercase tracking-wide opacity-75 mb-1">
+        {seconds && seconds >= 1 ? `thinking · ${seconds}s` : "thinking"}
+        {breathing && (
+          <span
+            aria-hidden
+            className="inline-block w-1.5 h-1.5 rounded-full bg-current"
+            style={{ animation: "breathe 1.3s ease-in-out infinite" }}
+          />
+        )}
+      </span>
+      {!collapsed && text}
+    </button>
+  );
+}
+
+/** Subdued row for an "interstitial" (mid-turn text) or "tool" event --
+ * progress only, never the turn's conclusion. */
+function InterstitialRow({ label, body }: { label: string; body: string }) {
+  return (
+    <div className="anim-liftD66 mb-2 max-w-[82%] rounded-lg border border-gray-800 bg-gray-950 px-3 py-2 text-xs text-gray-400">
+      <div className="text-[10px] uppercase tracking-wide opacity-70 mb-1">{label}</div>
+      {body}
+    </div>
+  );
+}
+
+// One row per (agent, session_id) from GET /cost/conversations — see
+// handle_cost_conversations in bin/agent-server.py. Only the fields the
+// badge needs are declared here.
+interface ConversationSummary {
+  agent: string;
+  session_id: string;
+  cost: number;
+  input_tokens: number;
+  output_tokens: number;
+  duration_ms: number;
+  turns: number;
+  current: boolean;
+}
+
+/** Badge next to the agent picker showing spend/tokens/duration for the
+ * conversation (context window) currently live for this agent — not the
+ * lifetime or daily total shown on the Costs page. */
+function ConversationBadge({ conv }: { conv: ConversationSummary }) {
+  return (
+    <span
+      className="inline-flex items-center gap-1.5 px-2 py-1 rounded border border-gray-800 bg-gray-900 text-xs text-gray-400"
+      title={`Session ${conv.session_id} · ${conv.turns} turn${conv.turns === 1 ? "" : "s"}`}
+    >
+      <span className="text-gray-500">this conversation</span>
+      <span className="text-gray-600">·</span>
+      <span className="text-gray-200">${conv.cost.toFixed(2)}</span>
+      <span className="text-gray-600">·</span>
+      <span>{formatTokens(conv.input_tokens + conv.output_tokens)} tok</span>
+      <span className="text-gray-600">·</span>
+      <span>{formatDuration(conv.duration_ms)}</span>
+    </span>
+  );
+}
+
+type DotState = "idle" | "replying" | "busy" | "recovering";
+
+// What each agent is doing, by name -> color + label. idle
+// renders dim and still; everything else pulses. "replying" is this
+// browser tab's own turn (driven by local `streaming` state, not a poll);
+// "busy" is the agent's subprocess working on something else entirely --
+// another dashboard tab, Discord, a cron -- read off /api/agents' `state`.
+const STATUS_DOT: Record<DotState, { color: string; label: string; pulse: boolean }> = {
+  idle: { color: "#6b7280", label: "idle", pulse: false },
+  replying: { color: "#4ade80", label: "replying…", pulse: true },
+  busy: { color: "#facc15", label: "busy elsewhere…", pulse: true },
+  recovering: { color: "#f87171", label: "recovering…", pulse: true },
+};
+
+function StatusDot({ state }: { state: DotState }) {
+  const cfg = STATUS_DOT[state];
+  return (
+    <span className="inline-flex items-center gap-1.5 text-xs text-gray-400">
+      <span
+        aria-hidden
+        className="inline-block w-2 h-2 rounded-full"
+        style={{
+          backgroundColor: cfg.color,
+          animation: cfg.pulse ? "breathe 1.6s ease-in-out infinite" : undefined,
+        }}
+      />
+      {cfg.label}
+    </span>
+  );
+}
+
 export default function ChatPage() {
   const { data: agentData } = usePoll<AgentList>("/api/agents", 30000);
+  // Polled unfiltered (same endpoint the Costs page uses) and matched
+  // client-side to the selected agent's live session below — avoids a
+  // second query param path for what /cost/conversations already returns.
+  const { data: conversationsData } = usePoll<{ conversations: ConversationSummary[] }>(
+    "/api/cost/conversations",
+    30000
+  );
   const [agent, setAgent] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
@@ -72,7 +220,13 @@ export default function ChatPage() {
   const messagesEnd = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
-  const agents = agentData?.agents ? agentData.agents.map((a) => a.name) : [];
+  // Chat-picker hygiene: only agents actually meant to be chatted with from
+  // the dashboard (dashboard_chat defaults true server-side -- see
+  // handle_agents in bin/agent-server.py; a low-capability relay agent
+  // opts out). agents[0] is the sane default -- whatever agents.json lists
+  // first.
+  const chattable = (agentData?.agents ?? []).filter((a) => a.dashboard_chat !== false);
+  const agents = chattable.map((a) => a.name);
 
   // Set default agent
   useEffect(() => {
@@ -81,9 +235,61 @@ export default function ChatPage() {
     }
   }, [agents, agent]);
 
+  const currentAgentInfo = chattable.find((a) => a.name === agent);
+  const agentLabel = currentAgentInfo?.label || agent;
+  const currentConversation = conversationsData?.conversations.find(
+    (c) => c.agent === agent && c.current
+  );
+  const dotState: DotState = streaming
+    ? "replying"
+    : currentAgentInfo?.state === "PROCESSING"
+    ? "busy"
+    : currentAgentInfo?.state === "ERROR_RECOVERY"
+    ? "recovering"
+    : "idle";
+
   useEffect(() => {
     messagesEnd.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
+
+  // Reconcile a bubble against the server's authoritative row. The SSE
+  // stream can die before a turn finishes (backgrounded mobile browser,
+  // reverse-proxy hiccup) and leave the bubble empty even though the row in
+  // message_queue holds the full text. Patches by messageId (not "last
+  // message") and only ever grows content. retries > 0 keeps polling while
+  // the turn is still running server-side.
+  const reconcileMessage = useCallback(
+    async (messageId: string, retries = 0): Promise<void> => {
+      try {
+        const res = await fetch(
+          `/api/chat/result?message_id=${encodeURIComponent(messageId)}`
+        );
+        if (!res.ok) return;
+        const data: { response: string; processed: number } = await res.json();
+        if (data.response) {
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.role === "assistant" &&
+              m.messageId === messageId &&
+              data.response.length > m.content.length
+                ? { ...m, content: data.response }
+                : m
+            )
+          );
+        }
+        // Still queued/in-progress and the caller wants us to wait for it.
+        if (data.processed < 2 && retries > 0) {
+          setTimeout(() => void reconcileMessage(messageId, retries - 1), 3000);
+        }
+      } catch {
+        // transient — a retrying caller will come back around
+        if (retries > 0) {
+          setTimeout(() => void reconcileMessage(messageId, retries - 1), 3000);
+        }
+      }
+    },
+    []
+  );
 
   async function handleOpenTerminal() {
     if (!agent || openingTerminal) return;
@@ -211,7 +417,10 @@ export default function ChatPage() {
       const messageId = data.message_id;
 
       // Add placeholder for streaming response
-      setMessages((prev) => [...prev, { role: "assistant", content: "", ts: new Date().toISOString() }]);
+      setMessages((prev) => [
+        ...prev,
+        { role: "assistant", content: "", ts: new Date().toISOString(), messageId },
+      ]);
 
       // Subscribe to SSE stream
       const eventSource = new EventSource(`/api/chat/stream?message_id=${messageId}`);
@@ -244,6 +453,22 @@ export default function ChatPage() {
           markLastAssistant(payload.status ?? STATUS_COMPLETE, payload.error);
           eventSource.close();
           setStreaming(false);
+          // Belt-and-braces: if buffering ate the chunk events, the server
+          // row still has the full text -- patch the bubble from it.
+          void reconcileMessage(messageId);
+        } else if (payload.event) {
+          // Typed mid-turn event (thinking / interstitial / tool).
+          const ev = { ...(payload.event as TurnEvent), arrivedAt: Date.now() };
+          setMessages((prev) => {
+            const next = [...prev];
+            const last = next[next.length - 1];
+            if (!last || last.role !== "assistant") return prev;
+            const events = last.events ?? [];
+            // Dedup by seq -- StrictMode double-invoke / reconnect can replay.
+            if (events.some((e) => e.seq === ev.seq)) return prev;
+            next[next.length - 1] = { ...last, events: [...events, ev] };
+            return next;
+          });
         } else if (payload.chunk) {
           setMessages((prev) =>
             prev.map((m, i) =>
@@ -264,6 +489,10 @@ export default function ChatPage() {
         }
         eventSource.close();
         setStreaming(false);
+        // Stream died (mobile backgrounding, proxy hiccup) but the agent is
+        // likely still working. Poll the result row until it completes --
+        // 60 tries x 3s covers a 3-minute turn.
+        void reconcileMessage(messageId, 60);
       };
     } catch (err) {
       setMessages((prev) => [...prev, {
@@ -284,10 +513,12 @@ export default function ChatPage() {
           onChange={(e) => { setAgent(e.target.value); setMessages([]); }}
           className="px-3 py-2 bg-gray-900 border border-gray-800 rounded text-gray-100 focus:outline-none focus:border-gray-600"
         >
-          {agents.map((a) => (
-            <option key={a} value={a}>{a}</option>
+          {chattable.map((a) => (
+            <option key={a.name} value={a.name}>{a.label || a.name}</option>
           ))}
         </select>
+        {agent && <StatusDot state={dotState} />}
+        {currentConversation && <ConversationBadge conv={currentConversation} />}
         <button
           type="button"
           onClick={handleReload}
@@ -315,27 +546,73 @@ export default function ChatPage() {
         {messages.map((msg, i) => {
           const isLastStreaming =
             streaming && i === messages.length - 1 && msg.role === "assistant";
-          return (
-            <div
-              key={i}
-              className={`p-3 mb-2 rounded-lg ${
-                msg.role === "assistant"
-                  ? "bg-gray-900 border border-gray-800"
-                  : "bg-gray-950"
-              }`}
-            >
-              <strong
-                className={`text-xs block mb-1 ${
-                  msg.role === "user" ? "text-gray-100" : "text-blue-400"
-                }`}
-              >
-                {msg.role === "user" ? "You" : agent}
-              </strong>
-              {msg.role === "user" ? (
+
+          if (msg.role === "user") {
+            return (
+              <div key={i} className="p-3 mb-2 rounded-lg bg-gray-950">
+                <strong className="text-xs block mb-1 text-gray-100">You</strong>
                 <p className="text-sm whitespace-pre-wrap text-gray-300">
                   {msg.content}
                 </p>
-              ) : (
+              </div>
+            );
+          }
+
+          // Typed mid-turn events from the pump above. It records the final
+          // answer's own text block as an interstitial too -- it can't know
+          // a block is final until the turn ends -- so drop any interstitial
+          // whose content IS the final body, or the answer renders twice.
+          const finalTrimmed = msg.content.trim();
+          const events = (msg.events ?? []).filter((ev) => {
+            if (ev.kind === "interstitial" && finalTrimmed && ev.content.trim() === finalTrimmed) {
+              return false;
+            }
+            // Content-less thinking is a live presence signal (some builds
+            // strip thinking text from the transcript) -- pulse while
+            // streaming, nothing to keep once the turn is done.
+            if (ev.kind === "thinking" && !ev.content.trim() && !isLastStreaming) {
+              return false;
+            }
+            return true;
+          });
+
+          // A completed turn whose response was never captured (a recovery
+          // gap) renders as nothing rather than an empty slip -- but a
+          // crash/timeout/error banner still needs somewhere to show even
+          // when the response text is empty.
+          const hasProblem = !!msg.status && msg.status !== STATUS_COMPLETE;
+          const showFinal = msg.content.length > 0 || hasProblem;
+
+          return (
+            <div key={i}>
+              {events.map((ev, j) => {
+                if (ev.kind === "thinking") {
+                  const next = events[j + 1];
+                  const seconds =
+                    ev.arrivedAt && next?.arrivedAt
+                      ? Math.round((next.arrivedAt - ev.arrivedAt) / 1000)
+                      : undefined;
+                  return (
+                    <ThinkingRow
+                      key={`ev-${i}-${ev.seq}`}
+                      text={ev.content}
+                      breathing={isLastStreaming && j === events.length - 1 && !msg.content}
+                      turnStreaming={isLastStreaming}
+                      seconds={seconds}
+                    />
+                  );
+                }
+                return (
+                  <InterstitialRow
+                    key={`ev-${i}-${ev.seq}`}
+                    label={ev.kind === "tool" ? "checking" : "working"}
+                    body={ev.content}
+                  />
+                );
+              })}
+              {showFinal && (
+              <div className="p-3 mb-2 rounded-lg bg-gray-900 border border-gray-800">
+              <strong className="text-xs block mb-1 text-blue-400">{agentLabel}</strong>
                 <div className="text-sm text-gray-300 chat-markdown">
                   <ReactMarkdown
                     remarkPlugins={[remarkGfm]}
@@ -429,6 +706,7 @@ export default function ChatPage() {
                     </div>
                   )}
                 </div>
+              </div>
               )}
             </div>
           );
@@ -445,7 +723,7 @@ export default function ChatPage() {
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={handleKeyDown}
-          placeholder={`Message ${agent || "agent"}...  (Shift-Enter for newline)`}
+          placeholder={`Message ${agentLabel || "agent"}...  (Shift-Enter for newline)`}
           disabled={streaming}
           rows={1}
           className="flex-1 px-3 py-2 bg-gray-900 border border-gray-800 rounded text-gray-100 text-sm leading-6 resize-none focus:outline-none focus:border-gray-600 disabled:opacity-50"

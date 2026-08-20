@@ -426,7 +426,8 @@ EOF
       "timeout": 300,
       "system_prompt": "agents/relay/SYSTEM_PROMPT.md",
       "tool_streaming": false,
-      "stream_to_channel": false
+      "stream_to_channel": false,
+      "dashboard_chat": false
     }
   }
 }

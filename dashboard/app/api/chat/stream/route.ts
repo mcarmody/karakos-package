@@ -48,6 +48,15 @@ export async function GET(request: NextRequest) {
       }
 
       let lastSize = 0;
+      // Typed turn events (thinking / interstitial / tool) written by
+      // bin/agent-server.py's read_agent_response. Cursor is the last
+      // relayed rowid — turn_events.id is a monotonic AUTOINCREMENT, so a
+      // plain "> cursor" scan without ORDER BY id is enough. The table may
+      // not exist yet on a fresh/pre-migration DB — guarded, and the guard
+      // stays cheap by flipping this off after the first missing-table
+      // error rather than re-trying every 200ms poll.
+      let lastEventRowId = 0;
+      let turnEventsAvailable = true;
       let polling = false;     // overlap guard — skip ticks if previous still in flight
       let closed = false;
       let pollHandle: ReturnType<typeof setInterval> | null = null;
@@ -90,6 +99,28 @@ export async function GET(request: NextRequest) {
           );
 
           if (!row) return;
+
+          // Relay typed events BEFORE the final-text chunk check so the
+          // client's ordering matches emission order (thinking and
+          // interstitials always precede the final answer they produced).
+          if (turnEventsAvailable) {
+            try {
+              const events = await db.all(
+                `SELECT id, seq, kind, content FROM turn_events
+                 WHERE message_id = ? AND id > ?
+                 ORDER BY id ASC`,
+                messageId,
+                lastEventRowId
+              );
+              for (const ev of events) {
+                send({ event: { kind: ev.kind, content: ev.content, seq: ev.seq } });
+                lastEventRowId = ev.id;
+              }
+            } catch {
+              // Table absent (agent-server predates this migration) — stop asking.
+              turnEventsAvailable = false;
+            }
+          }
 
           const response: string = row.response || "";
           if (response.length > lastSize) {
@@ -151,6 +182,11 @@ export async function GET(request: NextRequest) {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache",
       Connection: "keep-alive",
+      // nginx (and similar reverse proxies) default to proxy_buffering on,
+      // which holds SSE events in its buffer until close — the client would
+      // see nothing until the turn ended, and nothing at all if the
+      // connection dropped first.
+      "X-Accel-Buffering": "no",
     },
   });
 }
