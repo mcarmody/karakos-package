@@ -293,6 +293,11 @@ async def init_db():
     # IF NOT EXISTS is a no-op against an existing table, so a new column in
     # the definition above reaches upgraded installs only through here.
     await ensure_column("message_queue", "attachments", "TEXT")
+    # Conversation metrics: which session (== one context window; a cleared
+    # or respawned session is a new conversation) a cost row belongs to, so
+    # spend/tokens can be rolled up per conversation rather than only per
+    # agent. NULL on rows written before this column existed.
+    await ensure_column("cost_events", "session_id", "TEXT")
 
     await db.commit()
     log.info("Database initialized")
@@ -864,6 +869,11 @@ async def post_cost_update(agent: str, metadata: Dict):
     input_tokens = metadata.get("input_tokens", 0)
     output_tokens = metadata.get("output_tokens", 0)
     duration_ms = metadata.get("duration_ms", 0)
+    # A conversation is one context window: the CLI's own session_id, which
+    # only changes on a clear/respawn (see get_or_create_session /
+    # clear_session). The result event carries it, but fall back to the
+    # in-memory session map so a cost row is never left unattributed.
+    session_id = metadata.get("session_id") or agent_sessions.get(agent)
 
     # Calculate delta
     last_cost = agent_last_cost.get(agent, 0.0)
@@ -873,10 +883,10 @@ async def post_cost_update(agent: str, metadata: Dict):
     # Store in database
     await db.execute(
         """
-        INSERT INTO cost_events (agent, cost_delta, session_total, input_tokens, output_tokens, duration_ms)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO cost_events (agent, cost_delta, session_total, input_tokens, output_tokens, duration_ms, session_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
-        (agent, cost_delta, session_total, input_tokens, output_tokens, duration_ms)
+        (agent, cost_delta, session_total, input_tokens, output_tokens, duration_ms, session_id)
     )
     await db.commit()
 
@@ -2447,6 +2457,51 @@ async def handle_usage(request):
     return web.json_response({"agents": agents})
 
 
+async def handle_cost_get_all(request):
+    """GET /cost - Get cost summary for every agent.
+
+    dashboard/app/api/cost/route.ts (and the Costs page behind it) has
+    called this shape since the dashboard's first commit, but nothing ever
+    registered a GET handler for the bare /cost path -- only POST /cost
+    (ingest, handle_cost) and GET /cost/{agent} (single-agent summary,
+    handle_cost_get below) existed. Every no-agent request 405'd, which
+    usePoll() treats as a failed fetch, so the whole Costs page rendered
+    "Unable to fetch cost data" on every install.
+    """
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer ") or auth_header[7:] != AGENT_SERVER_TOKEN:
+        return web.json_response({"error": "Unauthorized"}, status=401)
+
+    daily: Dict[str, float] = {}
+    async with db.execute(
+        """
+        SELECT agent, SUM(cost_delta) as total FROM cost_events
+        WHERE timestamp > datetime('now', '-1 day') GROUP BY agent
+        """
+    ) as cursor:
+        async for row in cursor:
+            daily[row["agent"]] = row["total"] or 0.0
+
+    monthly: Dict[str, float] = {}
+    async with db.execute(
+        """
+        SELECT agent, SUM(cost_delta) as total FROM cost_events
+        WHERE timestamp > datetime('now', '-30 days') GROUP BY agent
+        """
+    ) as cursor:
+        async for row in cursor:
+            monthly[row["agent"]] = row["total"] or 0.0
+
+    return web.json_response({
+        "daily": daily,
+        "monthly": monthly,
+        "limits": {
+            "daily_limit": COST_DAILY_LIMIT,
+            "monthly_limit": COST_MONTHLY_LIMIT,
+        },
+    })
+
+
 async def handle_cost_get(request):
     """GET /cost/{agent} - Get cost summary"""
     # Check bearer token
@@ -2486,6 +2541,67 @@ async def handle_cost_get(request):
         "monthly": monthly,
         "session": agent_last_cost.get(agent, 0.0)
     })
+
+
+async def handle_cost_conversations(request):
+    """GET /cost/conversations[?agent=X] - Roll cost_events up by conversation.
+
+    A conversation is one context window: (agent, session_id). Rows written
+    before the session_id column existed group under session_id NULL, shown
+    to callers as "unknown" rather than silently dropped.
+    """
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer ") or auth_header[7:] != AGENT_SERVER_TOKEN:
+        return web.json_response({"error": "Unauthorized"}, status=401)
+
+    agent_filter = request.rel_url.query.get("agent")
+    where = "WHERE agent = ?" if agent_filter else ""
+    params = (agent_filter,) if agent_filter else ()
+
+    async with db.execute(
+        f"""
+        SELECT agent, session_id,
+               SUM(cost_delta) as cost,
+               SUM(input_tokens) as input_tokens,
+               SUM(output_tokens) as output_tokens,
+               SUM(duration_ms) as duration_ms,
+               COUNT(*) as turns,
+               MIN(timestamp) as started_at,
+               MAX(timestamp) as ended_at
+        FROM cost_events
+        {where}
+        GROUP BY agent, session_id
+        ORDER BY ended_at DESC
+        LIMIT 200
+        """,
+        params,
+    ) as cursor:
+        rows = await cursor.fetchall()
+
+    conversations = []
+    for row in rows:
+        session_id = row["session_id"]
+        conversations.append({
+            "agent": row["agent"],
+            # Truncated for display, same convention as /health's
+            # session_id field — the full id is a bearer-token-adjacent
+            # secret (--resume takes it) and callers never need the whole
+            # thing to tell conversations apart in a list.
+            "session_id": (session_id[:8] if session_id else "unknown"),
+            "cost": row["cost"] or 0.0,
+            "input_tokens": row["input_tokens"] or 0,
+            "output_tokens": row["output_tokens"] or 0,
+            "duration_ms": row["duration_ms"] or 0,
+            "turns": row["turns"] or 0,
+            "started_at": row["started_at"],
+            "ended_at": row["ended_at"],
+            # The session currently live for this agent -- lets the
+            # dashboard badge the in-progress conversation without ever
+            # seeing the real session_id itself.
+            "current": bool(session_id) and session_id == agent_sessions.get(row["agent"]),
+        })
+
+    return web.json_response({"conversations": conversations})
 
 # =============================================================================
 # Graceful Shutdown
@@ -2756,6 +2872,10 @@ def create_app(with_lifecycle: bool = True) -> web.Application:
     app.router.add_post("/agents/{name}/kill", handle_agent_kill)
     app.router.add_post("/agents/{name}/flush", handle_agent_flush)
     app.router.add_post("/cost", handle_cost)
+    app.router.add_get("/cost", handle_cost_get_all)
+    # Registered before the /cost/{agent} pattern below so "conversations"
+    # is never captured as an agent name.
+    app.router.add_get("/cost/conversations", handle_cost_conversations)
     app.router.add_get("/cost/{agent}", handle_cost_get)
     app.router.add_get("/usage", handle_usage)
     app.router.add_post("/ask", handle_ask_create)
