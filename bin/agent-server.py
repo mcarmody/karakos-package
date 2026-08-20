@@ -85,6 +85,23 @@ TOOL_EVENT_MIN_INTERVAL = 5    # seconds between lines within one turn
 TOOL_EVENT_MAX_PER_TURN = 12   # hard ceiling per turn
 TOOL_EVENT_DETAIL_CHARS = 90   # truncation for the argument summary
 
+# Live turn events for the dashboard chat: every thinking / interstitial-
+# text / tool_use block in a turn is persisted as a typed row keyed by the
+# queue message_id, which /api/chat/stream relays as typed SSE events. #91
+# (above) answered "is it still working?" for Discord; this is the same
+# observation point reaching the dashboard chat page, which otherwise only
+# ever sees the final response text at processed=2.
+TURN_EVENTS_DDL = """
+CREATE TABLE IF NOT EXISTS turn_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    content TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+)
+"""
+
 # Processing states
 STATUS_QUEUED = 0
 STATUS_IN_PROGRESS = 1
@@ -266,6 +283,11 @@ async def init_db():
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+
+    await db.execute(TURN_EVENTS_DDL)
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_turn_events_msg ON turn_events(message_id, seq)"
+    )
 
     # Migrations for databases created before a column existed. CREATE TABLE
     # IF NOT EXISTS is a no-op against an existing table, so a new column in
@@ -1472,7 +1494,7 @@ def should_post_tool_line(lines_posted: int, last_at: Optional[float],
     return now - last_at >= TOOL_EVENT_MIN_INTERVAL
 
 
-def summarize_tool_call(tool_name: str, tool_input: Optional[Dict]) -> str:
+def describe_tool_call(tool_name: str, tool_input: Optional[Dict]) -> str:
     """One-line "⚙ Bash — npm test" summary of a stream-json tool_use block.
 
     The tool name alone does not answer the question these lines exist to
@@ -1483,7 +1505,8 @@ def summarize_tool_call(tool_name: str, tool_input: Optional[Dict]) -> str:
     The argument picked per tool is the one a human would read first. An
     unknown tool degrades to the bare name rather than dumping its input —
     tool inputs carry file contents, patch bodies and credentials, and this
-    goes to a Discord channel.
+    reaches both a Discord channel (#91) and the dashboard chat page. Both
+    surfaces go through here so neither can be redacted less than the other.
     """
     name = str(tool_name or "unknown")
     detail = ""
@@ -1504,9 +1527,42 @@ def summarize_tool_call(tool_name: str, tool_input: Optional[Dict]) -> str:
             detail = detail[:TOOL_EVENT_DETAIL_CHARS - 1].rstrip() + "…"
         # Backticks and newlines would break out of the subtext line.
         detail = detail.replace("`", "'")
-        return f"-# ⚙ {name} — {detail}"
+        return f"⚙ {name} — {detail}"
 
-    return f"-# ⚙ {name}"
+    return f"⚙ {name}"
+
+
+def summarize_tool_call(tool_name: str, tool_input: Optional[Dict]) -> str:
+    """describe_tool_call() as a Discord subtext line (#91).
+
+    The `-# ` prefix is Discord markup and belongs to that surface only —
+    the dashboard's turn-events pill renders describe_tool_call() directly
+    and would otherwise show a literal "-#".
+    """
+    return f"-# {describe_tool_call(tool_name, tool_input)}"
+
+
+async def write_turn_event(message_ids: List[str], seq: int, kind: str, content: str) -> None:
+    """Insert one turn_events row per message_id in this turn's batch.
+
+    A "turn" can cover several queued message_ids at once (#121); writing
+    the row once per id means whichever message_id the dashboard is polling
+    with (see /api/chat/stream) sees it, the same broadcast pattern
+    write_streaming_response uses for the response text itself. Best-effort:
+    a bookkeeping failure must never cost the agent's actual reply, which is
+    still arriving on this same loop.
+    """
+    if not message_ids or db is None:
+        return
+    try:
+        for mid in message_ids:
+            await db.execute(
+                "INSERT INTO turn_events (message_id, seq, kind, content) VALUES (?, ?, ?, ?)",
+                (mid, seq, kind, content),
+            )
+        await db.commit()
+    except Exception as e:
+        log.warning(f"turn_events insert failed: {e}")
 
 
 async def start_typing(agent: str, channel_id: str):
@@ -1628,6 +1684,15 @@ async def read_agent_response(
     metadata = {}
     last_posted_chunk = ""
 
+    # turn_events sequence number for this turn, and burst-collapse state
+    # for content-less thinking blocks. Some builds strip thinking TEXT from
+    # the transcript (signature only, empty body) — that still means "the
+    # agent is thinking," so it's surfaced as presence: one empty row per
+    # burst rather than one per block, which the chat page renders as a
+    # pulsing "thinking" label instead of a flood of identical empty rows.
+    event_seq = 0
+    in_empty_think_burst = False
+
     try:
         while True:
             line = await proc.stdout.readline()
@@ -1678,18 +1743,44 @@ async def read_agent_response(
                 got_text = False
                 for block in message.get("content", []) or []:
                     btype = block.get("type")
-                    if btype == "text":
+                    if btype == "thinking":
+                        body = (block.get("thinking") or "").strip()
+                        if body:
+                            event_seq += 1
+                            await write_turn_event(msg_ids, event_seq, "thinking", body)
+                            in_empty_think_burst = False
+                        elif not in_empty_think_burst:
+                            event_seq += 1
+                            await write_turn_event(msg_ids, event_seq, "thinking", "")
+                            in_empty_think_burst = True
+                    elif btype == "text":
                         text = block.get("text", "")
                         if text:
                             final_text += text
                             response_buffers[agent] = final_text
                             got_text = True
+                            in_empty_think_burst = False
                             if stream_to_channel and channel_id != "0":
                                 # TODO: Implement chunked streaming
                                 pass
+                            # Recorded as a turn event too, even though this
+                            # may turn out to BE the final answer — a block
+                            # can't be known final until the turn ends. The
+                            # dashboard chat page dedupes an interstitial
+                            # against the final body it matches.
+                            stripped = text.strip()
+                            if stripped and stripped.upper() != "PASS":
+                                event_seq += 1
+                                await write_turn_event(msg_ids, event_seq, "interstitial", stripped)
                     elif btype == "tool_use":
                         tool_name = block.get("name", "unknown")
                         log.info(f"{agent} called tool: {tool_name}")
+                        in_empty_think_burst = False
+                        event_seq += 1
+                        await write_turn_event(
+                            msg_ids, event_seq, "tool",
+                            describe_tool_call(tool_name, block.get("input")),
+                        )
                         if tool_streaming and channel_id != "0":
                             now = time.monotonic()
                             if should_post_tool_line(tool_lines_posted,
@@ -1705,9 +1796,6 @@ async def read_agent_response(
                                     agent, channel_id,
                                     summarize_tool_call(tool_name, block.get("input")),
                                 )
-                    # `thinking` blocks are intentionally ignored here — they
-                    # are stripped from the final text below as a belt-and-
-                    # braces measure for any inline <thinking> tags.
 
                 if got_text:
                     cleaned = THINKING_BLOCK_RE.sub("", final_text)
