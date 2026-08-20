@@ -137,7 +137,7 @@ function InterstitialRow({ label, body }: { label: string; body: string }) {
 
 type DotState = "idle" | "replying" | "busy" | "recovering";
 
-// What Amos-equivalent agents are doing, by name -> color + label. idle
+// What each agent is doing, by name -> color + label. idle
 // renders dim and still; everything else pulses. "replying" is this
 // browser tab's own turn (driven by local `streaming` state, not a poll);
 // "busy" is the agent's subprocess working on something else entirely --
