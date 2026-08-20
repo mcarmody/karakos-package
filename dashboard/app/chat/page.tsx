@@ -135,6 +135,37 @@ function InterstitialRow({ label, body }: { label: string; body: string }) {
   );
 }
 
+type DotState = "idle" | "replying" | "busy" | "recovering";
+
+// What Amos-equivalent agents are doing, by name -> color + label. idle
+// renders dim and still; everything else pulses. "replying" is this
+// browser tab's own turn (driven by local `streaming` state, not a poll);
+// "busy" is the agent's subprocess working on something else entirely --
+// another dashboard tab, Discord, a cron -- read off /api/agents' `state`.
+const STATUS_DOT: Record<DotState, { color: string; label: string; pulse: boolean }> = {
+  idle: { color: "#6b7280", label: "idle", pulse: false },
+  replying: { color: "#4ade80", label: "replying…", pulse: true },
+  busy: { color: "#facc15", label: "busy elsewhere…", pulse: true },
+  recovering: { color: "#f87171", label: "recovering…", pulse: true },
+};
+
+function StatusDot({ state }: { state: DotState }) {
+  const cfg = STATUS_DOT[state];
+  return (
+    <span className="inline-flex items-center gap-1.5 text-xs text-gray-400">
+      <span
+        aria-hidden
+        className="inline-block w-2 h-2 rounded-full"
+        style={{
+          backgroundColor: cfg.color,
+          animation: cfg.pulse ? "breathe 1.6s ease-in-out infinite" : undefined,
+        }}
+      />
+      {cfg.label}
+    </span>
+  );
+}
+
 export default function ChatPage() {
   const { data: agentData } = usePoll<AgentList>("/api/agents", 30000);
   const [agent, setAgent] = useState("");
@@ -147,7 +178,13 @@ export default function ChatPage() {
   const messagesEnd = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
-  const agents = agentData?.agents ? agentData.agents.map((a) => a.name) : [];
+  // Chat-picker hygiene: only agents actually meant to be chatted with from
+  // the dashboard (dashboard_chat defaults true server-side -- see
+  // handle_agents in bin/agent-server.py; a low-capability relay agent
+  // opts out). agents[0] is the sane default -- whatever agents.json lists
+  // first.
+  const chattable = (agentData?.agents ?? []).filter((a) => a.dashboard_chat !== false);
+  const agents = chattable.map((a) => a.name);
 
   // Set default agent
   useEffect(() => {
@@ -155,6 +192,16 @@ export default function ChatPage() {
       setAgent(agents[0]);
     }
   }, [agents, agent]);
+
+  const currentAgentInfo = chattable.find((a) => a.name === agent);
+  const agentLabel = currentAgentInfo?.label || agent;
+  const dotState: DotState = streaming
+    ? "replying"
+    : currentAgentInfo?.state === "PROCESSING"
+    ? "busy"
+    : currentAgentInfo?.state === "ERROR_RECOVERY"
+    ? "recovering"
+    : "idle";
 
   useEffect(() => {
     messagesEnd.current?.scrollIntoView({ behavior: "smooth" });
@@ -421,10 +468,11 @@ export default function ChatPage() {
           onChange={(e) => { setAgent(e.target.value); setMessages([]); }}
           className="px-3 py-2 bg-gray-900 border border-gray-800 rounded text-gray-100 focus:outline-none focus:border-gray-600"
         >
-          {agents.map((a) => (
-            <option key={a} value={a}>{a}</option>
+          {chattable.map((a) => (
+            <option key={a.name} value={a.name}>{a.label || a.name}</option>
           ))}
         </select>
+        {agent && <StatusDot state={dotState} />}
         <button
           type="button"
           onClick={handleReload}
@@ -518,7 +566,7 @@ export default function ChatPage() {
               })}
               {showFinal && (
               <div className="p-3 mb-2 rounded-lg bg-gray-900 border border-gray-800">
-              <strong className="text-xs block mb-1 text-blue-400">{agent}</strong>
+              <strong className="text-xs block mb-1 text-blue-400">{agentLabel}</strong>
                 <div className="text-sm text-gray-300 chat-markdown">
                   <ReactMarkdown
                     remarkPlugins={[remarkGfm]}
@@ -629,7 +677,7 @@ export default function ChatPage() {
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={handleKeyDown}
-          placeholder={`Message ${agent || "agent"}...  (Shift-Enter for newline)`}
+          placeholder={`Message ${agentLabel || "agent"}...  (Shift-Enter for newline)`}
           disabled={streaming}
           rows={1}
           className="flex-1 px-3 py-2 bg-gray-900 border border-gray-800 rounded text-gray-100 text-sm leading-6 resize-none focus:outline-none focus:border-gray-600 disabled:opacity-50"
