@@ -1,9 +1,11 @@
 """
 Tests for the shape contract on /api/agents in the dashboard.
 
-The case this exists for: `dashboard/app/api/agents/route.ts` reshapes the
-agent-server's `/status` dict into `{ agents: [...] }` — an ARRAY of
-`{name, state, ...}` objects. `dashboard/app/chat/page.tsx` typed that as
+The case this exists for: `dashboard/app/api/agents/route.ts` reshapes
+agent-server data into `{ agents: [...] }` — an ARRAY of `{name, state, ...}`
+objects (originally sourced from a `/status` endpoint agent-server.py never
+actually registered; it now merges the real `/health` and `/agents` routes —
+see the route's own comment). `dashboard/app/chat/page.tsx` typed that as
 `Record<string, {state}>` and read it with `Object.keys(agentData.agents)`.
 
 `Object.keys()` on an array returns its indices: "0", "1", "2". So the agent
@@ -28,8 +30,9 @@ DASHBOARD_APP = PACKAGE_ROOT / "dashboard" / "app"
 AGENTS_ROUTE = DASHBOARD_APP / "api" / "agents" / "route.ts"
 
 
-# Endpoints whose `agents` field is an ARRAY. Both proxy an agent-server route
-# that builds a list: /api/agents from /status, /api/agents/config from /agents.
+# Endpoints whose `agents` field is an ARRAY. Both proxy agent-server routes
+# that build a list: /api/agents from /health + /agents, /api/agents/config
+# from /agents.
 #
 # Deliberately NOT a match on `.agents` anywhere in the file. The agent-server's
 # /health returns `agents` as a dict keyed by name, and dashboard/app/page.tsx
@@ -89,8 +92,8 @@ def test_route_still_returns_an_array():
     assert AGENTS_ROUTE.exists(), f"{AGENTS_ROUTE} is missing"
     src = AGENTS_ROUTE.read_text()
 
-    assert re.search(r"const\s+agents\s*=\s*Object\.entries\([^)]*\)\s*\.map\(", src), (
-        "/api/agents no longer builds `agents` with Object.entries(...).map(...) "
+    assert re.search(r"const\s+agents\s*=\s*\w+\s*\.map\(", src), (
+        "/api/agents no longer builds `agents` with an array .map(...) call "
         "— confirm whether it still returns an array and update these tests"
     )
     assert re.search(r"NextResponse\.json\(\s*\{\s*agents\s*\}", src), (

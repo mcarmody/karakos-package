@@ -2144,7 +2144,14 @@ async def handle_agents(request):
             "max_turns": config.get("max_turns", 200),
             "timeout": config.get("timeout"),
             "state": agent_states.get(agent, "UNKNOWN"),
-            "has_discord_token": agent in AGENT_TOKENS
+            "has_discord_token": agent in AGENT_TOKENS,
+            # Chat-picker hygiene: not every configured agent is meant to be
+            # talked to directly from the dashboard (a low-capability relay
+            # exists to route, not converse). Defaults true so existing
+            # agents.json files with no opinion keep showing up. "label" is
+            # a human-friendly display name, defaulting to the raw agent key.
+            "dashboard_chat": config.get("dashboard_chat", True),
+            "label": config.get("label", agent),
         })
 
     return web.json_response({"agents": agents_list})
