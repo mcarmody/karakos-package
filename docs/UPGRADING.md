@@ -2,90 +2,124 @@
 
 Manual upgrade instructions. Karakos does not auto-update.
 
-Karakos ships prebuilt multi-arch images to GHCR. The upgrade path is
-`docker compose pull && docker compose up -d` — no local build required.
+Karakos ships prebuilt multi-arch images to GHCR, so upgrading is a pull and a
+restart — there is no local build step.
 
 `latest` always tracks the newest release. To control when you upgrade, pin
 `KARAKOS_VERSION` in `config/.env` (e.g. `KARAKOS_VERSION=v1.3`). Remove the
-pin or update it when you are ready to move to a newer release.
+pin or update it when you are ready to move.
 
-## Version Check
+## A note on the Docker commands below
 
-The system checks for updates weekly and posts to #signals if a newer version is available. You can also check manually:
-
-```bash
-bin/check-updates.sh
-```
-
-## Upgrade Process
-
-### 1. Stop the System
+The compose file lives at `config/docker-compose.yml`, not at the repo root,
+so a bare `docker compose` run from your checkout will not find it. Every
+command here uses the `make` targets, which pass the right flags for you. The
+long form, if you prefer typing it, is:
 
 ```bash
-docker compose down
+docker compose -f config/docker-compose.yml --env-file config/.env <command>
 ```
 
-Wait for graceful shutdown (agents finalize sessions, up to 45 seconds).
+There is one service, named `karakos`. Address it by that name — `docker
+compose exec karakos …`, not by a guessed container name.
 
-### 2. Back Up Data
+## Version check
+
+There is no working automatic notification. `bin/check-updates.sh` is
+scheduled weekly, but it only logs to stdout — nothing reaches Discord — and
+it currently exits non-zero before it gets that far, because it reads a
+`package.json` at the workspace root that does not exist
+([known gap](ARCHITECTURE.md#known-gaps)).
+
+Watch the [releases page](https://github.com/mcarmody/karakos-package/releases)
+instead, or subscribe to it on GitHub.
+
+## Upgrade
+
+### 1. Back up, while it is still running
+
+The data directory is a **named Docker volume**, not a folder in your
+checkout. Copying `./data` from the host backs up nothing. Copy it out of the
+container instead:
 
 ```bash
-# Back up the data directory (messages, memory, databases)
-cp -r data/ data-backup-$(date +%Y%m%d)/
+cd ~/karakos
+docker compose -f config/docker-compose.yml --env-file config/.env \
+  cp karakos:/workspace/data ./data-backup-$(date +%Y%m%d)
 
-# Back up config (contains credentials)
-cp config/.env config/.env.backup
+cp config/.env config/.env.backup    # credentials — keep this somewhere safe
 ```
 
-### 3. Pull Updates
+`config/`, `agents/` and `.karakos/` *are* bind-mounted from your checkout, so
+those are backed up by copying the directories or committing them.
+
+### 2. Stop the system
+
+```bash
+make down
+```
+
+Shutdown is graceful: agents finalize their sessions first, up to 45 seconds.
+
+### 3. Pull the new code
 
 ```bash
 git pull origin main
 ```
 
-If you have local modifications, stash or commit them first:
+With local modifications, stash them first:
 
 ```bash
-git stash
-git pull origin main
-git stash pop
+git stash && git pull origin main && git stash pop
 ```
 
-### 4. Check for Breaking Changes
+### 4. Read the release notes
 
-Read the release notes for your version jump. Breaking changes are documented in the GitHub release.
+Breaking changes are documented on the GitHub release for the version you are
+moving to. Check them before the next step, not after.
 
-### 5. Pull and Start
+Note that `git pull` does **not** change which image runs. The image tag comes
+from `KARAKOS_VERSION` in `config/.env`, defaulting to `latest`. If you have
+pinned a version, bump the pin here or the next step will re-pull what you are
+already on. Releases are tagged `v<major>.<minor>` and `v<major>` only — there
+are no patch-level image tags.
+
+### 5. Pull the image and start
 
 ```bash
-docker compose pull
-docker compose up -d
+make pull
+make up
 ```
-
-`docker compose pull` downloads the prebuilt image for the new release from GHCR.
-No local build step required.
 
 ### 6. Verify
 
-1. Check `docker compose logs -f` for startup errors
-2. Open the dashboard and verify agent status
-3. Check #signals for the startup health report
+1. `make logs` — watch for startup errors.
+2. Open the dashboard; confirm agents show as running.
+3. Say something to your agent in Discord and confirm it answers. There is no
+   startup health report to check for — the health sweep posts only on
+   failure, and only at 04:00.
 
-## Schema Migrations
+If startup fails saying `data/`, `logs/` or `inbox/` is not writable, a
+previous run left root-owned volumes behind. That needs
+`docker compose -f config/docker-compose.yml --env-file config/.env down -v`,
+which destroys those volumes — restore from the step-1 backup afterwards.
 
-If the upgrade includes database schema changes, the agent server handles them automatically on startup. It checks the current schema version and applies any pending migrations.
+## Database schema
 
-Manual migration (if needed):
+There is no migration command to run and no `bin/migrate.py`. The agent server
+creates its tables with `CREATE TABLE IF NOT EXISTS` and adds new columns to
+existing tables on startup, guarded by a `PRAGMA table_info` check. Both are
+idempotent, so starting a newer image on an older database is the whole
+procedure.
 
-```bash
-docker exec -it karakos-karakos-1 python3 bin/migrate.py
-```
+If startup fails with a database error, that is a bug worth an issue — not
+something to fix by hand.
 
-## The Claude CLI Rolls Back On Its Own
+## The Claude CLI rolls back on its own
 
 Everything above is about upgrading Karakos. The agent loop also runs on the
 Claude CLI, which this project does not release and which is replaced on every
-`docker compose pull` onto a rebuilt image.
+image pull.
 
 A bad CLI release is the one failure that gives you no signal: it installs
 cleanly, `claude --version` answers, every container process stays up, and
@@ -94,13 +128,14 @@ messages simply stop being answered.
 `bin/cli-upgrade-watchdog.sh` runs at startup and hourly. When the installed
 CLI version differs from the last one this install completed a turn on, it
 sends one probe message through the CLI. If no answer comes back, it
-reinstalls the known-good version and posts a notice to `#signals`. No API
-call is made when the version has not changed.
+reinstalls the known-good version and posts a notice to your signals channel.
+No API call is made when the version has not changed.
 
 To upgrade the CLI deliberately, behind the same guarantee:
 
 ```bash
-docker exec -u karakos karakos-karakos-1 bin/upgrade-claude-cli.sh --to 1.2.3
+docker compose -f config/docker-compose.yml --env-file config/.env \
+  exec -u karakos karakos bin/upgrade-claude-cli.sh --to 1.2.3
 ```
 
 It records the current version before touching anything, verifies the new one
@@ -117,31 +152,39 @@ bin/upgrade-claude-cli.sh --selftest
 
 Both run entirely against fake `npm` and `claude` binaries and change nothing.
 
-The rollback state lives in `data/health/claude-cli.json`. Delete it to make
-the watchdog re-adopt whatever is currently installed.
+The rollback state lives in `data/health/claude-cli.json` inside the
+container. Delete it to make the watchdog adopt whatever is installed now.
 
-## Rolling Back
-
-If something breaks:
+## Rolling back
 
 ```bash
-docker compose down
+make down
 
-# Restore data backup
-rm -rf data/
-mv data-backup-YYYYMMDD/ data/
+# Restore the data volume from the backup you took in step 1
+make up
+docker compose -f config/docker-compose.yml --env-file config/.env \
+  cp ./data-backup-YYYYMMDD/. karakos:/workspace/data
+make down
 
-# Restore config
 cp config/.env.backup config/.env
-
-# Check out previous version
-git checkout v1.0.0  # or whatever version you were on
-
-# Pull that version's image and start
-docker compose pull
-docker compose up -d
 ```
 
-## Version History
+Then roll the **image** back, which is the part that matters. Checking out an
+old git tag does not do it — set the pin explicitly in `config/.env`:
 
-Check the GitHub releases page for the full changelog.
+```bash
+KARAKOS_VERSION=v1.2         # the release you were on
+```
+
+```bash
+git checkout v1.2            # match the checkout to the pin
+make pull
+make up
+```
+
+Restoring into the volume needs the container to exist, which is why it starts
+and stops again around the copy.
+
+## Version history
+
+The full changelog is on the GitHub releases page.

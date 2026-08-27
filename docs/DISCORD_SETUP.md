@@ -13,7 +13,8 @@ Step-by-step guide to creating a Discord bot for Karakos.
 
 1. In your application, go to the **Bot** section (left sidebar)
 2. Click **Add Bot** → **Yes, do it!**
-3. Under **TOKEN**, click **Copy** — this is your `DISCORD_BOT_TOKEN`
+3. Under **TOKEN**, click **Copy** — this goes in `config/.env` as
+   `DISCORD_BOT_TOKEN_PRIMARY`
 4. **Save this token** — you can only see it once (you can regenerate if lost)
 
 ### Bot Settings
@@ -22,15 +23,35 @@ Under the Bot section, configure:
 
 - **Public Bot**: OFF (only you need to add it)
 - **Message Content Intent**: ON (required — the bot needs to read messages)
-- **Server Members Intent**: ON (optional — enables online member list)
+- **Server Members Intent**: OFF (the relay never requests it; turning it on
+  changes nothing)
 - **Presence Intent**: OFF (not needed)
 
 ## 3. Get the Bot User ID
 
 1. In your application, go to **General Information**
-2. Copy the **Application ID** — this is your `DISCORD_BOT_ID`
+2. Copy the **Application ID** — this goes in `config/.env` as
+   `DISCORD_BOT_ID_PRIMARY`
 
 Or: In Discord, enable Developer Mode (Settings → Advanced → Developer Mode), then right-click your bot in the server and **Copy User ID**.
+
+### The names these end up under
+
+The setup wizard writes them for you; this is what it writes, in case you are
+editing `config/.env` by hand later:
+
+| Value | Variable |
+|---|---|
+| Bot token | `DISCORD_BOT_TOKEN_PRIMARY` |
+| Application / bot user ID | `DISCORD_BOT_ID_PRIMARY` |
+| Server ID | `DISCORD_SERVER_ID` |
+| General channel ID | `DISCORD_CHANNEL_GENERAL` |
+| Signals channel ID | `DISCORD_CHANNEL_SIGNALS` |
+| Your own user ID | `OWNER_DISCORD_ID` |
+
+Additional agents use the same pattern with their own suffix, e.g.
+`DISCORD_BOT_TOKEN_BUILDER`. There are no unsuffixed `DISCORD_BOT_TOKEN` or
+`DISCORD_BOT_ID` variables — nothing reads those names.
 
 ## 4. Invite the Bot
 
@@ -167,9 +188,11 @@ picker itself is unavailable.
 ## Troubleshooting
 
 **Bot appears offline:**
-- Check that the container is running: `docker compose ps`
-- Check relay logs: `docker compose logs relay`
-- Verify the token in `config/.env`
+- Check that the container is running: `make ps` or
+  `docker compose -f config/docker-compose.yml --env-file config/.env ps`
+- Check the logs: `make logs`. There is one compose service, `karakos`, and
+  the relay is a process inside it — `docker compose logs relay` will not work
+- Verify `DISCORD_BOT_TOKEN_PRIMARY` in `config/.env`
 
 **Bot can't read messages:**
 - Ensure **Message Content Intent** is enabled in the developer portal
@@ -204,7 +227,10 @@ The file only ever grows — prune it once the entries have been recovered.
 **Slash commands don't show up when you type `/`:**
 - Registration runs automatically on container start
   (`bin/register-discord-commands.py`, via `bin/entrypoint.sh`) and logs a
-  `WARNING` on failure — check `docker compose logs`
+  `WARNING` on failure — check `make logs`
+- To see what is currently registered, or to wipe it and let the next start
+  re-register from scratch: `bin/register-discord-commands.py --list` and
+  `--clear`
 - A 403 in that log means the bot was invited without the
   `applications.commands` scope. Re-invite it through **OAuth2 → URL
   Generator** with that scope checked (step 4 above) — a token or
