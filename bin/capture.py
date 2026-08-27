@@ -20,6 +20,10 @@ from pathlib import Path
 
 WORKSPACE = Path(os.environ.get("WORKSPACE_ROOT", "/workspace"))
 MESSAGES_DIR = WORKSPACE / "data" / "messages"
+# Must match bin/agent-server.py:DB_PATH — that server is the only writer of
+# message_queue, and --backfill is a reader of it. tests/test_capture.py
+# asserts the two constants are equal rather than re-stating the literal.
+QUEUE_DB = WORKSPACE / "data" / "memory" / "agent-server.db"
 
 
 def ensure_dirs():
@@ -59,7 +63,7 @@ def backfill(date_str: str) -> None:
     """Re-export messages from SQLite for a specific date."""
     import sqlite3
 
-    db_path = WORKSPACE / "data" / "agent-server.db"
+    db_path = QUEUE_DB
     if not db_path.exists():
         print(f"Database not found: {db_path}", file=sys.stderr)
         sys.exit(1)
@@ -88,7 +92,7 @@ def backfill(date_str: str) -> None:
                 "content": row["content"],
                 "message_id": row["message_id"],
                 "agent": row["agent"],
-                "server": row.get("server", "discord") if "server" in row.keys() else "discord",
+                "server": (row["server"] if "server" in row.keys() else None) or "discord",
             }
             f.write(json.dumps(entry) + "\n")
             count += 1
