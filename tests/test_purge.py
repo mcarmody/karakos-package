@@ -98,3 +98,79 @@ class TestPurgeSessionSummaries:
         purge = self._make_purger(tmp_workspace, monkeypatch)
         deleted = purge.purge_old_session_summaries()
         assert deleted == 0
+
+
+class TestPurgeToolAudit:
+    """Test tool-audit retention against the database the tool server writes.
+
+    These are the tests that were missing: nothing here ever exercised
+    ``purge_tool_audit``, so ``TOOL_AUDIT_DB`` pointed at ``mcp/tool-audit.db``
+    — a path no writer in the repo has ever created — for as long as the file
+    has existed, and ``TOOL_AUDIT_RETENTION_DAYS`` was a no-op (#150).
+
+    The guard is deliberately *not* another string literal: asserting
+    ``purge.TOOL_AUDIT_DB == tools_server.AUDIT_DB_PATH`` fails whenever reader
+    and writer drift apart, which a duplicated literal cannot do.
+    """
+
+    def _modules(self, tmp_workspace, monkeypatch):
+        monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_workspace))
+        monkeypatch.setenv("TOOL_AUDIT_RETENTION_DAYS", "30")
+        purge = import_script("purge-data")
+        tools_server = import_script(
+            "tools-server", file_path=PACKAGE_ROOT / "mcp" / "tools-server.py"
+        )
+        return purge, tools_server
+
+    def test_purge_path_matches_the_writer(self, tmp_workspace, monkeypatch):
+        purge, tools_server = self._modules(tmp_workspace, monkeypatch)
+        assert purge.TOOL_AUDIT_DB == tools_server.AUDIT_DB_PATH
+
+    def test_purge_path_is_one_something_actually_writes(self, tmp_workspace, monkeypatch):
+        """Let the real writer create its database, then look for it.
+
+        A purge aimed at a path nothing writes fails here even if the two
+        constants above were changed in lockstep to a third wrong value.
+        """
+        purge, tools_server = self._modules(tmp_workspace, monkeypatch)
+
+        conn = tools_server.init_audit_db()
+        tools_server.log_audit(conn, "sysmon", '{}', 12, 3.4, True)
+        conn.close()
+
+        assert purge.TOOL_AUDIT_DB.exists(), (
+            f"purge targets {purge.TOOL_AUDIT_DB}, which the tool server "
+            f"did not create"
+        )
+
+    def test_deletes_rows_past_retention_and_keeps_recent(self, tmp_workspace, monkeypatch):
+        purge, tools_server = self._modules(tmp_workspace, monkeypatch)
+
+        # Schema comes from the writer, so the column purge_tool_audit filters
+        # on ("timestamp") is the one tools-server actually creates.
+        conn = tools_server.init_audit_db()
+        old = (datetime.now(timezone.utc) - timedelta(days=45)).isoformat()
+        recent = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+        conn.executemany(
+            "INSERT INTO tool_calls (timestamp, tool_name, args_json, "
+            "result_size_bytes, duration_ms, success) VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                (old, "sysmon", "{}", 10, 1.0, 1),
+                (old, "calendar", "{}", 10, 1.0, 1),
+                (recent, "sysmon", "{}", 10, 1.0, 1),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        deleted = purge.purge_tool_audit()
+        assert deleted == 2
+
+        check = sqlite3.connect(str(purge.TOOL_AUDIT_DB))
+        remaining = check.execute("SELECT timestamp FROM tool_calls").fetchall()
+        check.close()
+        assert [r[0] for r in remaining] == [recent]
+
+    def test_missing_database_is_not_an_error(self, tmp_workspace, monkeypatch):
+        purge, _ = self._modules(tmp_workspace, monkeypatch)
+        assert purge.purge_tool_audit() == 0

@@ -18,7 +18,10 @@ from pathlib import Path
 
 WORKSPACE = Path(os.environ.get("WORKSPACE_ROOT", "/workspace"))
 MESSAGES_DIR = WORKSPACE / "data" / "messages"
-TOOL_AUDIT_DB = WORKSPACE / "mcp" / "tool-audit.db"
+# Must match mcp/tools-server.py:AUDIT_DB_PATH — that server is the only
+# writer, and this purge is the only reader. tests/test_purge.py asserts the
+# two constants are equal rather than re-stating the literal.
+TOOL_AUDIT_DB = WORKSPACE / "data" / "mcp-tools-audit.db"
 SESSION_SUMMARIES_DIR = WORKSPACE / "logs" / "session-summaries"
 
 MESSAGE_RETENTION_DAYS = int(os.environ.get("MESSAGE_RETENTION_DAYS", "90"))
