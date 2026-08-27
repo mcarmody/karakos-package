@@ -395,3 +395,247 @@ def test_a_normal_turn_is_not_discarded(server, monkeypatch, tmp_path):
     text, metadata = run(go())
     assert "the answer" in text
     assert metadata != {}
+
+
+# ---------------------------------------------------------------------------
+# /agents/{name}/queue — read and per-message cancel (issue #151)
+#
+# The dashboard's agent modal called GET /queue/{name} and DELETE
+# /queue/{name}/{id}, neither of which was ever registered. Both 404'd, which
+# is why the modal showed "Queue empty" for a backlogged agent — `data.messages
+# || []` on a 404 body is an empty list, not an error.
+#
+# These drive the real route table over real HTTP for the same reason the
+# tests above do: the handlers were not the half that was broken.
+# ---------------------------------------------------------------------------
+
+async def _queue(db, agent, *contents, processed=0, prefix="q"):
+    """Insert queued rows and return their primary keys, oldest first."""
+    ids = []
+    for i, content in enumerate(contents):
+        cur = await db.execute(
+            "INSERT INTO message_queue (agent, channel, channel_id, server, author,"
+            " author_id, is_bot, content, message_id, processed)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (agent, "general", "1", "discord", "mike", "2", 0, content,
+             f"{prefix}-{agent}-{i}", processed))
+        ids.append(cur.lastrowid)
+    await db.commit()
+    return ids
+
+
+@pytest.mark.parametrize("method", ["get", "delete"])
+def test_queue_routes_require_the_bearer_token(server, method, monkeypatch):
+    monkeypatch.setattr(server, "agent_config", {"amos": {}})
+
+    async def go():
+        client = await _client(server)
+        try:
+            path = "/agents/amos/queue" if method == "get" else "/agents/amos/queue/1"
+            resp = await getattr(client, method)(path)
+            return resp.status
+        finally:
+            await client.close()
+
+    assert run(go()) == 401
+
+
+@pytest.mark.parametrize("method", ["get", "delete"])
+def test_queue_routes_reject_an_unknown_agent(server, method, monkeypatch):
+    monkeypatch.setattr(server, "agent_config", {"amos": {}})
+
+    async def go():
+        client = await _client(server)
+        try:
+            path = ("/agents/nobody/queue" if method == "get"
+                    else "/agents/nobody/queue/1")
+            resp = await getattr(client, method)(path, headers=AUTH)
+            return resp.status
+        finally:
+            await client.close()
+
+    assert run(go()) == 404
+
+
+def test_queue_returns_pending_and_processing_for_that_agent_only(
+        server, monkeypatch, tmp_path):
+    """The modal distinguishes pending from processing, and hiding the
+    in-flight message would make a busy agent look idle."""
+    monkeypatch.setattr(server, "agent_config", {"amos": {}, "kothar": {}})
+
+    async def go():
+        db = await _fresh_db(server, tmp_path)
+        await _queue(db, "amos", "first", "second")
+        await _queue(db, "amos", "in flight",
+                     processed=server.STATUS_IN_PROGRESS, prefix="p")
+        await _queue(db, "amos", "already answered",
+                     processed=server.STATUS_COMPLETE, prefix="d")
+        await _queue(db, "kothar", "not yours")
+
+        client = await _client(server)
+        try:
+            resp = await client.get("/agents/amos/queue", headers=AUTH)
+            body = await resp.json()
+        finally:
+            await client.close()
+            await db.close()
+        return body
+
+    body = run(go())
+    contents = [m["content"] for m in body["messages"]]
+    assert contents == ["first", "second", "in flight"], contents
+    assert [m["state"] for m in body["messages"]] == [
+        "pending", "pending", "processing"]
+    assert "not yours" not in contents, "another agent's queue leaked"
+    assert "already answered" not in contents, "a finished message is not queued"
+    # The shape dashboard/app/components/AgentModal.tsx destructures.
+    for msg in body["messages"]:
+        assert set(msg) >= {
+            "id", "channel", "author", "content", "content_full_length",
+            "created_at", "state"}
+
+
+def test_queue_truncates_long_content_but_reports_the_real_length(
+        server, monkeypatch, tmp_path):
+    monkeypatch.setattr(server, "agent_config", {"amos": {}})
+    long_content = "x" * 5000
+
+    async def go():
+        db = await _fresh_db(server, tmp_path)
+        await _queue(db, "amos", long_content)
+        client = await _client(server)
+        try:
+            body = await (await client.get("/agents/amos/queue", headers=AUTH)).json()
+        finally:
+            await client.close()
+            await db.close()
+        return body
+
+    msg = run(go())["messages"][0]
+    assert len(msg["content"]) == server.QUEUE_PREVIEW_CHARS
+    assert msg["content_full_length"] == 5000, (
+        "the UI shows '...N chars' from this field; truncating it too would "
+        "make a 5000-character message claim to be 200")
+
+
+def test_delete_cancels_exactly_one_message(server, monkeypatch, tmp_path):
+    """The reason /flush does not cover this case: flush drops the whole
+    backlog, and the modal's row-level 'x' must leave the rest queued."""
+    monkeypatch.setattr(server, "agent_config", {"amos": {}})
+
+    async def go():
+        db = await _fresh_db(server, tmp_path)
+        ids = await _queue(db, "amos", "keep", "drop", "keep too")
+        client = await _client(server)
+        try:
+            resp = await client.delete(f"/agents/amos/queue/{ids[1]}", headers=AUTH)
+            body = await resp.json()
+            status = resp.status
+        finally:
+            await client.close()
+        async with db.execute(
+            "SELECT content FROM message_queue WHERE agent = ? AND processed = ?"
+            " ORDER BY id", ("amos", server.STATUS_QUEUED)) as cur:
+            left = [r["content"] for r in await cur.fetchall()]
+        await db.close()
+        return status, body, left
+
+    status, body, left = run(go())
+    assert status == 200
+    assert body["cancelled"] is True
+    assert left == ["keep", "keep too"], left
+
+
+def test_delete_will_not_cancel_another_agents_message(server, monkeypatch, tmp_path):
+    """The agent name is in the path, so it has to be part of the predicate —
+    an id alone would let one agent's modal cancel another's work."""
+    monkeypatch.setattr(server, "agent_config", {"amos": {}, "kothar": {}})
+
+    async def go():
+        db = await _fresh_db(server, tmp_path)
+        ids = await _queue(db, "kothar", "kothar's message")
+        client = await _client(server)
+        try:
+            resp = await client.delete(f"/agents/amos/queue/{ids[0]}", headers=AUTH)
+            status, body = resp.status, await resp.json()
+        finally:
+            await client.close()
+        async with db.execute(
+            "SELECT COUNT(*) c FROM message_queue WHERE agent = ? AND processed = ?",
+            ("kothar", server.STATUS_QUEUED)) as cur:
+            still_queued = (await cur.fetchone())["c"]
+        await db.close()
+        return status, body, still_queued
+
+    status, body, still_queued = run(go())
+    assert status == 404
+    assert body["cancelled"] is False
+    assert still_queued == 1, "amos cancelled kothar's queued message"
+
+
+def test_delete_will_not_cancel_a_message_already_in_flight(
+        server, monkeypatch, tmp_path):
+    """Once the subprocess has it, dropping the row loses the record without
+    stopping the work. Interrupt is the tool for that, not this."""
+    monkeypatch.setattr(server, "agent_config", {"amos": {}})
+
+    async def go():
+        db = await _fresh_db(server, tmp_path)
+        ids = await _queue(db, "amos", "in flight",
+                           processed=server.STATUS_IN_PROGRESS)
+        client = await _client(server)
+        try:
+            resp = await client.delete(f"/agents/amos/queue/{ids[0]}", headers=AUTH)
+            status, body = resp.status, await resp.json()
+        finally:
+            await client.close()
+            await db.close()
+        return status, body
+
+    status, body = run(go())
+    assert status == 404
+    assert body["cancelled"] is False
+
+
+def test_delete_rejects_a_non_numeric_id(server, monkeypatch, tmp_path):
+    monkeypatch.setattr(server, "agent_config", {"amos": {}})
+
+    async def go():
+        db = await _fresh_db(server, tmp_path)
+        client = await _client(server)
+        try:
+            resp = await client.delete("/agents/amos/queue/not-a-number", headers=AUTH)
+            status, body = resp.status, await resp.json()
+        finally:
+            await client.close()
+            await db.close()
+        return status, body
+
+    status, body = run(go())
+    assert status == 400
+    assert "Invalid" in body["error"]
+
+
+def test_health_reports_uptime_and_a_total_queue_depth(server, monkeypatch, tmp_path):
+    """Both feed the dashboard home page's summary cards, which showed a
+    hardcoded 0 for as long as nothing served them."""
+    monkeypatch.setattr(server, "agent_config", {"amos": {}, "kothar": {}})
+    monkeypatch.setattr(server, "agent_states", {"amos": "IDLE", "kothar": "IDLE"})
+
+    async def go():
+        db = await _fresh_db(server, tmp_path)
+        await _queue(db, "amos", "a", "b")
+        await _queue(db, "kothar", "c")
+        client = await _client(server)
+        try:
+            body = await (await client.get("/health", headers=AUTH)).json()
+        finally:
+            await client.close()
+            await db.close()
+        return body
+
+    body = run(go())
+    assert body["queue_depth"] == 3, (
+        "total queue_depth must be the sum of the per-agent depths, not 0")
+    assert isinstance(body["uptime_seconds"], int)
+    assert body["uptime_seconds"] >= 0

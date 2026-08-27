@@ -1,6 +1,16 @@
 import { NextRequest, NextResponse } from "next/server";
 import { agentFetch, isAuthenticated, unauthorizedResponse } from "@/lib/api";
 
+// Repointed (#151): these called /queue/{name} and /queue/{name}/{id}, which
+// agent-server.py has never registered. Both now use the routes added in the
+// same change, namespaced under the agent like every other per-agent verb:
+//   GET    /agents/{name}/queue            -> { agent, messages: [...] }
+//   DELETE /agents/{name}/queue/{id}       -> cancel one queued message
+//
+// POST /agents/{name}/flush already existed but does not cover the DELETE
+// case: it drops the agent's whole backlog, and the modal's row-level "x"
+// cancels exactly one message and leaves the rest queued.
+
 export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ name: string }> }
@@ -12,9 +22,11 @@ export async function GET(
   }
 
   try {
-    const response = await agentFetch(`/queue/${name}`);
+    const response = await agentFetch(
+      `/agents/${encodeURIComponent(name)}/queue`
+    );
     const data = await response.json();
-    return NextResponse.json(data);
+    return NextResponse.json(data, { status: response.status });
   } catch (error) {
     return NextResponse.json(
       { error: "Failed to fetch queue" },
@@ -37,11 +49,13 @@ export async function DELETE(
     const body = await request.json();
     const { messageId } = body;
 
-    if (!messageId) {
+    if (messageId === undefined || messageId === null || messageId === "") {
       return NextResponse.json({ error: "messageId required" }, { status: 400 });
     }
 
-    const response = await agentFetch(`/queue/${name}/${messageId}`, {
+    const agentPath = encodeURIComponent(name);
+    const idPath = encodeURIComponent(String(messageId));
+    const response = await agentFetch(`/agents/${agentPath}/queue/${idPath}`, {
       method: "DELETE",
     });
     const data = await response.json();

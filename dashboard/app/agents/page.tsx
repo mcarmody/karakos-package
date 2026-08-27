@@ -4,17 +4,18 @@ import { usePoll } from "@/lib/hooks";
 import { useState } from "react";
 import AgentModal from "@/app/components/AgentModal";
 
+// Exactly what /api/agents returns -- which is what agent-server's /health
+// and /agents between them actually serve. This interface used to also
+// declare messages_processed, session_age_seconds, token_usage, cost,
+// queue_depths and compaction_count; none of them had a source, and an
+// interface asserting a field into existence is not a check that it is
+// there (see tests/test_dashboard_agents_contract.py).
 interface AgentInfo {
   name: string;
   state: string;
-  messages_processed: number;
-  session_age_seconds?: number;
-  token_usage?: { input: number; output: number };
-  cost?: number;
   subprocess_alive?: boolean;
   total_pending?: number;
-  queue_depths?: Record<string, number>;
-  compaction_count?: number;
+  session_id?: string;
 }
 
 export default function AgentsPage() {
@@ -112,46 +113,19 @@ export default function AgentsPage() {
 
               <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
                 <div>
-                  <p className="text-gray-400">Messages Processed</p>
+                  <p className="text-gray-400">Queued</p>
                   <p className="text-lg font-semibold">
-                    {agent.messages_processed}
+                    {agent.total_pending ?? 0}
                   </p>
                 </div>
-                {agent.session_age_seconds !== undefined && (
+                {agent.session_id && (
                   <div>
-                    <p className="text-gray-400">Session Age</p>
-                    <p className="text-lg font-semibold">
-                      {Math.floor(agent.session_age_seconds / 60)}m
+                    <p className="text-gray-400">Session</p>
+                    <p className="text-lg font-semibold font-mono">
+                      {agent.session_id}
                     </p>
                   </div>
                 )}
-                {agent.token_usage && (
-                  <div>
-                    <p className="text-gray-400">Token Usage</p>
-                    <p className="text-lg font-semibold">
-                      {(
-                        agent.token_usage.input + agent.token_usage.output
-                      ).toLocaleString()}
-                    </p>
-                  </div>
-                )}
-                {agent.cost !== undefined && (
-                  <div>
-                    <p className="text-gray-400">Cost</p>
-                    <p className="text-lg font-semibold">
-                      ${agent.cost.toFixed(2)}
-                    </p>
-                  </div>
-                )}
-                {agent.compaction_count !== undefined &&
-                  agent.compaction_count > 0 && (
-                    <div>
-                      <p className="text-gray-400">Compactions</p>
-                      <p className="text-lg font-semibold">
-                        {agent.compaction_count}
-                      </p>
-                    </div>
-                  )}
               </div>
             </div>
           );

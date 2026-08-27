@@ -2,12 +2,20 @@
 
 import { usePoll } from "@/lib/hooks";
 
+// Mirrors what agent-server's GET /health actually returns. `agents` is a
+// dict keyed by name here (unlike /api/agents, which is an array -- see
+// tests/test_dashboard_agents_contract.py). This interface used to declare
+// per-agent messages_processed and last_activity, and top-level
+// messages_today and cost_today; /health serves none of them, so the card
+// below rendered the literal string "undefined messages processed".
 interface HealthData {
   uptime_seconds: number;
-  agents: Record<string, { state: string; messages_processed: number; last_activity?: string }>;
   queue_depth: number;
-  messages_today?: number;
-  cost_today?: number;
+  agents: Record<
+    string,
+    { state: string; alive?: boolean; queue_depth?: number; session_id?: string }
+  >;
+  dead_letters?: number;
 }
 
 export default function HomePage() {
@@ -56,12 +64,10 @@ export default function HomePage() {
               </span>
             </div>
             <p className="text-sm text-gray-400 mb-1">
-              {info.messages_processed} messages processed
+              {info.queue_depth ?? 0} queued
             </p>
-            {info.last_activity && (
-              <p className="text-xs text-gray-500">
-                Last active: {new Date(info.last_activity).toLocaleTimeString()}
-              </p>
+            {info.alive === false && (
+              <p className="text-xs text-red-400">subprocess down</p>
             )}
           </div>
         ))}

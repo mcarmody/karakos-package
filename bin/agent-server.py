@@ -118,6 +118,11 @@ STATUS_COMPLETE = 2
 STATUS_CRASHED = 3
 STATUS_SKIPPED = 4
 
+# Wall-clock start of this process, for /health's uptime_seconds. The
+# dashboard's "Uptime" card read that field before anything served it and
+# rendered a permanent 0h.
+SERVER_START_TS = time.time()
+
 # Session persistence
 SUMMARY_DIR = WORKSPACE_ROOT / "logs" / "session-summaries"
 LAST_SUMMARY_TEMPLATE = WORKSPACE_ROOT / "data" / "last-session-summary-{agent}.md"
@@ -2302,6 +2307,11 @@ async def handle_health(request):
 
     return web.json_response({
         "status": "healthy",
+        # Both of these are read by the dashboard home page's summary cards,
+        # which showed a hardcoded 0 for as long as nothing served them.
+        # queue_depth is the sum of what the loop above already counted.
+        "uptime_seconds": int(time.time() - SERVER_START_TS),
+        "queue_depth": sum(a["queue_depth"] for a in agent_status.values()),
         "agents": agent_status,
         "dead_letters": undelivered,
         "dead_letter_path": str(DEAD_LETTER_PATH),
@@ -2413,6 +2423,105 @@ async def handle_agent_flush(request):
 
     flushed = await flush_agent_queue(agent)
     return web.json_response({"status": "flushed", "flushed": flushed})
+
+
+# How much of a queued message body /agents/{name}/queue returns. The
+# dashboard shows one truncated line per row, so shipping the full text of a
+# long backlog would be megabytes of JSON nobody renders.
+QUEUE_PREVIEW_CHARS = 200
+
+
+async def handle_agent_queue(request):
+    """GET /agents/{name}/queue - what this agent still has to answer.
+
+    Read side of the dashboard's agent modal. Composed from message_queue —
+    the same table /health already counts for queue_depth — rather than a new
+    store, so there is exactly one source of truth for "what is waiting".
+
+    Returns both STATUS_QUEUED and STATUS_IN_PROGRESS rows: the modal
+    distinguishes them as "pending" vs "processing", and hiding the in-flight
+    message would make an agent mid-turn look idle.
+    """
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer ") or auth_header[7:] != AGENT_SERVER_TOKEN:
+        return web.json_response({"error": "Unauthorized"}, status=401)
+
+    agent = request.match_info.get("name")
+    if agent not in agent_config:
+        return web.json_response({"error": "Unknown agent"}, status=404)
+
+    async with db.execute(
+        "SELECT id, channel, author, content, created_at, processed"
+        " FROM message_queue WHERE agent = ? AND processed IN (?, ?)"
+        " ORDER BY created_at ASC, id ASC",
+        (agent, STATUS_QUEUED, STATUS_IN_PROGRESS),
+    ) as cursor:
+        rows = await cursor.fetchall()
+
+    messages = []
+    for row in rows:
+        content = row["content"] or ""
+        messages.append({
+            # The row's primary key, which is what DELETE below takes. Not
+            # the `message_id` column — that is the upstream (Discord) id.
+            "id": row["id"],
+            "channel": row["channel"],
+            "author": row["author"],
+            "content": content[:QUEUE_PREVIEW_CHARS],
+            "content_full_length": len(content),
+            "created_at": row["created_at"],
+            "state": (
+                "processing" if row["processed"] == STATUS_IN_PROGRESS else "pending"
+            ),
+        })
+
+    return web.json_response({"agent": agent, "messages": messages})
+
+
+async def handle_agent_queue_delete(request):
+    """DELETE /agents/{name}/queue/{queue_id} - cancel one queued message.
+
+    /flush is the all-or-nothing form of this and does not cover it: the
+    dashboard cancels a single mistyped message and leaves the rest of the
+    backlog alone.
+
+    Marks the row STATUS_SKIPPED rather than deleting it, exactly as
+    flush_agent_queue does, so the record of what was asked survives. Only a
+    STATUS_QUEUED row can be cancelled — once a message is STATUS_IN_PROGRESS
+    it is already inside the subprocess and dropping the row would lose the
+    record without stopping the work. Interrupt is the tool for that.
+    """
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer ") or auth_header[7:] != AGENT_SERVER_TOKEN:
+        return web.json_response({"error": "Unauthorized"}, status=401)
+
+    agent = request.match_info.get("name")
+    if agent not in agent_config:
+        return web.json_response({"error": "Unknown agent"}, status=404)
+
+    try:
+        queue_id = int(request.match_info.get("queue_id", ""))
+    except ValueError:
+        return web.json_response({"error": "Invalid message id"}, status=400)
+
+    cursor = await db.execute(
+        "UPDATE message_queue SET processed = ?"
+        " WHERE id = ? AND agent = ? AND processed = ?",
+        (STATUS_SKIPPED, queue_id, agent, STATUS_QUEUED),
+    )
+    await db.commit()
+
+    if not cursor.rowcount:
+        # No such row, another agent's row, or already picked up. All three
+        # mean nothing was cancelled and the caller's list is stale; saying
+        # "cancelled" here would be the lie this whole issue is about.
+        return web.json_response(
+            {"error": "No queued message with that id", "cancelled": False},
+            status=404,
+        )
+
+    log.info(f"Cancelled queued message {queue_id} for {agent}")
+    return web.json_response({"status": "cancelled", "cancelled": True, "id": queue_id})
 
 
 # Agent name validator — same surface as bin/create-agent.sh's check, used
@@ -2955,6 +3064,8 @@ def create_app(with_lifecycle: bool = True) -> web.Application:
     app.router.add_post("/agents/{name}/interrupt", handle_agent_interrupt)
     app.router.add_post("/agents/{name}/kill", handle_agent_kill)
     app.router.add_post("/agents/{name}/flush", handle_agent_flush)
+    app.router.add_get("/agents/{name}/queue", handle_agent_queue)
+    app.router.add_delete("/agents/{name}/queue/{queue_id}", handle_agent_queue_delete)
     app.router.add_post("/cost", handle_cost)
     app.router.add_get("/cost", handle_cost_get_all)
     # Registered before the /cost/{agent} pattern below so "conversations"
