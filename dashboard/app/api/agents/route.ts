@@ -40,16 +40,18 @@ export async function GET(request: NextRequest) {
         // be chatted with directly from the dashboard.
         label: cfg.label || cfg.name,
         dashboard_chat: cfg.dashboard_chat !== false,
-        messages_processed: 0, // Not tracked by either upstream endpoint
-        session_age_seconds: undefined,
-        token_usage: undefined,
-        cost: undefined,
+        // Everything below has a real source in the two responses above.
+        // The shape used to carry messages_processed, session_age_seconds,
+        // token_usage, cost, subprocess_pid, queue_depths and
+        // compaction_count as well -- fields the dead /status was imagined
+        // to return. They were shipped hardcoded to 0/undefined/{} and the
+        // agents page rendered them, so "0 messages processed" was not a
+        // reading, it was a literal. Nothing serves them, so nothing claims
+        // them. Cost is on /api/cost; per-agent queue rows are on
+        // /api/agents/{name}/queue.
         subprocess_alive: info.alive,
-        subprocess_pid: undefined,
-        queue_depths: {},
         total_pending: info.queue_depth || 0,
         session_id: info.session_id,
-        compaction_count: undefined,
       };
     });
 

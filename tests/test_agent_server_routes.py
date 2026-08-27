@@ -24,6 +24,7 @@ route table the code actually builds.
 """
 
 import ast
+import re
 from pathlib import Path
 
 import pytest
@@ -140,6 +141,7 @@ def _calls_in(node):
 #   bin/cost-report.sh, /sys     -> POST /cost, GET /cost/{agent}, /usage
 #   the ask surface (#101/#135)  -> POST /ask, GET /ask/{id}, POST /ask/{id}/answer
 #   the relay's control buttons  -> POST /agents/{name}/{interrupt,kill,flush}
+#   the dashboard agent modal    -> GET/DELETE /agents/{name}/queue[/{id}]
 REQUIRED_ROUTES = {
     ("post", "/message"): "handle_message",
     ("get", "/health"): "handle_health",
@@ -150,6 +152,8 @@ REQUIRED_ROUTES = {
     ("post", "/agents/{name}/interrupt"): "handle_agent_interrupt",
     ("post", "/agents/{name}/kill"): "handle_agent_kill",
     ("post", "/agents/{name}/flush"): "handle_agent_flush",
+    ("get", "/agents/{name}/queue"): "handle_agent_queue",
+    ("delete", "/agents/{name}/queue/{queue_id}"): "handle_agent_queue_delete",
     ("post", "/cost"): "handle_cost",
     ("get", "/cost/{agent}"): "handle_cost_get",
     ("get", "/usage"): "handle_usage",
@@ -324,4 +328,282 @@ def test_create_agent_script_targets_register():
     )
     assert "/agents/$AGENT_NAME/register" in live, (
         "create-agent.sh does not POST to the register endpoint outside of a comment"
+    )
+
+
+# ===========================================================================
+# The dashboard <-> agent-server path contract (issue #151)
+# ===========================================================================
+#
+# Every one of the four defects in #151 was the same shape: a dashboard API
+# route called an agent-server path that agent-server.py does not register,
+# got a 404 body back, and rendered it as if it were data. `GET /status`,
+# `POST /interrupt`, `GET /queue/{name}` and `DELETE /queue/{name}/{id}` were
+# all confidently written and none of them existed.
+#
+# Nothing could catch that. TypeScript does not know what the Python server
+# routes; the Python tests above did not know the dashboard existed; and the
+# 404 arrives as a perfectly well-formed JSON object, so `await res.json()`
+# succeeds and the failure has no symptom beyond a card full of `undefined`.
+#
+# These tests join the two halves: they read the paths the dashboard actually
+# asks for and check each one against the route table `create_app()` actually
+# builds. They are deliberately general -- they do not enumerate the four
+# known-bad paths, so the fifth one fails here too.
+
+DASHBOARD_DIR = PACKAGE_ROOT / "dashboard"
+# The single chokepoint through which the dashboard talks to agent-server.
+# `test_agent_fetch_is_the_only_door` below is what keeps that true; if it
+# ever stops being true, this whole scan goes blind and that test says so.
+API_HELPER = DASHBOARD_DIR / "lib" / "api.ts"
+
+_TS_BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
+_TS_LINE_COMMENT = re.compile(r"(?<![:\w])//[^\n]*")
+_AGENT_FETCH = re.compile(r"\bagentFetch\s*\(")
+# A quoted path: "/health", '/agents', or a `/agents/${name}/queue` template.
+# A backtick template may span lines (prettier wraps long ones); a '' or ""
+# string may not, and allowing newlines there would let the scan run away
+# past an unterminated quote.
+_PATH_LITERAL = re.compile(r"""`(/[^`]*)`|['"](/[^'"\n]*)['"]""")
+
+
+def _path_literals(text):
+    """Every quoted path in an expression, template literals included."""
+    return [m.group(1) if m.group(1) is not None else m.group(2)
+            for m in _PATH_LITERAL.finditer(text)]
+_METHOD = re.compile(r"""\bmethod\s*:\s*['"](\w+)['"]""")
+
+
+def _strip_ts_comments(text):
+    """Blank out comments, preserving offsets so line numbers stay true.
+
+    The same trap the contract test documents, and it is live here: the fixed
+    routes carry comments naming the dead endpoints they used to call, so a
+    scan that read prose as code would report the very paths that were just
+    removed. The line-comment pattern refuses a `//` preceded by `:` so that
+    `http://host` inside a string is not mistaken for a comment.
+    """
+    def blank(match):
+        return re.sub(r"[^\n]", " ", match.group(0))
+
+    return _TS_LINE_COMMENT.sub(blank, _TS_BLOCK_COMMENT.sub(blank, text))
+
+
+def _balanced_paren(text, open_idx):
+    """Text inside the (...) whose opening paren is at `open_idx`."""
+    depth = 0
+    for i in range(open_idx, len(text)):
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return text[open_idx + 1 : i]
+    return ""
+
+
+def _split_top_level_commas(text):
+    """Split an argument list on commas that are not nested in (), [], {}."""
+    parts, depth, cur = [], 0, []
+    for ch in text:
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        if ch == "," and depth == 0:
+            parts.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    parts.append("".join(cur))
+    return parts
+
+
+def _placeholderize(path):
+    """`/agents/${encodeURIComponent(name)}/queue` -> `/agents/{}/queue`.
+
+    Brace-balanced so a `${cond ? a : b}` with its own braces is consumed
+    whole rather than leaving a tail that looks like a path segment.
+    """
+    out, i = [], 0
+    while i < len(path):
+        if path.startswith("${", i):
+            depth, j = 0, i + 1
+            while j < len(path):
+                if path[j] == "{":
+                    depth += 1
+                elif path[j] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j += 1
+            out.append("{}")
+            i = j + 1
+        else:
+            out.append(path[i])
+            i += 1
+    # The query string is not part of the route, and aiohttp never matches on
+    # it -- /cost?period=daily is a request to /cost.
+    return "".join(out).split("?", 1)[0]
+
+
+def _dashboard_sources():
+    """Every dashboard .ts/.tsx that calls agentFetch, comments stripped."""
+    out = []
+    if not DASHBOARD_DIR.exists():
+        return out
+    for path in sorted(DASHBOARD_DIR.rglob("*.ts")):
+        if path == API_HELPER or "node_modules" in path.parts:
+            continue
+        text = _strip_ts_comments(path.read_text())
+        if _AGENT_FETCH.search(text):
+            out.append((path, text))
+    return out
+
+
+def _requested_paths():
+    """[(file, line, method, path)] for every agentFetch call in the dashboard.
+
+    Resolves the one indirection the codebase actually uses: `const path =
+    ... ; agentFetch(path)`, as /api/cost does. Anything it cannot resolve is
+    returned with a path of None so `test_every_agent_fetch_path_is_readable`
+    fails loudly rather than this scan quietly covering less than it looks.
+    """
+    found = []
+    for path_obj, text in _dashboard_sources():
+        rel = path_obj.relative_to(PACKAGE_ROOT)
+        for m in _AGENT_FETCH.finditer(text):
+            line = text[: m.start()].count("\n") + 1
+            args = _balanced_paren(text, m.end() - 1)
+            pieces = _split_top_level_commas(args)
+            first = pieces[0].strip()
+            options = ",".join(pieces[1:])
+            method = (_METHOD.search(options).group(1).lower()
+                      if _METHOD.search(options) else "get")
+
+            literals = _path_literals(first)
+            if not literals:
+                # `agentFetch(path)` -- resolve the local const by name.
+                ident = first.strip()
+                if re.fullmatch(r"[A-Za-z_$][\w$]*", ident):
+                    for decl in re.finditer(
+                        r"\b(?:const|let|var)\s+%s\s*=(.*?);" % re.escape(ident),
+                        text,
+                        re.DOTALL,
+                    ):
+                        literals.extend(_path_literals(decl.group(1)))
+
+            if not literals:
+                found.append((rel, line, method, None))
+            for lit in literals:
+                found.append((rel, line, method, _placeholderize(lit)))
+    return found
+
+
+def _route_matches(requested, registered):
+    """Does a requested path reach an aiohttp route pattern?
+
+    Segment-wise. `{param}` on the server side matches anything; `{}` on the
+    client side is a value interpolated at runtime, which we cannot evaluate,
+    so it is allowed to stand in for any single segment. Segment *count* is
+    exact, which is what makes /queue/{name} fail against /cost/{agent}.
+    """
+    req = requested.strip("/").split("/")
+    reg = registered.strip("/").split("/")
+    if len(req) != len(reg):
+        return False
+    for r_seg, s_seg in zip(req, reg):
+        if s_seg.startswith("{") and s_seg.endswith("}"):
+            continue
+        if r_seg == "{}":
+            continue
+        if r_seg != s_seg:
+            return False
+    return True
+
+
+def test_the_dashboard_scan_finds_something():
+    """A scan that matched nothing would make the check below pass by vacuum
+    -- which is exactly how these four bugs survived to begin with."""
+    assert DASHBOARD_DIR.exists(), "dashboard/ is missing"
+    calls = _requested_paths()
+    assert len(calls) >= 5, (
+        f"only {len(calls)} agentFetch call(s) found in dashboard/ -- the "
+        "scan has probably stopped seeing them"
+    )
+
+
+def test_every_agent_fetch_path_is_readable():
+    """Every call site must yield a path this test can check.
+
+    If a route ever computes its path in a way the scan cannot follow, fail
+    here rather than silently checking a shrinking subset.
+    """
+    unreadable = [
+        f"{rel}:{line}" for rel, line, _, path in _requested_paths() if path is None
+    ]
+    assert not unreadable, (
+        "agentFetch() called with a path this test cannot resolve at "
+        f"{', '.join(unreadable)} -- extend _requested_paths() to cover it"
+    )
+
+
+def test_agent_fetch_is_the_only_door():
+    """The scan assumes every agent-server call goes through agentFetch().
+
+    A dashboard file that built the upstream URL itself would be invisible to
+    it, so AGENT_SERVER_URL is allowed to appear in exactly one file.
+    """
+    if not DASHBOARD_DIR.exists():
+        pytest.skip("no dashboard/ in this checkout")
+    offenders = []
+    for path in sorted(DASHBOARD_DIR.rglob("*.ts")):
+        if path == API_HELPER or "node_modules" in path.parts:
+            continue
+        if "AGENT_SERVER_URL" in _strip_ts_comments(path.read_text()):
+            offenders.append(str(path.relative_to(PACKAGE_ROOT)))
+    assert not offenders, (
+        "these files reach the agent server without agentFetch(), so the "
+        f"path contract test cannot see them: {offenders}. Route the call "
+        "through lib/api.ts."
+    )
+
+
+def test_no_dashboard_route_calls_an_unregistered_agent_server_path():
+    """Issue #151 itself, generalised.
+
+    The dashboard asked for /status, /interrupt, /queue/{name} and
+    /queue/{name}/{id}; agent-server.py registers none of them. A 404 body
+    parses as JSON just fine, so every one of those failures rendered as
+    `undefined` rather than as an error.
+    """
+    registered = _registered_routes()
+    assert registered, "no routes parsed out of agent-server.py"
+
+    offenders = []
+    for rel, line, method, path in _requested_paths():
+        if path is None:
+            continue  # reported by test_every_agent_fetch_path_is_readable
+        if any(
+            m == method and _route_matches(path, p) for m, p, _ in registered
+        ):
+            continue
+        # Distinguish "wrong path" from "right path, wrong verb": the second
+        # is a different fix and a confusing message if it says "no route".
+        by_path = sorted(
+            {m.upper() for m, p, _ in registered if _route_matches(path, p)}
+        )
+        detail = (
+            f"only {'/'.join(by_path)} is registered for it"
+            if by_path
+            else "no such route on the agent server"
+        )
+        offenders.append(f"{rel}:{line} {method.upper()} {path} -- {detail}")
+
+    assert not offenders, (
+        "dashboard routes calling agent-server paths that do not exist:\n  "
+        + "\n  ".join(offenders)
+        + "\nThese return a 404 JSON body that the caller renders as data. "
+        "Either repoint the client or register the route in "
+        "bin/agent-server.py."
     )
