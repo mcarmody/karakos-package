@@ -522,21 +522,23 @@ Each is a real defect in the code, not a configuration mistake.
   reads `logs/agent-streams/`, and nothing writes to that directory. It exits
   non-zero every time, so `data/last-session-summary-<agent>.md` is never
   written and the `[SESSION RESET]` re-injection above never fires in
-  practice.
+  practice. ([#148](https://github.com/mcarmody/karakos-package/issues/148))
 - **`memory.recall` does not use the embeddings** it spends time computing;
-  it is a `LIKE` match.
+  it is a `LIKE` match. ([#149](https://github.com/mcarmody/karakos-package/issues/149))
 - **Tool-audit retention is a no-op** — `bin/purge-data.py` purges
   `mcp/tool-audit.db`, while the real database is `data/mcp-tools-audit.db`.
+  ([#150](https://github.com/mcarmody/karakos-package/issues/150))
 - **`bin/capture.py --backfill` reads the wrong path**, `data/agent-server.db`
-  rather than `data/memory/agent-server.db`.
+  rather than `data/memory/agent-server.db`. ([#150](https://github.com/mcarmody/karakos-package/issues/150))
 - **Four dashboard API routes call endpoints the agent server does not have**
   (`/status`, `/interrupt` at the wrong path, `/queue/*`), and
   `/api/agents/[name]/open-terminal` shells `osascript`, which cannot work in
-  a Linux container.
+  a Linux container. ([#151](https://github.com/mcarmody/karakos-package/issues/151))
 - **The weekly update check does nothing.** `bin/check-updates.sh` reads a
   `package.json` at the workspace root that does not exist, so it exits before
   it reaches the GitHub API; even if it ran, it only writes to stdout, which
   the scheduler discards. Watch the releases page instead.
+  ([#152](https://github.com/mcarmody/karakos-package/issues/152))
 - **There is no context-budget compaction.** The `sessions` table carries
   `input_tokens`, `compaction_count` and `last_compacted`, and the tokens are
   written after every turn, but nothing reads them back or compares them to a
