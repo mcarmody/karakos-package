@@ -190,17 +190,29 @@ def run_flush_deferred_messages():
         log.error(f"Deferred-message flush failed: {e.stderr}")
 
 def check_updates():
-    """Check for Karakos updates"""
+    """Check for Karakos updates.
+
+    Exit 1 means the check could not complete — the releases API was
+    unreachable, or an available update could not be announced. It is logged
+    rather than swallowed (#152): this job runs weekly, so a checker that
+    fails quietly stays broken for a month at a time, which is exactly how
+    this one went unnoticed. Its own output goes to stdout, so that is logged
+    alongside stderr — the reason usually lands there.
+    """
     log.info("Checking for updates")
     try:
-        subprocess.run(
+        result = subprocess.run(
             ["bash", f"{WORKSPACE_ROOT}/bin/check-updates.sh"],
-            check=True,
             capture_output=True,
             text=True
         )
-    except subprocess.CalledProcessError as e:
-        log.error(f"Update check failed: {e.stderr}")
+        if result.returncode != 0:
+            log.error(
+                f"Update check failed ({result.returncode}): "
+                f"{result.stderr.strip() or result.stdout.strip()}"
+            )
+    except OSError as e:
+        log.error(f"Update check could not run: {e}")
 
 def purge_old_data():
     """Purge old logs and data"""

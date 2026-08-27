@@ -241,7 +241,7 @@ Replaces cron, with the container's full environment. The loop ticks every
 | Memory maintenance | daily 03:00 | `bin/memory-maintenance.py` |
 | Health monitor | daily 04:00 | `bin/health-monitor.py` |
 | Data purge | daily 04:30 | `bin/purge-data.py` |
-| Update check | Mondays 05:00 | `bin/check-updates.sh` |
+| Update check | Mondays 05:00 | `bin/check-updates.sh` — pokes signals on a new release |
 | Due one-off work | every tick | `bin/oneshot.py` |
 
 Two of these are deliberately far more frequent than a daily sweep, and it is
@@ -547,11 +547,6 @@ Each is a real defect in the code, not a configuration mistake.
   (`/status`, `/interrupt` at the wrong path, `/queue/*`), and
   `/api/agents/[name]/open-terminal` shells `osascript`, which cannot work in
   a Linux container. ([#151](https://github.com/mcarmody/karakos-package/issues/151))
-- **The weekly update check does nothing.** `bin/check-updates.sh` reads a
-  `package.json` at the workspace root that does not exist, so it exits before
-  it reaches the GitHub API; even if it ran, it only writes to stdout, which
-  the scheduler discards. Watch the releases page instead.
-  ([#152](https://github.com/mcarmody/karakos-package/issues/152))
 - **There is no context-budget compaction.** The `sessions` table carries
   `input_tokens`, `compaction_count` and `last_compacted`, and the tokens are
   written after every turn, but nothing reads them back or compares them to a

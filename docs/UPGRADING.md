@@ -25,14 +25,25 @@ compose exec karakos …`, not by a guessed container name.
 
 ## Version check
 
-There is no working automatic notification. `bin/check-updates.sh` is
-scheduled weekly, but it only logs to stdout — nothing reaches Discord — and
-it currently exits non-zero before it gets that far, because it reads a
-`package.json` at the workspace root that does not exist
-([known gap](ARCHITECTURE.md#known-gaps)).
+`bin/check-updates.sh` runs weekly (Mondays 05:00) and pokes your signals
+channel when a newer release exists, once per release. It compares against
+`KARAKOS_VERSION` — the same value `config/docker-compose.yml` uses to pick the
+image — so it reports at whatever precision you pinned: on `v1.3` it tells you
+about `v1.4`, not about the `v1.3.1` build that is already published under the
+`v1.3` tag you are tracking. On the default `latest` it names the new release
+and tells you to pull, since there is no version to compare against.
 
-Watch the [releases page](https://github.com/mcarmody/karakos-package/releases)
-instead, or subscribe to it on GitHub.
+To check on demand:
+
+```bash
+bin/check-updates.sh          # --force re-announces a release already seen
+```
+
+The notice arrives through `bin/poke.sh`, not a direct webhook post, so an
+agent reads the release notes and tells you what changed. That is the opposite
+choice from `bin/cli-upgrade-watchdog.sh` below, which bypasses the agent queue
+deliberately — the thing *it* reports is that agents cannot answer, which does
+not apply here.
 
 ## Upgrade
 
