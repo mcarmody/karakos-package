@@ -13,9 +13,15 @@ bin/create-agent.sh --template builder --model sonnet \
   --discord-token "$DISCORD_BOT_TOKEN_BUILDER" builder
 ```
 
-Templates: `primary`, `relay`, `builder`, `reviewer`
+Templates: `primary`, `relay`, `builder`, `reviewer`.
 
 The agent is hot-registered — no server restart needed.
+
+`create-agent.sh` also drops `agents/<name>/onboarding.md` into every new
+agent. The agent server injects it as the first turn's prompt **whenever
+`persona/` is empty**, so a brand-new agent interviews you about who you are
+instead of starting from nothing. Writing your first `persona/` file is
+therefore also what switches onboarding off.
 
 ## Customizing Agent Personality
 
@@ -24,6 +30,7 @@ Each agent has a persona directory:
 ```
 agents/{name}/
 ├── SYSTEM_PROMPT.md    # Core instructions (generated from template)
+├── onboarding.md       # First-turn prompt, used only while persona/ is empty
 ├── persona/
 │   └── voice.md        # Voice, tone, behavioral rules
 ├── inbox/              # Incoming work briefs
@@ -110,7 +117,21 @@ result = {"answer": f"You asked about: {query}"}
 print(json.dumps(result))
 ```
 
-Scripts receive `TOOL_ARGS` (JSON) and `WORKSPACE_ROOT` via environment. Print JSON to stdout. Exit code 0 = success.
+Scripts receive `TOOL_ARGS` (JSON) and `WORKSPACE_ROOT` via environment. Print
+JSON to stdout. Exit code 0 = success.
+
+Three details the discovery code enforces and it is cheap to get wrong:
+
+- **The script filename must match the tool name.** `my_tool` looks for
+  `scripts/my_tool.py`, then `scripts/my_tool.sh`, falling back to
+  `scripts/main.py` or `scripts/main.sh`. Nothing else is tried.
+- **The working directory is the skill directory**, not the workspace root.
+  Use `WORKSPACE_ROOT` for anything outside your own skill.
+- **60 seconds, hard.** A tool that runs longer is killed and reported as a
+  failure.
+
+`skills/README.md` is the fuller authoring guide, including argument
+validation and error conventions.
 
 ### 4. Test
 
@@ -128,12 +149,16 @@ The builder agent receives specs as markdown files in its inbox and implements t
 
 ### Writing a Spec
 
-Create a file in `agents/builder/inbox/`:
+Create a file in **`inbox/builder/`** at the workspace root. This is not
+`agents/builder/inbox/` — the dispatcher only watches the top-level `inbox/`.
 
 ```markdown
 ---
-type: build
 target_branch: main
+repo: mcarmody/karakos-package
+branch_prefix: builder
+requester: 123456789012345678
+callback_channel: general
 ---
 
 # Feature: User Preferences
@@ -151,36 +176,58 @@ Add a user preferences system that persists settings to a JSON file.
 - [ ] Default values provided for new installations
 ```
 
+Only five frontmatter keys are read: `target_branch`, `repo`,
+`branch_prefix`, `requester` and `callback_channel`. Anything else is ignored.
+
+**`requester` is the one that matters most.** It is the Discord user ID the
+completion notice is sent to. Without it, the build runs to completion and
+nobody is told — there is no fallback announcement.
+
 ### Triggering a Build
 
-The dispatch adapter watches inbox directories. When it finds a spec:
+The dispatch adapter watches `inbox/<agent>/`. When it finds a spec:
 
-1. Invokes `bin/invoke-builder.sh` with the spec path
-2. Builder reads the spec, creates a feature branch, implements, and opens a PR
-3. Cost is posted to #signals
-4. Owner reviews and merges
+1. It invokes `bin/invoke-builder.sh` with the spec path
+2. The builder reads the spec, creates a feature branch, implements, opens a PR
+3. Cost is recorded against the builder agent through the agent server's
+   `/cost` endpoint — it is visible on the dashboard's `/costs` page, and it is
+   **not** posted to the signals channel
+4. `requester` is poked on `callback_channel` (default `general`)
+5. Owner reviews and merges
+
+Concurrency is capped: one builder and two reviewers at a time
+(`MAX_CONCURRENT_BUILDERS`, `MAX_CONCURRENT_REVIEWERS`). A builder dispatch
+times out after 6 hours, a reviewer after 1.
 
 ### Using the Reviewer Agent
 
 Send a spec and codebase for adversarial review:
 
 ```bash
-bin/invoke-reviewer.sh --spec agents/builder/inbox/my-feature.md \
-  --branch builder/my-feature --mode spec
+bin/invoke-reviewer.sh inbox/builder/my-feature.md
 ```
 
-The reviewer returns a verdict: APPROVE, REVISE, or REJECT.
+The spec path is positional. The flags it accepts are `--model`,
+`--dispatch-id`, `--output-format`, `--codebase-review` and `--help`; there is
+no `--spec`, `--branch` or `--mode`, and passing one silently swallows it as
+the spec path instead.
+
+The reviewer returns one of three verdicts: **APPROVE**, **REVISE** or
+**RETHINK**.
 
 ## Inter-Agent Communication
 
 Agents communicate via `bin/poke.sh`:
 
-```bash
-# Send a message to an agent
-bin/poke.sh agent-name channel-name "Your message here"
+`poke.sh` takes **flags**, not positional agent and channel names. Bare words
+before the message are silently discarded and the poke goes to the default
+agent on the default channel, which is a quiet way to lose a message.
 
-# Send to the primary agent on #general
-bin/poke.sh primary general "Status report please"
+```bash
+bin/poke.sh --agent primary --reply-channel general "Status report please"
+
+# Queue it without any Discord post at all (channel_id "0")
+bin/poke.sh --agent primary --silent "run the nightly sweep"
 ```
 
 For file-based dispatch, drop files in `inbox/{agent-name}/`.
@@ -193,7 +240,15 @@ The system can modify itself through the builder agent:
 2. Builder implements on a feature branch
 3. Reviewer provides adversarial feedback
 4. Owner merges the PR
-5. Protected paths (Tier 1) block unauthorized changes to core files
+5. `config/protected-paths.json` decides what the builder may touch
+
+That file has three lists, not one. **Tier 1** is a hard block — `system/`,
+`config/`, `.karakos/`, `Dockerfile`, and the four `bin/` scripts that own
+process lifecycle. **Tier 2** requires review: the rest of `bin/`,
+`agents/templates/`, `mcp/tools-server.py`. **Overrides** are always writable
+even though they sit under a protected prefix: `agents/*/persona/`,
+`agents/*/journal/`, `agents/*/inbox/` — which is what lets an agent maintain
+its own persona and journal without being handed its own process lifecycle.
 
 ### What Requires Restart
 
@@ -201,13 +256,14 @@ The system can modify itself through the builder agent:
 |-------------|---------------|-----|
 | `persona/voice.md` | None | Loaded fresh each session |
 | `skills/*/` | Agent session reset | Dashboard → Reset |
-| `config/agents.json` | Agent server restart | POST `/restart/server` |
-| `bin/agent-server.py` | Agent server restart | POST `/restart/server` |
+| `config/agents.json`, adding an agent | None | `bin/create-agent.sh` hot-registers via POST `/agents/{name}/register` |
+| `config/agents.json`, changing an existing agent | Agent respawn | POST `/agents/{name}/reload` (keeps context) or `/reset` (drops it) |
+| `bin/agent-server.py` | Container restart | `make down && make up` |
 | `Dockerfile` | Container rebuild | see [Local development build](#local-development-build) |
 
 ## Local Development Build
 
-Production installs pull a prebuilt image from GHCR (`docker compose pull`).
+Production installs pull a prebuilt image from GHCR (`make pull`).
 If you are modifying the `Dockerfile` or Python/Node dependencies and need to
 test those changes before a release, use the dev compose override:
 
@@ -215,6 +271,7 @@ test those changes before a release, use the dev compose override:
 docker compose \
   -f config/docker-compose.yml \
   -f config/docker-compose.dev.yml \
+  --env-file config/.env \
   up --build -d
 ```
 
@@ -223,26 +280,74 @@ your local changes are compiled into an image named `karakos-dev:local`.
 Bring the stack back down and return to the prebuilt image at any time with:
 
 ```bash
-docker compose down
-docker compose -f config/docker-compose.yml up -d
+docker compose -f config/docker-compose.yml --env-file config/.env down
+make up
 ```
 
 The dev override is intentionally not committed to production flows — it is
 only for contributors iterating on the image itself.
 
-## Environment Variables
+## Configuration
 
-All configuration lives in `config/.env`. Key variables:
+`config/.env` holds the environment, but it is not the whole story — four
+other files in `config/` carry configuration the wizard generates and you may
+want to edit:
+
+| File | Holds |
+|---|---|
+| `.env` | Secrets, ports, limits — everything below |
+| `agents.json` | The agent registry: model, `max_turns`, timeout, streaming flags |
+| `channels.json` | Which Discord servers and channels are watched, and each channel's `default_agent`, `reply_gate` and `guest_agents` |
+| `claude-settings.json` | Hook wiring and the tool permission policy |
+| `protected-paths.json` | What a builder agent may and may not commit |
+
+### Environment variables
+
+**Required — the container refuses to start without them:**
 
 | Variable | Description |
-|----------|-------------|
+|---|---|
+| `AGENT_SERVER_TOKEN` | Bearer token every internal API call carries |
+| `DASHBOARD_PORT` | Web UI port, and the port published on the host |
+
+**Identity and access:**
+
+| Variable | Description |
+|---|---|
 | *(Anthropic auth)* | Handled by `claude login` — no API key in env |
-| `AGENT_SERVER_TOKEN` | Bearer token for API auth |
-| `COST_DAILY_LIMIT` | Daily spend cap in USD |
-| `COST_MONTHLY_LIMIT` | Monthly spend cap in USD |
-| `MAX_CONCURRENT_BUILDERS` | Parallel builder agents |
-| `MEMORY_DECAY_RATE` | Episode importance decay (0-1) |
+| `DISCORD_BOT_TOKEN_PRIMARY` / `DISCORD_BOT_ID_PRIMARY` | The primary agent's bot. Other agents use the same `_<AGENT>` suffix |
+| `DISCORD_SERVER_ID` | The guild the relay listens to |
+| `DISCORD_CHANNEL_GENERAL` / `DISCORD_CHANNEL_SIGNALS` | Channel IDs |
+| `OWNER_DISCORD_ID` | Who counts as the owner. **Unset denies every slash command to everyone** |
+| `DASHBOARD_USER` / `DASHBOARD_PASSWORD` | Dashboard login, user defaults to `admin` |
+| `SESSION_SECRET` | HMAC key for the dashboard session cookie |
+| `AGENT_SERVER_PORT` | API port, default 18791, loopback-only on the host |
+| `WORKSPACE_ROOT` | `/workspace` in the container |
+| `KARAKOS_VERSION` | Image tag to run, default `latest` |
+| `TZ` | Container timezone — the scheduler's clock times are in it |
+
+**Cost and capacity:**
+
+| Variable | Description |
+|---|---|
+| `COST_DAILY_LIMIT` / `COST_MONTHLY_LIMIT` | Spend caps in USD, enforced when a message is queued |
+| `COST_WARNING_THRESHOLD` | Fraction of a cap that triggers a warning, default 0.75 |
+| `MAX_CONCURRENT_BUILDERS` / `MAX_CONCURRENT_REVIEWERS` | Parallel dispatches |
+| `GUEST_TURN_LIMIT` | Turns a bot author may consume, default 12 |
+| `DISCORD_POST_MAX_ATTEMPTS` | Retries before a reply is dead-lettered, default 3 |
+
+**Memory, retention and timing:**
+
+| Variable | Description |
+|---|---|
+| `MEMORY_DECAY_RATE` | Episode importance decay per pass (0–1) |
+| `MEMORY_CUTOFF` | Importance below which an episode is dropped |
+| `MEMORY_MAX_EPISODES` | Episodes kept per day |
 | `MESSAGE_RETENTION_DAYS` | JSONL log retention |
+| `TOOL_AUDIT_RETENTION_DAYS` | Tool-call audit retention |
+| `KARAKOS_RECALL_SOURCE` / `KARAKOS_RECALL_TIMEOUT_S` | Recall injection, below |
+| `SCHEDULER_TICK_SECONDS` | Scheduler loop period, default 15 |
+| `ONESHOT_STALE_AFTER_SECONDS` | How late a missed one-off may fire, default 24h |
 
 ## Claude Code Hooks
 
@@ -376,7 +481,8 @@ the first tool call of a turn always posts, then at most one line every
 `TOOL_EVENT_MAX_PER_TURN` lines per turn (both in `bin/agent-server.py`). A
 turn making fifty rapid tool calls posts one line, not fifty. These are a
 liveness signal rather than an audit log — for a complete record of tool
-calls, read the agent's log or `mcp/tools-server.py`'s `tool_calls` table.
+calls, read the agent's log or the `tool_calls` table in
+`data/mcp-tools-audit.db`.
 
 Only a known argument is shown (`command`, `file_path`, `pattern`, `url`,
 and a few more); an unrecognised tool gets its bare name. Tool inputs carry

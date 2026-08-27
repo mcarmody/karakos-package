@@ -1,142 +1,231 @@
 # Quick Start
 
-Get Karakos running in under 30 minutes.
+From nothing to an agent answering you in Discord, in about 30 minutes. Most
+of that is Discord's bot-creation screens, not this software.
 
-## Prerequisites
+## Before you start
 
-- A machine running Ubuntu 22.04+ or Debian 12+ (Raspberry Pi 4/5, mini PC, VM, etc.)
-- Docker Engine 24+ with Compose v2 (`docker compose version`)
-- `jq` installed (`sudo apt install jq`)
-- An Anthropic account — login is handled by the Claude Code CLI (`claude login`), no API key required
-- A Discord bot token (see [DISCORD_SETUP.md](DISCORD_SETUP.md))
+| | |
+|---|---|
+| **A machine that stays on** | Raspberry Pi 4/5, mini PC, or a VM. 4 GB RAM minimum, 8 GB recommended; 10 GB free disk |
+| **OS** | Ubuntu 22.04+, Debian 12+, macOS 12+, or Windows 10/11 (via Docker Desktop + WSL2) |
+| **Docker** | Engine 24+ with Compose v2 — check with `docker compose version` |
+| **`git` and `openssl`** | Almost always already present. The wizard installs `jq` and Node/npm itself if they're missing |
+| **An Anthropic account** | Login happens through the Claude Code CLI. No API key to paste |
+| **A Discord bot** | Token, bot user ID, server ID — [DISCORD_SETUP.md](DISCORD_SETUP.md) walks through it |
+
+Do the Discord bot first if you haven't. The wizard will ask for its token
+partway through and it is easier to have it ready than to go and get it.
 
 ## Install
 
+The one-line installer handles prerequisites, clones the repo to `~/karakos`,
+and launches the wizard:
+
 ```bash
-git clone <repository-url>
-cd karakos
-chmod +x setup.sh
+curl -fsSL https://raw.githubusercontent.com/mcarmody/karakos-package/main/install.sh | bash
+```
+
+On Windows, in PowerShell as administrator:
+
+```powershell
+irm https://raw.githubusercontent.com/mcarmody/karakos-package/main/install.ps1 | iex
+```
+
+Or do it by hand — same result:
+
+```bash
+git clone https://github.com/mcarmody/karakos-package.git ~/karakos
+cd ~/karakos
 ./setup.sh
 ```
 
-The setup wizard walks you through:
+(`KARAKOS_DIR=/somewhere/else` before the installer changes where it clones.)
 
-1. **System name** — What you want to call your installation
-2. **Owner name** — How the system addresses you
-3. **Primary agent name** — Your main agent's name (defaults to system name)
-4. **Anthropic login** — Opens your browser for `claude login` (OAuth, no API key)
-5. **Discord bot** — Token, bot user ID, server ID (see [DISCORD_SETUP.md](DISCORD_SETUP.md))
-6. **Discord channels** — Channel IDs for general, signals, and optionally staff-comms
-7. **Your Discord user ID** — So the system knows who the owner is
-8. **Cost limits** — Daily and monthly spend caps
+## What the wizard asks
 
-The credentials produced by `claude login` live in `~/.claude/` on the host
-and are bind-mounted into the container at runtime, so the in-container
-`claude` CLI inherits the same auth.
+Eight steps:
 
-The wizard saves progress, so you can quit and resume with `./setup.sh`.
+1. **System name** — what the installation is called
+2. **Owner name** — how the system addresses you
+3. **Primary agent name** — defaults to the system name
+4. **Anthropic login** — opens a browser for `claude login` (OAuth)
+5. **Discord bot** — token, bot user ID, server ID
+6. **Discord channels** — the general and signals channel IDs
+7. **Your Discord user ID** — so it knows which human is the owner
+8. **Cost limits** — daily and monthly spend caps
 
-## Start
+It saves progress as it goes, so you can quit at any prompt and resume by
+running `./setup.sh` again. One exception: step 4 is not covered by the resume
+state, so a resumed run asks you to log in again.
 
-Run the preflight check first to catch Docker/WSL issues before they surface
-deep inside the install:
+The credentials `claude login` produces live in `~/.claude/` on the host and
+are bind-mounted into the container, so the `claude` CLI inside it inherits
+the same session. You do not log in twice.
+
+The wizard prints a dashboard password at the end. Write it down.
+
+## Start it
+
+**The wizard already started it.** `setup.sh` finishes by pulling the image
+and running `docker compose up -d` for you, so if setup completed cleanly,
+Karakos is already running and you can skip to the next section.
+
+The `make` targets below are for afterwards — restarts, upgrades, and
+day-to-day operation:
 
 ```bash
-./bin/preflight.sh && docker compose pull && docker compose up -d
+cd ~/karakos
+make install     # preflight checks, pull, start
 ```
 
-Or use the convenience target:
+`make install` needs `config/.env` to exist, which the wizard creates, so it
+is not a substitute for running the wizard first.
+
+Preflight is worth understanding, because it catches the failures that are
+otherwise diagnosed an hour later: Docker unreachable, Compose v1 instead of
+v2, Docker Desktop's WSL integration not actually running, an unsupported CPU
+architecture, shell scripts checked out with CRLF line endings, missing
+required env vars, port 3000 already taken, and low disk. It exits non-zero
+naming the specific fix.
+
+To run just the checks and start nothing:
 
 ```bash
-make install
+make preflight
 ```
 
-`make install` runs preflight, pulls the prebuilt image, and starts the
-containers. If preflight fails it halts with a clear error — fix the issue
-flagged and re-run.
+The image is pulled prebuilt from GHCR (~1.2 GB, multi-arch). There is no
+local build step.
 
-`docker compose pull` downloads the prebuilt multi-arch image from GHCR (~1.2 GB).
-No local build step — startup is fast once the image is on disk.
+**Pinning a version.** `latest` tracks the newest release. To upgrade on your
+own schedule, set `KARAKOS_VERSION=v1.3` in `config/.env`. Releases are tagged
+`v<major>.<minor>` and `v<major>` — there are no patch-level image tags.
 
-**Version pinning:** To stay on a specific release and control when you upgrade, set
-`KARAKOS_VERSION` in `config/.env`:
+> **Maintainers, first publish only:** GHCR packages are private when first
+> created by a `docker push`. After the first `release.yml` run, visit
+> [the package page](https://github.com/mcarmody/karakos-package/pkgs/container/karakos)
+> → **Package settings** → **Change package visibility** → **Public**, or
+> end users cannot pull without authenticating. One time, per package.
+
+## Check that it worked
+
+1. **Dashboard** — open `http://localhost:3000`, log in as `admin` with the
+   wizard's password.
+2. **Discord** — say hello in your general channel. The primary agent should
+   answer within a minute.
+3. **Logs** — `make logs` to watch startup.
+
+If Discord is silent but the dashboard is up, the agent is running and the
+Discord side is misconfigured. Start at
+[DISCORD_SETUP.md](DISCORD_SETUP.md#troubleshooting).
+
+## The Docker commands, and why they need a flag
+
+The compose file is at `config/docker-compose.yml`, not the repo root, so a
+bare `docker compose up` in your checkout finds nothing. The `make` targets
+pass the right flags:
+
+| Command | What it does |
+|---|---|
+| `make up` | Start the container |
+| `make down` | Stop it — agents finalize sessions first, up to 45s |
+| `make logs` | Follow the log |
+| `make shell` | A shell inside the container, as the `karakos` user |
+| `make pull` | Fetch a newer image |
+| `make help` | List targets |
+
+The long form is
+`docker compose -f config/docker-compose.yml --env-file config/.env <command>`.
+
+**There is one service, named `karakos`.** Everything runs inside that single
+container, so `docker compose logs relay` or `docker compose logs dashboard`
+will not work — those are processes, not services. Their individual logs are
+inside the container under `/workspace/logs/`.
+
+## What's actually running
+
+Four supervised processes in the one container:
+
+| Process | Job |
+|---|---|
+| `bin/agent-server.py` | The core: Claude subprocesses, message queue, cost guard, HTTP API on :18791 |
+| `bin/relay.py` | The Discord gateway — carries messages in and replies out |
+| `bin/scheduler.py` | Heartbeats, health sweeps, memory maintenance, agent-scheduled one-offs |
+| `dashboard` | The Next.js web interface on :3000 |
+
+Plus the MCP tool server, which the Claude CLI starts as its own child.
+[ARCHITECTURE.md](ARCHITECTURE.md) has the full picture.
+
+## First things to try
+
+1. Say hello in Discord.
+2. Ask it something that needs a tool — "what's the system health?"
+3. Open `/chat` in the dashboard and talk to the same agent there; replies
+   stay in the browser rather than posting to Discord.
+4. Look at `/costs` after a few exchanges to see what a turn actually costs.
+5. Check your signals channel. Agent heartbeats land there every 30 minutes,
+   along with cost warnings and health alerts. It is quiet by design — the
+   health sweep posts only when something is wrong, so silence there is good
+   news, not a broken hook.
+
+## Adding the coding stack
+
+Builder and reviewer agents are not created by default. To add them:
 
 ```bash
-KARAKOS_VERSION=v1.3
-```
-
-Then `docker compose up -d` will use that version instead of `latest`.
-
-> **First-time package publish (maintainers only):** GHCR packages default to
-> private when first created by a `docker push`. After the first `release.yml`
-> run, the package owner must visit
-> [github.com/mcarmody/karakos-package/pkgs/container/karakos](https://github.com/mcarmody/karakos-package/pkgs/container/karakos)
-> → **Package settings** → **Change package visibility** → **Public**, so
-> end-users can pull without authentication. This is a one-time step per
-> package.
-
-## Verify
-
-1. **Dashboard**: Open `http://localhost:3000` — login with `admin` and the password shown during setup
-2. **Discord**: Your primary agent should respond in #general within a minute
-3. **Logs**: `docker compose logs -f` to watch startup
-
-## What's Running
-
-Inside the container:
-
-| Process | Description |
-|---------|-------------|
-| `agent-server.py` | Core — manages Claude subprocesses, message queue, API |
-| `relay.py` | Routes Discord messages to agents |
-| `scheduler.py` | Periodic tasks (heartbeats, memory, health checks) |
-| `dashboard` | Next.js web interface on port 3000 |
-
-## First Steps
-
-1. Say hello to your agent in Discord — it should respond
-2. Check the dashboard agents page to see agent status
-3. Try the chat page to talk to your agent directly through the browser
-4. Check #signals for system health updates
-
-## Adding the Coding Stack
-
-To add builder and reviewer agents:
-
-```bash
-docker exec -it karakos-karakos-1 bash
-cd /workspace
-bin/create-agent.sh --template builder --model sonnet builder
+make shell
+bin/create-agent.sh --template builder  --model sonnet builder
 bin/create-agent.sh --template reviewer --model sonnet reviewer
 ```
 
-The builder can then receive specs in its inbox and create pull requests. The reviewer provides adversarial code review.
+The builder picks up specs from `inbox/builder/` at the workspace root — not
+from `agents/builder/inbox/` — and opens pull requests; the reviewer reviews
+them adversarially. `config/protected-paths.json` decides
+what a builder is allowed to touch — see
+[ARCHITECTURE.md](ARCHITECTURE.md#protected-paths).
 
 ## Stopping
 
 ```bash
-docker compose down
+make down
 ```
 
-The system shuts down gracefully — agents finalize their sessions before exiting (up to 45 seconds).
+Agents finalize their sessions before exit, which can take up to 45 seconds.
+Data lives in Docker volumes and survives.
 
 ## Troubleshooting
 
-**Agent not responding in Discord:**
-- Check `docker compose logs agent-server` for errors
-- Verify your bot token and channel IDs in `config/.env`
-- Make sure your bot has been invited to the server with message permissions
+**The agent doesn't answer in Discord.**
+`make logs` and look for errors from `relay` or `agent-server`. Check the bot
+token and channel IDs in `config/.env`. Confirm the bot was invited to the
+server with permission to read and send messages in that channel.
 
-**Dashboard won't load:**
-- Check port 3000 isn't in use: `lsof -i :3000`
-- Check `docker compose logs dashboard` for build errors
+**The dashboard won't load.**
+Check nothing else holds the port: `lsof -i :3000`. Then `make logs`. Preflight
+also checks this — `make preflight`.
 
-**High API costs:**
-- Adjust `COST_DAILY_LIMIT` in `config/.env`
-- Consider using `haiku` model for the relay agent (already default)
+**It answered once and now it's quiet.**
+Check `/costs` in the dashboard; you may have hit a daily cap. Caps are in
+`config/.env` as `COST_DAILY_LIMIT` and `COST_MONTHLY_LIMIT`.
 
-## Next Steps
+**Costs are higher than you want.**
+Lower `COST_DAILY_LIMIT`. The relay agent already defaults to Haiku; the
+primary agent's model is set in its config under `agents/`.
 
-- [DISCORD_SETUP.md](DISCORD_SETUP.md) — Detailed Discord bot creation
-- [ARCHITECTURE.md](ARCHITECTURE.md) — How the system works
-- [EXTENDING.md](EXTENDING.md) — Adding skills and custom agents
+**Something is wrong with Docker or WSL.**
+`make preflight` names the specific problem and the fix, which beats reading
+logs.
+
+**Startup fails complaining that `data/`, `logs/` or `inbox/` is not
+writable.** A previous run left root-owned Docker volumes behind. `make down`,
+then remove the volumes (`docker compose -f config/docker-compose.yml down -v`)
+and start again — this destroys the data in them, so take a backup first if the
+install was ever working.
+
+## Next
+
+- [DISCORD_SETUP.md](DISCORD_SETUP.md) — the bot, in detail
+- [ARCHITECTURE.md](ARCHITECTURE.md) — how the system works
+- [EXTENDING.md](EXTENDING.md) — your own tools and agents
+- [UPGRADING.md](UPGRADING.md) — moving to a new release
