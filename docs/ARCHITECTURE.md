@@ -555,11 +555,14 @@ Note `data/memory/agent-server.db` — the queue database lives under
 Documented so you don't spend an evening deciding whether it's your install.
 Each is a real defect in the code, not a configuration mistake.
 
-- **Tool-audit retention is a no-op** — `bin/purge-data.py` purges
-  `mcp/tool-audit.db`, while the real database is `data/mcp-tools-audit.db`.
-  ([#150](https://github.com/mcarmody/karakos-package/issues/150))
-- **`bin/capture.py --backfill` reads the wrong path**, `data/agent-server.db`
-  rather than `data/memory/agent-server.db`. ([#150](https://github.com/mcarmody/karakos-package/issues/150))
+- **The `session` tool's `load_last` can return another agent's summary.** It
+  globs `data/last-session-summary-*.md` across every agent and returns the
+  alphabetically last one, rather than the calling agent's own.
+  ([#160](https://github.com/mcarmody/karakos-package/issues/160))
+- **Session-summary retention mis-buckets hyphenated agent names.**
+  `bin/purge-data.py` splits the agent out of the filename at the first
+  hyphen, so `test-agent` and `test-bot` share one 30-file budget and evict
+  each other. ([#156](https://github.com/mcarmody/karakos-package/issues/156))
 - **There is no context-budget compaction.** The `sessions` table carries
   `input_tokens`, `compaction_count` and `last_compacted`, and the tokens are
   written after every turn, but nothing reads them back or compares them to a
