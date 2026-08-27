@@ -443,9 +443,24 @@ episodes a batch, stored as float32 blobs. The model is hardcoded, not
 configurable. If `fastembed` is missing the step is skipped rather than
 failing the run.
 
-**Recall today is a `LIKE` scan over `summary`, ordered by importance** — the
-embeddings are written but nothing reads them back. There is no vector index
-and no similarity search. See [Known gaps](#known-gaps).
+**Recall is semantic.** `memory.recall` embeds the query with the same model
+and ranks episodes by `0.75 × cosine similarity + 0.25 × (importance ÷ 10)`,
+so a close match on a trivial episode does not outrank a decent match on an
+important one. Importance already carries age, because the nightly pass decays
+it.
+
+It degrades rather than failing. If `fastembed` is absent, the model will not
+load, the query cannot be embedded, or no episode has an embedding yet, recall
+falls back to the old `LIKE` scan and says so in its response (`mode:
+"keyword"`, plus a reason). A mixed database is handled rather than fallen
+back on: embedded rows are scored, and literal matches on un-embedded rows are
+folded into the same ranking, tagged `match: "keyword"`. Set
+`KARAKOS_SEMANTIC_RECALL=0` to force the keyword path.
+
+The model is loaded lazily and cached for the life of the tool-server process:
+roughly 6 seconds and 230 MB on a Pi 4, paid once per session. The database is
+queried before the model, so an install with nothing embedded never loads it
+at all.
 
 Separately, `system/hooks/inject-recall.py` runs on `UserPromptSubmit` and
 injects a block from `KARAKOS_RECALL_SOURCE` (default `config/recall-source`,
@@ -523,8 +538,6 @@ Each is a real defect in the code, not a configuration mistake.
   non-zero every time, so `data/last-session-summary-<agent>.md` is never
   written and the `[SESSION RESET]` re-injection above never fires in
   practice. ([#148](https://github.com/mcarmody/karakos-package/issues/148))
-- **`memory.recall` does not use the embeddings** it spends time computing;
-  it is a `LIKE` match. ([#149](https://github.com/mcarmody/karakos-package/issues/149))
 - **Tool-audit retention is a no-op** — `bin/purge-data.py` purges
   `mcp/tool-audit.db`, while the real database is `data/mcp-tools-audit.db`.
   ([#150](https://github.com/mcarmody/karakos-package/issues/150))
