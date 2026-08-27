@@ -6,6 +6,7 @@ Discovers tools from skills/*/tools.json, validates calls,
 dispatches to skill scripts, maintains audit trail.
 """
 
+import array
 import json
 import os
 import sqlite3
@@ -118,7 +119,7 @@ CORE_TOOLS = [
     },
     {
         "name": "memory",
-        "description": "Query episodic memory. Actions: recall (search episodes), facts (search facts), recent (recent episodes).",
+        "description": "Query episodic memory. Actions: recall (semantic search over episodes by embedding similarity, blended with importance; falls back to keyword matching when no embeddings are available), facts (search facts), recent (recent episodes).",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -500,6 +501,282 @@ def ask_user(args: dict, sleep=time.sleep, monotonic=time.monotonic) -> dict:
         sleep(ASK_POLL_INTERVAL_SEC)
 
 
+# =============================================================================
+# Semantic recall for the memory tool (#149)
+# =============================================================================
+#
+# bin/memory-maintenance.py has always written a float32 embedding
+# (BAAI/bge-small-en-v1.5, via fastembed) onto every episode, and nothing ever
+# read one back: `recall` was a `summary LIKE '%query%'` scan. The install paid
+# for the fastembed dependency — including the aarch64 build-essential dance in
+# the Dockerfile — and the nightly embedding compute, and got substring
+# matching. These helpers close that loop.
+#
+# Everything below is best-effort on purpose. fastembed is an optional import
+# in memory-maintenance.py (missing => embedding generation is skipped), and
+# every episode written before this change has `embedding IS NULL`. So recall
+# has to keep working with no model, no vectors, or only some vectors: every
+# failure path lands on the original LIKE query, never on an error or an empty
+# result.
+
+EMBED_MODEL_NAME = "BAAI/bge-small-en-v1.5"
+
+# How much an episode's own importance counts versus how close it sits to the
+# query. 0.0 = pure cosine, 1.0 = pure importance. Rationale for 0.25 is on
+# blended_score().
+MEMORY_IMPORTANCE_WEIGHT = float(os.environ.get("MEMORY_IMPORTANCE_WEIGHT", "0.25"))
+
+# An episode with no embedding can still be matched literally, and a literal
+# hit has to be rankable against a scored one. It is scored as a fair-but-not-
+# great semantic match (0.75 on the 0..1 scale below, i.e. cosine 0.5) so a
+# substring hit on a not-yet-embedded episode interleaves with the semantic
+# hits instead of being dropped or always winning.
+KEYWORD_MATCH_SIMILARITY = 0.75
+
+# Ceiling on how many embedded episodes are pulled into memory to score,
+# highest importance first. 2000 x 384 float32 is ~3 MB of blobs and ~0.6s to
+# decode and score on a Raspberry Pi 4; maintenance prunes the table by
+# importance nightly, so a real database rarely gets near this.
+MEMORY_RECALL_SCAN_LIMIT = int(os.environ.get("MEMORY_RECALL_SCAN_LIMIT", "2000"))
+
+# Kill switch for a host where loading an ONNX model inside a 60s tool call is
+# not affordable. Anything falsy forces the original keyword path.
+SEMANTIC_RECALL_ENABLED = os.environ.get(
+    "KARAKOS_SEMANTIC_RECALL", "1"
+).strip().lower() not in ("0", "false", "no", "off", "")
+
+# Loading BAAI/bge-small-en-v1.5 costs ~6s and ~230 MB RSS on a Raspberry Pi 4
+# with the weights already on disk — a real bite out of a 60s tool-call budget,
+# and out of the box. This server is long-lived (one process per agent), so the
+# model is loaded once and reused: only the first recall of a session pays for
+# it, and later ones cost ~0.1-0.3s. Nothing here downloads the weights; that
+# is the nightly bin/memory-maintenance.py run's job, and until it has run
+# there are no embeddings and recall_episodes() never reaches the model.
+_embedder = None
+_embedder_failed = False
+
+
+def get_embedder():
+    """Return a cached fastembed TextEmbedding, or None if unavailable.
+
+    A missing fastembed, a missing model file, or an onnxruntime that will not
+    start are all "no semantic recall today", never an error to the caller.
+    The failure is latched so a broken install is not re-probed — and
+    re-timed-out — on every subsequent call.
+    """
+    global _embedder, _embedder_failed
+
+    if _embedder is not None:
+        return _embedder
+    if _embedder_failed:
+        return None
+
+    try:
+        from fastembed import TextEmbedding
+        _embedder = TextEmbedding(model_name=EMBED_MODEL_NAME)
+    except Exception as e:  # ImportError, missing model, onnxruntime, ...
+        print(f"[tools-server] semantic recall unavailable ({e}); "
+              f"falling back to keyword search", file=sys.stderr)
+        _embedder_failed = True
+        return None
+
+    return _embedder
+
+
+def embed_query(text: str):
+    """Embed one query string with the same model maintenance used.
+
+    Returns a list of floats, or None if the query could not be embedded.
+    """
+    model = get_embedder()
+    if model is None:
+        return None
+    try:
+        vectors = list(model.embed([text]))
+    except Exception as e:
+        print(f"[tools-server] could not embed query ({e}); "
+              f"falling back to keyword search", file=sys.stderr)
+        return None
+    if not vectors:
+        return None
+    return [float(x) for x in vectors[0]]
+
+
+def decode_embedding(blob):
+    """Decode one float32 blob written by bin/memory-maintenance.py.
+
+    That writer uses numpy's `tobytes()` — native-endian, unpadded, which is
+    exactly what `array('f')` reads back, so this needs no numpy of its own.
+    NULL, empty, or truncated blobs return None rather than raising: one bad
+    row must not take out the whole recall.
+    """
+    if not blob:
+        return None
+    try:
+        vector = array.array("f")
+        vector.frombytes(bytes(blob))
+    except (ValueError, TypeError):
+        return None
+    return list(vector) if len(vector) else None
+
+
+def cosine_similarity(a, b) -> float:
+    """Cosine similarity of two equal-length vectors; 0.0 if either is zero."""
+    dot = 0.0
+    norm_a = 0.0
+    norm_b = 0.0
+    for x, y in zip(a, b):
+        dot += x * y
+        norm_a += x * x
+        norm_b += y * y
+    if norm_a <= 0.0 or norm_b <= 0.0:
+        return 0.0
+    return dot / ((norm_a * norm_b) ** 0.5)
+
+
+def blended_score(similarity01: float, importance) -> float:
+    """Blend a 0..1 similarity with the episode's importance.
+
+    Keeping importance in the ranking is the whole point of the blend: on pure
+    cosine, an ancient throwaway line that happens to land near the query in
+    vector space outranks a genuinely important episode that is only slightly
+    further away.
+
+    Importance carries recency for free, so nothing here has to re-derive age
+    from created_at: bin/memory-maintenance.py decays importance by age every
+    night (decay_importance(), 0.25 points per 4 days by default) and prunes
+    below a cutoff, so a stale episode has already been marked down by the
+    time it reaches this function.
+
+    0.25 keeps similarity dominant — a genuinely bad match cannot be rescued
+    by being important — while letting a ~3-point importance gap flip a
+    near-tie in similarity.
+    """
+    try:
+        importance = float(importance)
+    except (TypeError, ValueError):
+        importance = 5.0
+    importance01 = max(0.0, min(1.0, importance / 10.0))
+    weight = max(0.0, min(1.0, MEMORY_IMPORTANCE_WEIGHT))
+    return (1.0 - weight) * similarity01 + weight * importance01
+
+
+def keyword_recall(conn, query: str, limit: int, reason: str) -> dict:
+    """The original substring scan — the floor every failure path lands on."""
+    rows = conn.execute(
+        "SELECT id, summary, importance, created_at FROM episodes "
+        "WHERE summary LIKE ? ORDER BY importance DESC LIMIT ?",
+        (f"%{query}%", limit)
+    ).fetchall()
+    return {
+        "episodes": [dict(r) for r in rows],
+        "mode": "keyword",
+        "reason": reason,
+    }
+
+
+def recall_episodes(conn, query: str, limit: int) -> dict:
+    """Rank episodes against `query` by embedding similarity plus importance.
+
+    Falls back to keyword_recall() whenever semantic ranking is not possible:
+    an empty query, the kill switch, no embedded episodes yet, or no usable
+    embedding model. A *partially* embedded database is handled rather than
+    fallen back on — embedded rows are scored, and un-embedded rows that match
+    literally are folded into the same ranking.
+    """
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = 10
+    limit = max(1, min(limit, 100))
+
+    query = (query or "").strip()
+    if not query:
+        # `LIKE '%%'` matches everything, which is the documented way to ask
+        # for "the most important episodes". Embedding the empty string is not.
+        return keyword_recall(conn, "", limit, "empty_query")
+
+    if not SEMANTIC_RECALL_ENABLED:
+        return keyword_recall(conn, query, limit, "disabled")
+
+    # Ask the database before the model. If maintenance has never embedded
+    # anything there is nothing to compare against, and loading an ONNX model
+    # to find that out would burn seconds of a 60s tool call for nothing.
+    embedded_rows = conn.execute(
+        "SELECT id, summary, importance, created_at, embedding FROM episodes "
+        "WHERE embedding IS NOT NULL ORDER BY importance DESC LIMIT ?",
+        (MEMORY_RECALL_SCAN_LIMIT,)
+    ).fetchall()
+    if not embedded_rows:
+        return keyword_recall(conn, query, limit, "no_embeddings")
+
+    query_vector = embed_query(query)
+    if not query_vector:
+        return keyword_recall(conn, query, limit, "embedder_unavailable")
+
+    scored = []
+    for row in embedded_rows:
+        vector = decode_embedding(row["embedding"])
+        if not vector or len(vector) != len(query_vector):
+            # A different length means a different model wrote it; skip rather
+            # than compare two vectors that do not share a space.
+            continue
+        # bge cosine is [-1, 1]; map to [0, 1] so it blends with importance.
+        cosine = cosine_similarity(query_vector, vector)
+        similarity01 = (cosine + 1.0) / 2.0
+        scored.append({
+            "id": row["id"],
+            "summary": row["summary"],
+            "importance": row["importance"],
+            "created_at": row["created_at"],
+            "similarity": round(cosine, 4),
+            "score": round(blended_score(similarity01, row["importance"]), 4),
+            "match": "semantic",
+        })
+
+    if not scored:
+        # Every stored blob was unreadable, or came from another model.
+        return keyword_recall(conn, query, limit, "no_usable_embeddings")
+
+    # Mixed database: episodes maintenance has not reached yet can still be
+    # matched literally, and are folded into the same ranking so they are
+    # neither dropped nor automatically preferred.
+    seen = {episode["id"] for episode in scored}
+    for row in conn.execute(
+        "SELECT id, summary, importance, created_at FROM episodes "
+        "WHERE embedding IS NULL AND summary LIKE ? "
+        "ORDER BY importance DESC LIMIT ?",
+        (f"%{query}%", limit)
+    ).fetchall():
+        if row["id"] in seen:
+            continue
+        scored.append({
+            "id": row["id"],
+            "summary": row["summary"],
+            "importance": row["importance"],
+            "created_at": row["created_at"],
+            "similarity": None,
+            "score": round(
+                blended_score(KEYWORD_MATCH_SIMILARITY, row["importance"]), 4
+            ),
+            "match": "keyword",
+        })
+
+    def sort_key(episode):
+        try:
+            importance = float(episode["importance"])
+        except (TypeError, ValueError):
+            importance = 0.0
+        return (episode["score"], importance)
+
+    scored.sort(key=sort_key, reverse=True)
+    return {
+        "episodes": scored[:limit],
+        "mode": "semantic",
+        "scanned": len(embedded_rows),
+    }
+
+
 def handle_core_tool(tool_name: str, args: dict) -> dict:
     """Handle built-in core tools."""
 
@@ -613,32 +890,32 @@ def handle_core_tool(tool_name: str, args: dict) -> dict:
         conn.row_factory = sqlite3.Row
         limit = args.get("limit", 10)
 
-        if action == "recent":
-            rows = conn.execute(
-                "SELECT id, summary, importance, created_at FROM episodes "
-                "ORDER BY created_at DESC LIMIT ?", (limit,)
-            ).fetchall()
-            return {"episodes": [dict(r) for r in rows]}
+        # try/finally, because the `conn.close()` that used to sit at the foot
+        # of this branch was unreachable — every action above it returns — so
+        # the connection leaked on every single memory call.
+        try:
+            if action == "recent":
+                rows = conn.execute(
+                    "SELECT id, summary, importance, created_at FROM episodes "
+                    "ORDER BY created_at DESC LIMIT ?", (limit,)
+                ).fetchall()
+                return {"episodes": [dict(r) for r in rows]}
 
-        elif action == "recall":
-            query = args.get("query", "")
-            rows = conn.execute(
-                "SELECT id, summary, importance, created_at FROM episodes "
-                "WHERE summary LIKE ? ORDER BY importance DESC LIMIT ?",
-                (f"%{query}%", limit)
-            ).fetchall()
-            return {"episodes": [dict(r) for r in rows]}
+            elif action == "recall":
+                return recall_episodes(conn, args.get("query", ""), limit)
 
-        elif action == "facts":
-            query = args.get("query", "")
-            rows = conn.execute(
-                "SELECT id, subject, content, confidence, domain FROM facts "
-                "WHERE content LIKE ? OR subject LIKE ? LIMIT ?",
-                (f"%{query}%", f"%{query}%", limit)
-            ).fetchall()
-            return {"facts": [dict(r) for r in rows]}
+            elif action == "facts":
+                query = args.get("query", "")
+                rows = conn.execute(
+                    "SELECT id, subject, content, confidence, domain FROM facts "
+                    "WHERE content LIKE ? OR subject LIKE ? LIMIT ?",
+                    (f"%{query}%", f"%{query}%", limit)
+                ).fetchall()
+                return {"facts": [dict(r) for r in rows]}
 
-        conn.close()
+            return {"error": f"Unknown tool or action: {tool_name}"}
+        finally:
+            conn.close()
 
     elif tool_name == "discord":
         action = args.get("action", "channels")
