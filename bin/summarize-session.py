@@ -8,17 +8,24 @@ required headers, and outputs to checkpoint file for next session re-injection.
 
 import argparse
 import json
+import os
 import sys
 import subprocess
 import time
 from pathlib import Path
 from datetime import datetime
 
-WORKSPACE_ROOT = Path("/workspace")
+WORKSPACE_ROOT = Path(os.environ.get("WORKSPACE_ROOT", "/workspace"))
 STREAM_LOG_DIR = WORKSPACE_ROOT / "logs" / "agent-streams"
 SUMMARY_DIR = WORKSPACE_ROOT / "logs" / "session-summaries"
 LAST_SUMMARY_TEMPLATE = WORKSPACE_ROOT / "data" / "last-session-summary-{agent}.md"
 AUDIT_LOG = WORKSPACE_ROOT / "logs" / "summarizer-audit.jsonl"
+
+# How many rotated stream logs to walk back through. agent-server rolls to a
+# new file per boot, per day and at a size cap, so the newest file can be a
+# handful of events old — reading only it would summarize the last 30
+# seconds of a six-hour session.
+STREAM_FILE_LOOKBACK = 3
 
 REQUIRED_HEADERS = [
     "## Primary Task",
@@ -45,34 +52,99 @@ Recent agent activity:
 {stream_content}
 """
 
+def extract_assistant_text(event: dict) -> str:
+    """Concatenate the text blocks of one stream-json `assistant` event.
+
+    Claude Code emits `assistant` events whose `message.content` is a LIST OF
+    BLOCKS (thinking / text / tool_use) — never a flat {"type": "text"}
+    record. read_agent_response() in bin/agent-server.py is the reference
+    parser; this has to agree with it.
+    """
+    if event.get("type") != "assistant":
+        return ""
+    message = event.get("message") or {}
+    parts = []
+    for block in message.get("content") or []:
+        if isinstance(block, dict) and block.get("type") == "text":
+            parts.append(block.get("text") or "")
+    return "".join(parts)
+
+
+def format_stream_event(event: dict) -> list:
+    """Render one stream-json event as lines for the summarizer prompt.
+
+    Returns [] for events with nothing worth summarizing (thinking blocks,
+    tool results, init/result bookkeeping).
+    """
+    event_type = event.get("type", "")
+    lines = []
+
+    if event_type == "assistant":
+        message = event.get("message") or {}
+        for block in message.get("content") or []:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype == "text":
+                text = (block.get("text") or "").strip()
+                if text:
+                    lines.append(f"[TEXT] {text[:200]}")
+            elif btype == "tool_use":
+                lines.append(f"[TOOL] {block.get('name') or 'unknown'}")
+
+    elif event_type == "user":
+        # The prompt the agent was answering. Only the plain-string form —
+        # the block-list form is tool_result payloads, which are bulky and
+        # say nothing a [TOOL] line hasn't already said.
+        message = event.get("message") or {}
+        content = message.get("content")
+        if isinstance(content, str) and content.strip():
+            lines.append(f"[USER] {content.strip()[:200]}")
+
+    # Flat shapes, kept so a log written by anything other than the tee in
+    # bin/agent-server.py still parses.
+    elif event_type == "text":
+        text = (event.get("text") or "").strip()
+        if text:
+            lines.append(f"[TEXT] {text[:200]}")
+    elif event_type == "tool_use":
+        lines.append(f"[TOOL] {event.get('name') or 'unknown'}")
+
+    return lines
+
+
 def read_recent_stream(agent: str, limit: int = 50) -> str:
     """Read last N lines from agent stream logs"""
     # Find most recent stream log for agent
+    if not STREAM_LOG_DIR.exists():
+        return ""
     stream_files = sorted(STREAM_LOG_DIR.glob(f"{agent}_*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
 
     if not stream_files:
         return ""
 
-    # Read last N lines
+    # Read the last N lines, walking back through rotated files if the
+    # newest one is shorter than that.
     lines = []
-    with open(stream_files[0]) as f:
-        all_lines = f.readlines()
-        lines = all_lines[-limit:]
+    for path in stream_files[:STREAM_FILE_LOOKBACK]:
+        need = limit - len(lines)
+        if need <= 0:
+            break
+        try:
+            with open(path, errors="replace") as f:
+                lines = f.readlines()[-need:] + lines
+        except OSError:
+            continue
 
     # Parse and format
     formatted = []
     for line in lines:
         try:
             event = json.loads(line)
-            event_type = event.get("type", "")
-
-            if event_type == "text":
-                formatted.append(f"[TEXT] {event.get('text', '')[:200]}")
-            elif event_type == "tool_use":
-                tool = event.get("name", "unknown")
-                formatted.append(f"[TOOL] {tool}")
         except json.JSONDecodeError:
             continue
+        if isinstance(event, dict):
+            formatted.extend(format_stream_event(event))
 
     return "\n".join(formatted)
 
@@ -84,7 +156,9 @@ def call_summarizer(stream_content: str) -> tuple[bool, str, dict]:
         "claude", "-p", prompt,
         "--model", "sonnet",
         "--max-turns", "1",
-        "--output-format", "stream-json"
+        "--output-format", "stream-json",
+        # The CLI refuses stream-json output under -p without it.
+        "--verbose",
     ]
 
     start_time = time.time()
@@ -102,15 +176,19 @@ def call_summarizer(stream_content: str) -> tuple[bool, str, dict]:
         if result.returncode != 0:
             return False, "", {"error": "subprocess_failed", "duration_ms": duration_ms}
 
-        # Parse stream-json output
+        # Parse stream-json output — same block shape as the agent stream.
         summary = ""
         for line in result.stdout.splitlines():
             try:
                 event = json.loads(line)
-                if event.get("type") == "text":
-                    summary += event.get("text", "")
             except json.JSONDecodeError:
                 continue
+            if not isinstance(event, dict):
+                continue
+            summary += extract_assistant_text(event)
+            # Fallback for a build that only emits the flat result string.
+            if not summary and event.get("type") == "result":
+                summary = event.get("result") or ""
 
         summary = summary.strip()
 

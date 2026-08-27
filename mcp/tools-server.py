@@ -69,6 +69,10 @@ CORE_TOOLS = [
                     "type": "string",
                     "enum": ["finalize", "load_last"],
                     "description": "The action to perform"
+                },
+                "agent": {
+                    "type": "string",
+                    "description": "Agent to finalize. Defaults to the calling agent (KARAKOS_AGENT)."
                 }
             },
             "required": ["action"]
@@ -810,12 +814,27 @@ def handle_core_tool(tool_name: str, args: dict) -> dict:
     elif tool_name == "session":
         action = args.get("action", "load_last")
         if action == "finalize":
+            # summarize-session.py declares `agent` as a REQUIRED positional.
+            # Calling it bare exited 2 on argparse every time (#148), which
+            # surfaced here only as an empty "output" because stderr was
+            # dropped. Identity comes from KARAKOS_AGENT, which
+            # bin/agent-server.py sets on the agent subprocess this server
+            # is a child of — the same source ask_user uses.
+            agent = (args.get("agent") or KARAKOS_AGENT).strip()
+            if not agent:
+                return {"error": "No agent identity (KARAKOS_AGENT unset); "
+                                 "cannot finalize a session"}
             try:
                 result = subprocess.run(
-                    ["python3", str(WORKSPACE / "bin" / "summarize-session.py")],
+                    ["python3", str(WORKSPACE / "bin" / "summarize-session.py"), agent],
                     capture_output=True, text=True, timeout=30, cwd=str(WORKSPACE)
                 )
-                return {"status": "ok" if result.returncode == 0 else "error",
+                if result.returncode != 0:
+                    return {"status": "error", "agent": agent,
+                            "output": result.stdout.strip(),
+                            "error": result.stderr.strip() or
+                                     f"summarize-session.py exited {result.returncode}"}
+                return {"status": "ok", "agent": agent,
                         "output": result.stdout.strip()}
             except Exception as e:
                 return {"error": str(e)}

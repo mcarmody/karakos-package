@@ -418,9 +418,24 @@ routinely confused:
 end an in-flight turn is to kill the process to force EOF. The agent is
 flagged so the partial text is thrown away rather than posted.
 
-**Shutdown.** `SIGTERM` triggers `graceful_shutdown()`, which runs
-`bin/summarize-session.py` per agent with a 25-second budget, which is why
-`stop_grace_period` is 45 seconds.
+**Shutdown, and the summary that carries context forward.** As it reads each
+agent's stream, `read_agent_response` tees every raw stream-json line to
+`logs/agent-streams/{agent}_<timestamp>.jsonl` — unbuffered, so a separate
+process can tail it while the agent still holds the handle, and fail-safe, so
+a write error can never break a turn. The file rolls per boot, per day, and at
+16 MB; `bin/purge-data.py` drops them after `STREAM_LOG_RETENTION_DAYS`
+(default 7).
+
+`SIGTERM` triggers `graceful_shutdown()`, which runs `bin/summarize-session.py`
+per agent with a 25-second budget — which is why `stop_grace_period` is 45
+seconds. The summarizer reads back the last of those stream files (walking up
+to three, so a mid-session roll does not leave it summarizing the final thirty
+seconds), asks Claude for a summary under three required headings, and writes
+`data/last-session-summary-<agent>.md`. That file is what gets re-injected as
+`[SESSION RESET]` on the next start, if it is under 24 hours old.
+
+The MCP `session` tool's `finalize` action runs the same summarizer on demand,
+resolving which agent it is speaking for from `KARAKOS_AGENT`.
 
 ## Memory
 
@@ -520,6 +535,7 @@ logs/                                  # named volume
 ├── agent-server.log  relay.log  scheduler.log  supervisord.log
 ├── health-alerts.log
 ├── summarizer-audit.jsonl  git-events.jsonl  hook-events.log
+├── agent-streams/<agent>_<ts>.jsonl   # raw stream-json, fed to the summarizer
 └── session-summaries/<agent>-<ts>.md
 
 inbox/<agent>/                         # named volume — builder/reviewer briefs
@@ -533,11 +549,6 @@ Note `data/memory/agent-server.db` — the queue database lives under
 Documented so you don't spend an evening deciding whether it's your install.
 Each is a real defect in the code, not a configuration mistake.
 
-- **Session summaries are not actually produced.** `bin/summarize-session.py`
-  reads `logs/agent-streams/`, and nothing writes to that directory. It exits
-  non-zero every time, so `data/last-session-summary-<agent>.md` is never
-  written and the `[SESSION RESET]` re-injection above never fires in
-  practice. ([#148](https://github.com/mcarmody/karakos-package/issues/148))
 - **Tool-audit retention is a no-op** — `bin/purge-data.py` purges
   `mcp/tool-audit.db`, while the real database is `data/mcp-tools-audit.db`.
   ([#150](https://github.com/mcarmody/karakos-package/issues/150))

@@ -6,6 +6,7 @@ Purges:
 1. Message JSONL files older than MESSAGE_RETENTION_DAYS (default 90)
 2. Tool audit records older than TOOL_AUDIT_RETENTION_DAYS (default 30)
 3. Session summary archives (keeps last 30 per agent)
+4. Agent stream logs older than STREAM_LOG_RETENTION_DAYS (default 7)
 
 Called by scheduler daily at 4:30 AM.
 """
@@ -129,6 +130,41 @@ def purge_old_session_summaries() -> int:
     return deleted
 
 
+# Raw stream-json tee written by bin/agent-server.py (#148). Only the newest
+# few files per agent are ever read — bin/summarize-session.py tails them for
+# the session summary — so these expire by age, and short (a week) because
+# they are verbatim transcript volume, not a record anything reads later.
+AGENT_STREAMS_DIR = WORKSPACE / "logs" / "agent-streams"
+STREAM_LOG_RETENTION_DAYS = int(os.environ.get("STREAM_LOG_RETENTION_DAYS", "7"))
+
+
+def purge_old_stream_logs() -> int:
+    """Delete agent stream logs whose last write is past the retention window.
+
+    By mtime, not by the timestamp in the filename: agent-server keeps a log
+    open across a whole boot, so the name says when it was opened and only
+    mtime says when it stopped being the live one.
+    """
+    if not AGENT_STREAMS_DIR.exists():
+        return 0
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=STREAM_LOG_RETENTION_DAYS)).timestamp()
+    deleted = 0
+
+    for file in AGENT_STREAMS_DIR.glob("*.jsonl"):
+        try:
+            if file.stat().st_mtime < cutoff:
+                file.unlink()
+                deleted += 1
+        except OSError as e:
+            log.warning(f"Failed to delete {file.name}: {e}")
+            continue
+
+    if deleted:
+        log.info(f"Purged {deleted} agent stream logs older than {STREAM_LOG_RETENTION_DAYS} days")
+    return deleted
+
+
 def main():
     log.info("Data purge starting")
 
@@ -137,6 +173,7 @@ def main():
             "messages": purge_old_messages(),
             "tool_audit": purge_tool_audit(),
             "session_summaries": purge_old_session_summaries(),
+            "stream_logs": purge_old_stream_logs(),
         }
 
         log.info(f"Purge complete: {stats}")
