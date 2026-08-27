@@ -188,6 +188,8 @@ All endpoints require the bearer token.
 | `/agents/{name}/interrupt` | POST | Stop an in-flight turn, discard the partial |
 | `/agents/{name}/kill` | POST | Stop and stay down |
 | `/agents/{name}/flush` | POST | Drop that agent's queued messages |
+| `/agents/{name}/queue` | GET | Inspect that agent's pending messages |
+| `/agents/{name}/queue/{id}` | DELETE | Cancel one queued message; refuses one already in flight |
 | `/agents/{name}/register` | POST | Hot-register a newly created agent |
 | `/cost` | POST | Record a cost event |
 | `/cost` | GET | Cost across all agents |
@@ -198,8 +200,12 @@ All endpoints require the bearer token.
 | `/ask/{id}` | GET | Poll its state |
 | `/ask/{id}/answer` | POST | Deliver the clicked answer |
 
-There is **no `/status`, no `/queue/*`, and no `/message/{id}/status`** — if
-you find a client calling one of those, it is calling a 404.
+There is **no `/status` and no `/message/{id}/status`**. `GET /health` carries
+uptime and total queue depth; `GET /agents` carries the per-agent detail. A
+test in `tests/test_agent_server_routes.py` parses every `agentFetch()` call in
+the dashboard and fails if one names a path and method this table does not
+register, so a client calling a 404 is now a red build rather than a card
+rendering zeroes.
 
 ### Cost control
 
@@ -554,10 +560,6 @@ Each is a real defect in the code, not a configuration mistake.
   ([#150](https://github.com/mcarmody/karakos-package/issues/150))
 - **`bin/capture.py --backfill` reads the wrong path**, `data/agent-server.db`
   rather than `data/memory/agent-server.db`. ([#150](https://github.com/mcarmody/karakos-package/issues/150))
-- **Four dashboard API routes call endpoints the agent server does not have**
-  (`/status`, `/interrupt` at the wrong path, `/queue/*`), and
-  `/api/agents/[name]/open-terminal` shells `osascript`, which cannot work in
-  a Linux container. ([#151](https://github.com/mcarmody/karakos-package/issues/151))
 - **There is no context-budget compaction.** The `sessions` table carries
   `input_tokens`, `compaction_count` and `last_compacted`, and the tokens are
   written after every turn, but nothing reads them back or compares them to a
