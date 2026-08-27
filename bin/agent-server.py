@@ -45,6 +45,15 @@ CHANNELS_CONFIG_PATH = WORKSPACE_ROOT / "config" / "channels.json"
 CLAUDE_SETTINGS_PATH = WORKSPACE_ROOT / "config" / "claude-settings.json"
 STREAM_LOG_DIR = WORKSPACE_ROOT / "logs" / "agent-streams"
 DEAD_LETTER_PATH = WORKSPACE_ROOT / "data" / "discord-dead-letter.jsonl"
+
+# Raw stream-json events are teed to logs/agent-streams/{agent}_*.jsonl as
+# they are read (#148). bin/summarize-session.py reads the tail of the newest
+# matching file to build the [SESSION RESET] summary; nothing wrote these
+# files before, so that whole path was dead. A new file is opened per boot,
+# per day, and whenever the current one passes the size cap — which keeps
+# each file small enough to tail cheaply and gives bin/purge-data.py whole
+# files to expire rather than lines to rewrite.
+STREAM_LOG_MAX_BYTES = int(os.environ.get("STREAM_LOG_MAX_BYTES", str(16 * 1024 * 1024)))
 AGENT_SERVER_TOKEN = os.environ.get("AGENT_SERVER_TOKEN", "")
 OWNER_DISCORD_ID = os.environ.get("OWNER_DISCORD_ID", "0")
 
@@ -1659,6 +1668,78 @@ async def write_streaming_response(message_ids: List[str], text: str) -> None:
         log.warning(f"streaming response write failed: {e}")
 
 
+# agent -> {"fh": file object, "day": "YYYY-MM-DD", "bytes": int}. The handle
+# is kept open across turns: this runs once per stream event, and reopening
+# per line would put three syscalls on the hot path instead of one.
+_stream_log_files: Dict[str, Dict] = {}
+
+
+def _open_stream_log(agent: str):
+    """Open a fresh stream log for `agent` and return (handle, day, path).
+
+    The name must match the `{agent}_*.jsonl` glob bin/summarize-session.py
+    globs for. Unbuffered binary append: the summarizer is a *separate*
+    process reading this file, so a buffered write would leave it reading
+    a stale tail.
+    """
+    STREAM_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    now = datetime.now()
+    stamp = now.strftime("%Y%m%d-%H%M%S")
+    # Second-resolution names are what an operator wants to read, but two
+    # rotations can land in the same second — so a colliding name gets a
+    # counter rather than silently reopening the file we just rolled off.
+    path = STREAM_LOG_DIR / f"{agent}_{stamp}.jsonl"
+    n = 1
+    while path.exists():
+        path = STREAM_LOG_DIR / f"{agent}_{stamp}-{n}.jsonl"
+        n += 1
+    return open(path, "ab", buffering=0), now.strftime("%Y-%m-%d"), path
+
+
+def write_stream_log(agent: str, line: bytes) -> None:
+    """Tee one raw stream-json event to the agent's stream log.
+
+    Best-effort by construction: this sits in the readline loop of every
+    turn, and a full disk or a revoked permission must cost the log line,
+    never the agent's reply. Nothing here raises.
+    """
+    if not line:
+        return
+    if not line.endswith(b"\n"):
+        line = line + b"\n"
+
+    # Two attempts: a handle that has gone bad (fd closed, file deleted under
+    # us) is dropped and the same line retried against a fresh one, so one
+    # bad handle costs at most one write rather than the rest of the session.
+    for attempt in (0, 1):
+        try:
+            entry = _stream_log_files.get(agent)
+            today = datetime.now().strftime("%Y-%m-%d")
+            if entry is None or entry["day"] != today or entry["bytes"] >= STREAM_LOG_MAX_BYTES:
+                if entry is not None:
+                    try:
+                        entry["fh"].close()
+                    except Exception:
+                        pass
+                fh, day, path = _open_stream_log(agent)
+                entry = {"fh": fh, "day": day, "bytes": 0}
+                _stream_log_files[agent] = entry
+                log.info(f"{agent} stream log: {path}")
+
+            entry["fh"].write(line)
+            entry["bytes"] += len(line)
+            return
+        except Exception as e:
+            stale = _stream_log_files.pop(agent, None)
+            if stale is not None:
+                try:
+                    stale["fh"].close()
+                except Exception:
+                    pass
+            if attempt:
+                log.debug(f"Could not tee stream log for {agent}: {e}")
+
+
 def extract_permission_denials(result_event: Dict) -> List[Dict]:
     """Pull the `permission_denials` list off a stream-json `result` event.
     Always a list, never None, so callers can iterate unconditionally."""
@@ -1708,6 +1789,9 @@ async def read_agent_response(
             line = await proc.stdout.readline()
             if not line:
                 break
+
+            # Tee before parsing, so a malformed line is still on the record.
+            write_stream_log(agent, line)
 
             try:
                 event = json.loads(line.decode())
