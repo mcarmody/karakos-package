@@ -1,0 +1,165 @@
+---
+layout: landing
+title: Karakos — a standing Claude agent for your household, in one install
+description: Karakos packages session persistence, episodic memory, cost guards and self-modifying builder agents into one Docker-installable system. Point it at Discord and an Anthropic key; get a standing assistant with a web dashboard.
+---
+
+<nav class="nav">
+  <div class="wrap">
+    <a class="brand" href="{{ '/' | relative_url }}">Karakos</a>
+    <span class="spacer"></span>
+    <a class="navlink" href="#features">Features</a>
+    <a class="navlink hide-sm" href="#requirements">Requirements</a>
+    <a class="navlink hide-sm" href="#docs">Docs</a>
+    <a class="navlink" href="https://github.com/mcarmody/karakos-package">GitHub</a>
+  </div>
+</nav>
+
+<header class="hero">
+  <div class="wrap">
+    <span class="eyebrow">Self-hosted · MIT licensed</span>
+    <h1>A standing Claude agent for your household — not a script you rebuild every week.</h1>
+    <p class="lede">
+      Persistent agents need session lifecycle management, memory consolidation, cost guards
+      and orchestration before you get to the part you actually wanted. Karakos ships all of
+      it in <strong>one Docker install</strong>. Point it at a Discord server and an Anthropic
+      key, and you get an assistant that remembers, costs what you tell it to, reaches you
+      where you already are, and can safely extend its own code.
+    </p>
+    <div class="cta-row">
+      <a class="btn btn-primary" href="#install">Install in one command</a>
+      <a class="btn btn-ghost" href="https://github.com/mcarmody/karakos-package">View on GitHub</a>
+    </div>
+    <div class="badges">
+      <a href="https://github.com/mcarmody/karakos-package/actions/workflows/ci.yml"><img src="https://github.com/mcarmody/karakos-package/actions/workflows/ci.yml/badge.svg" alt="CI status"></a>
+      <a href="https://github.com/mcarmody/karakos-package/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="MIT license"></a>
+      <img src="https://img.shields.io/badge/Docker-required-2496ED?logo=docker&logoColor=white" alt="Docker required">
+      <img src="https://img.shields.io/badge/Powered_by-Claude-orange" alt="Powered by Claude">
+    </div>
+  </div>
+</header>
+
+<section class="install" id="install">
+  <div class="wrap">
+    <h2>Install</h2>
+    <p class="sub">The installer handles Docker, Git and jq, clones the repo, runs the setup wizard, pulls the prebuilt image from GHCR and starts the system.</p>
+
+    <div class="tabs" role="tablist">
+      <button class="tab" role="tab" aria-selected="true" data-target="sh">Linux / macOS</button>
+      <button class="tab" role="tab" aria-selected="false" data-target="ps">Windows</button>
+    </div>
+
+<pre class="code" id="pane-sh"><span class="prompt">$ </span><span class="cmd">curl -fsSL https://raw.githubusercontent.com/mcarmody/karakos-package/main/install.sh | bash</span></pre>
+<pre class="code" id="pane-ps" hidden><span class="prompt">PS&gt; </span><span class="cmd">irm https://raw.githubusercontent.com/mcarmody/karakos-package/main/install.ps1 | iex</span></pre>
+
+    <p class="note">When it finishes, open <a href="http://localhost:3000">http://localhost:3000</a>. Windows needs an elevated PowerShell.</p>
+  </div>
+</section>
+
+<section class="section" id="features">
+  <div class="wrap">
+    <h2>What you get</h2>
+    <p class="sub">Six pieces of infrastructure that are individually unremarkable and collectively the reason most hobby agents never make it past a weekend.</p>
+    <div class="grid">
+
+      <div class="card">
+        <div class="icon">💬</div>
+        <h3>Discord-native</h3>
+        <p>Agents answer in the server you already sit in — per-channel, with attachments, slash commands, and typing indicators that tell you a turn is actually running.</p>
+      </div>
+
+      <div class="card">
+        <div class="icon">🖥️</div>
+        <h3>Local dashboard</h3>
+        <p>A web UI at <code>localhost:3000</code> for chat, health, agent status and live monitoring. No cloud tenant, no account, nothing leaves the box but the API calls.</p>
+      </div>
+
+      <div class="card">
+        <div class="icon">🧠</div>
+        <h3>Episodic memory</h3>
+        <p>Conversations are consolidated into durable memories with semantic recall, so the agent knows what you told it last Tuesday without you pasting it again.</p>
+      </div>
+
+      <div class="card">
+        <div class="icon">🔁</div>
+        <h3>Session persistence</h3>
+        <p>Context survives restarts, upgrades and crashes. A container bounce is an interruption, not amnesia — and unexpected respawns are announced, not swallowed.</p>
+      </div>
+
+      <div class="card">
+        <div class="icon">💸</div>
+        <h3>Cost tracking &amp; guards</h3>
+        <p>Per-agent spend tracking with configurable limits. Typical household usage runs $5–15/week, and you set the ceiling rather than discovering it on a statement.</p>
+      </div>
+
+      <div class="card">
+        <div class="icon">🛠️</div>
+        <h3>Self-modifying, safely</h3>
+        <p>Builder and reviewer agents can change the system's own code behind guardrails — protected paths and tiered review — so it extends itself without corrupting its own process.</p>
+      </div>
+
+    </div>
+  </div>
+</section>
+
+<section class="section specs" id="requirements">
+  <div class="wrap">
+    <h2>Requirements</h2>
+    <p class="sub">One always-on machine. A Raspberry Pi 5 is enough; a spare laptop is plenty.</p>
+    <div class="table-scroll">
+      <table class="spec-table">
+        <tr><th>Hardware</th><td>4 GB RAM minimum (8 GB recommended), 2+ CPU cores, 10 GB disk</td></tr>
+        <tr><th>Operating system</th><td>Ubuntu 22.04+, Debian 12+, macOS 12+, Windows 10/11</td></tr>
+        <tr><th>Software</th><td>Docker Engine 24+ with Compose v2</td></tr>
+        <tr><th>Accounts</th><td>An Anthropic API key and a Discord bot token</td></tr>
+        <tr><th>Network</th><td>Stable outbound internet for Anthropic API calls</td></tr>
+        <tr><th>Runtime</th><td>24/7 recommended — the point is that it is standing, not summoned</td></tr>
+        <tr><th>Expected cost</th><td>$5–15/week for typical household usage</td></tr>
+      </table>
+    </div>
+  </div>
+</section>
+
+<section class="section" id="docs">
+  <div class="wrap">
+    <h2>Documentation</h2>
+    <p class="sub">Start with the quickstart; the rest is there when you want to change something.</p>
+    <div class="doclist">
+      <a class="doc" href="https://github.com/mcarmody/karakos-package/blob/main/docs/QUICKSTART.md">
+        <strong>Quickstart</strong><span>Installation and first steps</span></a>
+      <a class="doc" href="https://github.com/mcarmody/karakos-package/blob/main/docs/DISCORD_SETUP.md">
+        <strong>Discord setup</strong><span>Creating and inviting the bot</span></a>
+      <a class="doc" href="https://github.com/mcarmody/karakos-package/blob/main/docs/ARCHITECTURE.md">
+        <strong>Architecture</strong><span>How the pieces fit together</span></a>
+      <a class="doc" href="https://github.com/mcarmody/karakos-package/blob/main/docs/EXTENDING.md">
+        <strong>Extending</strong><span>Adding skills and custom agents</span></a>
+      <a class="doc" href="https://github.com/mcarmody/karakos-package/blob/main/docs/UPGRADING.md">
+        <strong>Upgrading</strong><span>Moving between versions safely</span></a>
+      <a class="doc" href="https://github.com/mcarmody/karakos-package/blob/main/CONTRIBUTING.md">
+        <strong>Contributing</strong><span>Development setup and conventions</span></a>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <span>Karakos — MIT licensed. Built by <a href="https://github.com/mcarmody">mcarmody</a>.</span>
+    <span class="spacer"></span>
+    <a href="https://github.com/mcarmody/karakos-package">GitHub</a>
+    <a href="https://github.com/mcarmody/karakos-package/issues">Issues</a>
+    <a href="https://www.anthropic.com/claude">Powered by Claude</a>
+  </div>
+</footer>
+
+<script>
+(function () {
+  var tabs = document.querySelectorAll('.tab');
+  var panes = { sh: document.getElementById('pane-sh'), ps: document.getElementById('pane-ps') };
+  tabs.forEach(function (t) {
+    t.addEventListener('click', function () {
+      tabs.forEach(function (o) { o.setAttribute('aria-selected', String(o === t)); });
+      Object.keys(panes).forEach(function (k) { panes[k].hidden = (k !== t.dataset.target); });
+    });
+  });
+})();
+</script>
