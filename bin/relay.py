@@ -377,6 +377,12 @@ ATTACHMENTS_DIR = WORKSPACE_ROOT / "data" / "attachments"
 # be refused identically on every refire.
 DEFERRED_MESSAGES_DIR = WORKSPACE_ROOT / "data" / "deferred-messages"
 HEALTH_FILE = WORKSPACE_ROOT / "data" / "health" / "relay.json"
+# Liveness beacons written by bin/agent-server.py's write_agent_beacon(), read
+# here (and separately by bin/wedge-check.py) rather than pushed: relay.py and
+# agent-server.py talk over HTTP, which has no channel for agent-server.py to
+# tell relay.py "a turn just started" without relay.py already asking.
+AGENT_BEACON_DIR = WORKSPACE_ROOT / "data" / "health" / "agents"
+PRESENCE_POLL_INTERVAL = 5
 
 # Attachments the relay will pull down before handing a message to an agent.
 # Discord's own ceiling is 25 MB on an unboosted server, so the default cap
@@ -519,6 +525,7 @@ class DiscordAdapter(discord.Client):
         self.server_ids = set()
         self.reply_gate = ReplyGate()
         self.guest_budget = GuestBudget()
+        self._presence_busy = None
 
     async def setup_hook(self):
         """Initialize HTTP session"""
@@ -529,6 +536,7 @@ class DiscordAdapter(discord.Client):
             "Discord adapter initialized (servers: %s)",
             ", ".join(sorted(self.server_ids)) or "none configured",
         )
+        self.loop.create_task(self.presence_poll_loop())
 
     async def on_ready(self):
         """Bot logged in"""
@@ -1280,6 +1288,62 @@ class DiscordAdapter(discord.Client):
                 "timestamp": datetime.now().isoformat(),
                 "status": "healthy"
             }, f)
+
+    def any_agent_processing(self) -> bool:
+        """True if any agent's liveness beacon currently says PROCESSING.
+
+        Best-effort like the beacon writer itself: a missing or corrupt
+        beacon file just reads as "not processing" rather than raising into
+        the poll loop.
+        """
+        if not AGENT_BEACON_DIR.exists():
+            return False
+        for beacon_file in AGENT_BEACON_DIR.glob("*.json"):
+            try:
+                state = json.loads(beacon_file.read_text()).get("state")
+            except (OSError, ValueError):
+                continue
+            if state == "PROCESSING":
+                return True
+        return False
+
+    async def presence_tick(self):
+        """One presence-poll cycle: check beacons, change presence on transition.
+
+        Split out from presence_poll_loop so a test can drive a single cycle
+        without running the infinite loop underneath it.
+        """
+        try:
+            busy = self.any_agent_processing()
+            if busy != self._presence_busy:
+                if busy:
+                    await self.change_presence(
+                        status=discord.Status.idle,
+                        activity=discord.Activity(
+                            type=discord.ActivityType.watching, name="a turn run"
+                        ),
+                    )
+                else:
+                    await self.change_presence(status=discord.Status.online, activity=None)
+                self._presence_busy = busy
+        except Exception as e:
+            log.debug(f"Presence poll error: {e}")
+
+    async def presence_poll_loop(self):
+        """Reflect any agent's PROCESSING beacon as bot-wide Discord presence.
+
+        The per-message typing indicator only appears in the channel a turn
+        is actively draining into, so a long turn looks identical to a hung
+        bot to anyone not watching that specific channel — the "is it
+        broken?" question #91 exists for. Presence is visible from the
+        member list regardless of channel.
+
+        Presence changes only on a state transition, not every poll, to stay
+        well clear of Discord's rate limit on a turn that runs for minutes.
+        """
+        while True:
+            await self.presence_tick()
+            await asyncio.sleep(PRESENCE_POLL_INTERVAL)
 
     async def close(self):
         """Cleanup on shutdown"""
