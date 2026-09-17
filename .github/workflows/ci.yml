@@ -1,10 +1,19 @@
 name: CI
 
+# push->main trigger removed 2026-09-17 (Mike, #bellboard 11:36 PT: a $5/mo
+# Actions budget, "make sure we are not pushing and running CI constantly
+# but only every day, across all repos" — same fix mcarmody/karakos got
+# 2026-09-16 when its per-push volume drove the account-wide billing halt,
+# config/ci-hold.json). Rolled up to one scheduled run/day; `pull_request`
+# stays as-is (event-driven, the only pre-merge signal a PR gets, and not
+# the volume driver here). `workflow_dispatch` added so a specific commit
+# can still be checked on demand without waiting for the next scheduled run.
 on:
-  push:
-    branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: "0 13 * * *"
 
 jobs:
   # Fast checks — runs in seconds, catches syntax and structure issues
