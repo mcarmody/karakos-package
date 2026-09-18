@@ -1,4 +1,53 @@
-theme: jekyll-theme-cayman
+# GitHub Pages site config for https://mcarmody.github.io/karakos-package/
+#
+# The homepage is index.html (layout: landing) — a real landing page, not the
+# README rendered through a theme. `theme:` is deliberately absent: nothing
+# uses a theme layout any more, and keeping one would only pull in Cayman's
+# CSS for no page.
+
 title: Karakos
-description: A self-contained, installable multi-agent household assistant system powered by Claude.
+description: >-
+  A self-contained, Docker-installable multi-agent household assistant powered
+  by Claude — persistent memory, cost guards, a local dashboard, and builder
+  agents that can safely extend the system itself.
+
+# Absolute URLs. jekyll-seo-tag needs both to emit a correct canonical link,
+# and jekyll-sitemap needs them to emit absolute <loc> entries — a sitemap of
+# relative paths is silently useless to Search Console.
+url: https://mcarmody.github.io
+baseurl: /karakos-package
+
+author: mcarmody
+lang: en_US
 show_downloads: false
+
+plugins:
+  - jekyll-seo-tag   # canonical, OpenGraph, JSON-LD
+  - jekyll-sitemap   # /sitemap.xml + /robots.txt — the one real gap found
+                     # in the 2026-08-27 indexing investigation (task b11495d3)
+
+# Repo scaffolding is not site content. Without this, Jekyll would try to
+# render CLAUDE.md, CONTRIBUTING.md and every docs/*.md as bare pages with no
+# layout, and they would land in sitemap.xml as thin duplicate content.
+exclude:
+  - agents/
+  - bin/
+  - config/
+  - dashboard/
+  - docs/
+  - installer/
+  - mcp/
+  - skills/
+  - system/
+  - tests/
+  - CLAUDE.md
+  - CONTRIBUTING.md
+  - README.md
+  - Dockerfile
+  - Makefile
+  - install.ps1
+  - install.sh
+  - setup.sh
+  - pytest.ini
+  - requirements.txt
+  - vendor/
