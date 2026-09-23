@@ -14,9 +14,12 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-43 commits since `v1.4.1` (2026-08-04). The GHCR image the installer pulls is
-built only on tag push, so none of the following has reached anyone who
-installed via the one-liner. See `docs/production-grade-plan.md` §0.
+## [1.5.0] — 2026-09-23
+
+45 commits since `v1.4.1` (2026-08-04). The first release since the GHCR image
+went stale: everything below reaches one-liner installs with this tag. Image:
+`ghcr.io/mcarmody/karakos:v1.5` (also `:v1` and `:latest`); pin with
+`KARAKOS_VERSION=v1.5`.
 
 ### Added
 
@@ -43,8 +46,8 @@ installed via the one-liner. See `docs/production-grade-plan.md` §0.
 - Dashboard: theming, live turns, conversation metrics, PWA support
 - `LICENSE`, `CONTRIBUTING.md` and a PR template for public sharing
 - Jekyll config for the GitHub Pages landing site
-- Public landing page, sitemap and SEO config (this release)
-- `docs/production-grade-plan.md` and this changelog (this release)
+- Public landing page, sitemap and SEO config (#163)
+- `docs/production-grade-plan.md` and this changelog (#163)
 
 ### Fixed
 
@@ -71,6 +74,9 @@ installed via the one-liner. See `docs/production-grade-plan.md` §0.
 - Docs distinguish Karakos skills from Claude Code Agent Skills; root
   `CLAUDE.md` added (#118)
 - `ARCHITECTURE.md`: fixed gaps retired, two new ones recorded (#162)
+- CI runs once a day, on pull requests and on manual dispatch, instead of on
+  every push to `main`
+- README: a value-proposition paragraph above the fold (#138)
 
 ## [1.4.1] — 2026-08-04
 
@@ -122,7 +128,8 @@ Initial release: an installable multi-agent household system — Discord
 integration, local dashboard, episodic memory, session persistence, cost
 tracking, and builder/reviewer agents behind guardrails.
 
-[Unreleased]: https://github.com/mcarmody/karakos-package/compare/v1.4.1...HEAD
+[Unreleased]: https://github.com/mcarmody/karakos-package/compare/v1.5.0...HEAD
+[1.5.0]: https://github.com/mcarmody/karakos-package/compare/v1.4.1...v1.5.0
 [1.4.1]: https://github.com/mcarmody/karakos-package/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/mcarmody/karakos-package/compare/v1.3...v1.4.0
 [1.3]: https://github.com/mcarmody/karakos-package/compare/v1.2...v1.3
