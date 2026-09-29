@@ -465,3 +465,64 @@ def test_unknown_memory_action_still_errors(server, monkeypatch):
     mod, _ = server
     result = mod.handle_core_tool("memory", {"action": "nonsense"})
     assert "error" in result
+
+
+# --- remember (issue: no live write path into `facts`) --------------------
+
+
+def test_remember_writes_a_fact_that_facts_action_then_returns(server):
+    mod, conn = server
+
+    result = mod.handle_core_tool("memory", {
+        "action": "remember",
+        "subject": "OwnerName",
+        "content": "Prefers dark mode everywhere",
+        "domain": "preferences",
+        "confidence": 0.9,
+    })
+
+    assert result["status"] == "ok"
+    assert result["subject"] == "OwnerName"
+
+    facts = mod.handle_core_tool("memory", {"action": "facts", "query": "dark mode"})
+    assert len(facts["facts"]) == 1
+    assert facts["facts"][0]["subject"] == "OwnerName"
+    assert facts["facts"][0]["content"] == "Prefers dark mode everywhere"
+    assert facts["facts"][0]["domain"] == "preferences"
+
+
+def test_remember_rejects_empty_content(server):
+    mod, _ = server
+    result = mod.handle_core_tool("memory", {
+        "action": "remember", "subject": "X", "content": "   ",
+    })
+    assert "error" in result
+
+
+def test_remember_rejects_empty_subject(server):
+    mod, _ = server
+    result = mod.handle_core_tool("memory", {
+        "action": "remember", "subject": "", "content": "something",
+    })
+    assert "error" in result
+
+
+def test_remember_defaults_confidence_and_domain(server):
+    mod, _ = server
+    result = mod.handle_core_tool("memory", {
+        "action": "remember", "subject": "X", "content": "something true",
+    })
+    assert result["confidence"] == 0.8
+    assert result["domain"] == "general"
+
+
+def test_remember_is_atomic_one_fact_per_call(server):
+    """A single remember call inserts exactly one row, even if content is
+    long or multi-sentence — no implicit splitting into multiple facts."""
+    mod, conn = server
+    mod.handle_core_tool("memory", {
+        "action": "remember", "subject": "X",
+        "content": "First sentence. Second sentence. Third.",
+    })
+    count = conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
+    assert count == 1

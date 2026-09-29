@@ -116,10 +116,12 @@ def memory_db(tmp_workspace):
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             summary TEXT NOT NULL,
             importance REAL DEFAULT 5.0,
+            base_importance REAL,
             channel TEXT,
             tags TEXT,
             agents TEXT,
             created_at TIMESTAMP,
+            inserted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             consolidated_at TIMESTAMP DEFAULT NULL,
             embedding BLOB
         );

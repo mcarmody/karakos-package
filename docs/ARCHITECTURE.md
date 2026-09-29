@@ -450,14 +450,17 @@ resolving which agent it is speaking for from `KARAKOS_AGENT`.
 
 | Table | Columns of note |
 |---|---|
-| `episodes` | `summary`, `importance` (default 5.0), `channel`, `tags`, `agents`, `embedding` |
+| `episodes` | `summary`, `importance` (default 5.0), `base_importance`, `channel`, `tags`, `agents`, `created_at`, `inserted_at`, `embedding` |
 | `facts` | `subject`, `content`, `confidence` (0.8), `domain` |
 | `patterns` | `agent`, `pattern_type`, `content`, `confidence`, `reinforcement_count` |
 
-The daily pass reads yesterday's message JSONL, scores importance with a Haiku
-call, writes episodes, decays importance by `MEMORY_DECAY_RATE` (0.25), drops
-anything below `MEMORY_CUTOFF` (6.0), and keeps at most
-`MEMORY_MAX_EPISODES` (15) per day.
+The daily pass reads yesterday's message JSONL, scores importance with a
+(retried) Haiku call, writes episodes, decays importance from
+`base_importance` idempotently by `MEMORY_DECAY_RATE` (0.25), and drops
+anything below `MEMORY_CUTOFF` (6.0) that is also older than
+`MEMORY_PRUNE_GRACE_DAYS` (default 7, from `inserted_at` — the DB-write
+time, not the `created_at` message timestamp recall ranking still uses).
+Maintenance also keeps at most `MEMORY_MAX_EPISODES` (15) per day.
 
 Embeddings are generated with **`BAAI/bge-small-en-v1.5` via `fastembed`**, 50
 episodes a batch, stored as float32 blobs. The model is hardcoded, not
@@ -482,6 +485,11 @@ The model is loaded lazily and cached for the life of the tool-server process:
 roughly 6 seconds and 230 MB on a Pi 4, paid once per session. The database is
 queried before the model, so an install with nothing embedded never loads it
 at all.
+
+**Writing memory:** `memory.remember` is the only live write path into
+`facts` (episodes are written solely by the nightly pass above). It inserts
+one row — `{subject, content, confidence?, domain?}` — and rejects empty
+`subject`/`content`.
 
 Separately, `system/hooks/inject-recall.py` runs on `UserPromptSubmit` and
 injects a block from `KARAKOS_RECALL_SOURCE` (default `config/recall-source`,
