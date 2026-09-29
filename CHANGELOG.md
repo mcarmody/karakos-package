@@ -14,6 +14,10 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `agent-server.py`: load stored facts from `memory.db` (and candidate facts from `data/memory-candidates/`) and routing-table `MEMORY.md` into `--append-system-prompt` at startup and session resume, closing the durable memory retrieval loop.
+
 ### Fixed
 
 - Memory maintenance: episodes created in the nightly pass were pruned in
