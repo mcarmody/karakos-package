@@ -14,6 +14,11 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `agent-server.py`: load stored facts from `memory.db` (and candidate facts from `data/memory-candidates/`) and routing-table `MEMORY.md` into `--append-system-prompt` at startup and session resume, closing the durable memory retrieval loop.
+
+
 ## [1.5.0] — 2026-09-23
 
 45 commits since `v1.4.1` (2026-08-04). The first release since the GHCR image
