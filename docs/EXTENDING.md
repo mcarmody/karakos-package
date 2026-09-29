@@ -340,9 +340,11 @@ want to edit:
 
 | Variable | Description |
 |---|---|
-| `MEMORY_DECAY_RATE` | Episode importance decay per pass (0–1) |
-| `MEMORY_CUTOFF` | Importance below which an episode is dropped |
+| `MEMORY_DECAY_RATE` | Episode importance decay per pass (0–1), applied from `base_importance` |
+| `MEMORY_CUTOFF` | Importance below which an episode is eligible to be dropped |
+| `MEMORY_PRUNE_GRACE_DAYS` | Days an episode is protected from pruning regardless of score, measured from `inserted_at`; default 7 |
 | `MEMORY_MAX_EPISODES` | Episodes kept per day |
+| `MEMORY_SCORE_TIMEOUT` / `MEMORY_SCORE_RETRY_TIMEOUT` | Haiku scoring call timeout, first attempt and retry; default 20s / 60s |
 | `MESSAGE_RETENTION_DAYS` | JSONL log retention |
 | `TOOL_AUDIT_RETENTION_DAYS` | Tool-call audit retention |
 | `KARAKOS_RECALL_SOURCE` / `KARAKOS_RECALL_TIMEOUT_S` | Recall injection, below |

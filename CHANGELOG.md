@@ -14,6 +14,17 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Memory maintenance: episodes created in the nightly pass were pruned in
+  the same run before a grace period could apply, a scoring failure
+  defaulted to a below-cutoff score, and decay compounded across nightly
+  runs instead of applying idempotently. Added `MEMORY_PRUNE_GRACE_DAYS`
+  (default 7), a scoring retry, and a `base_importance` column that decay
+  is now computed from.
+- `memory` MCP tool: added a `remember` action, the first live write path
+  into the `facts` table.
+
 ## [1.5.0] — 2026-09-23
 
 45 commits since `v1.4.1` (2026-08-04). The first release since the GHCR image
