@@ -502,6 +502,91 @@ def load_server_ids(config: Dict) -> set:
     return ids
 
 # =============================================================================
+# Bot presence (busy/idle)
+# =============================================================================
+
+PRESENCE_POLL_SECONDS = float(os.environ.get("PRESENCE_POLL_SECONDS", "5"))
+# Discord rate-limits presence updates (about 5 per 20s per session). A turn
+# that flaps busy/idle faster than this is collapsed rather than mirrored.
+PRESENCE_MIN_INTERVAL = float(os.environ.get("PRESENCE_MIN_INTERVAL", "15"))
+# A turn that ends must stay ended this long before presence goes idle, so
+# back-to-back queued turns do not flicker.
+PRESENCE_IDLE_HOLD = float(os.environ.get("PRESENCE_IDLE_HOLD", "10"))
+PRESENCE_ENABLED = os.environ.get("PRESENCE_ENABLED", "true").lower() not in ("0", "false", "no")
+
+BUSY_STATES = {"PROCESSING"}
+
+
+def aiohttp_timeout(seconds):
+    import aiohttp
+    return aiohttp.ClientTimeout(total=seconds)
+
+
+def agents_busy(health: dict) -> bool:
+    """True when any agent in an agent-server /health payload is mid-turn."""
+    agents = (health or {}).get("agents") or {}
+    return any(
+        (info or {}).get("state") in BUSY_STATES for info in agents.values()
+    )
+
+
+class PresenceTracker:
+    """Decide when the bot's Discord presence should change.
+
+    Pure state machine (clock injected) so the debounce is testable. Feed it
+    observations with observe(); it returns the target ("busy"/"idle") when a
+    presence update should be sent now, else None.
+
+    - Busy applies as soon as the rate limit allows.
+    - Idle applies only after the agent has been continuously idle for
+      idle_hold seconds.
+    - No update is sent within min_interval of the previous one.
+    - reset() forgets what Discord holds (reconnect/session loss), so the
+      current state is re-sent on the next observation.
+    """
+
+    def __init__(self, min_interval=PRESENCE_MIN_INTERVAL,
+                 idle_hold=PRESENCE_IDLE_HOLD, clock=time.monotonic):
+        self.min_interval = min_interval
+        self.idle_hold = idle_hold
+        self.clock = clock
+        self.applied = None        # what Discord currently shows
+        self.last_sent = None      # monotonic time of last update
+        self.idle_since = None
+
+    def reset(self):
+        self.applied = None
+        self.last_sent = None  # a fresh session has no rate-limit history
+
+    def observe(self, busy: bool):
+        now = self.clock()
+        if busy:
+            self.idle_since = None
+            target = "busy"
+        else:
+            if self.idle_since is None:
+                self.idle_since = now
+            if self.applied is not None and now - self.idle_since < self.idle_hold:
+                return None
+            target = "idle"
+        if target == self.applied:
+            return None
+        if self.last_sent is not None and now - self.last_sent < self.min_interval:
+            return None
+        self.applied = target
+        self.last_sent = now
+        return target
+
+
+def presence_for(target: str):
+    """(discord.Status, discord.Activity|None) for a tracker target."""
+    if target == "busy":
+        return discord.Status.dnd, discord.Activity(
+            type=discord.ActivityType.playing, name="working on a turn")
+    return discord.Status.online, None
+
+
+# =============================================================================
 # Discord Adapter
 # =============================================================================
 
@@ -519,6 +604,8 @@ class DiscordAdapter(discord.Client):
         self.server_ids = set()
         self.reply_gate = ReplyGate()
         self.guest_budget = GuestBudget()
+        self.presence = PresenceTracker()
+        self._presence_task = None
 
     async def setup_hook(self):
         """Initialize HTTP session"""
@@ -534,6 +621,58 @@ class DiscordAdapter(discord.Client):
         """Bot logged in"""
         log.info(f"Discord bot ready as {self.user.name} (ID: {self.user.id})")
         await self.write_health_heartbeat()
+        self.start_presence_loop()
+
+    async def on_resumed(self):
+        """Gateway session resumed — presence may not have survived."""
+        self.presence.reset()
+
+    async def on_connect(self):
+        """New gateway connection — Discord holds no presence for it yet."""
+        self.presence.reset()
+
+    def start_presence_loop(self):
+        if not PRESENCE_ENABLED:
+            return
+        if self._presence_task is None or self._presence_task.done():
+            self._presence_task = asyncio.create_task(self.presence_loop())
+
+    async def fetch_agents_busy(self) -> Optional[bool]:
+        """Ask the agent server whether any turn is in flight; None if unknown."""
+        try:
+            async with self.http_session.get(
+                f"{AGENT_SERVER_URL}/health",
+                headers={"Authorization": f"Bearer {AGENT_SERVER_TOKEN}"},
+                timeout=aiohttp_timeout(5),
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                return agents_busy(await resp.json())
+        except Exception:
+            return None
+
+    async def presence_tick(self):
+        """One poll: update presence if the tracker says it is due."""
+        busy = await self.fetch_agents_busy()
+        if busy is None:
+            return  # agent server unreachable: keep what is shown
+        target = self.presence.observe(busy)
+        if target is None or self.is_closed():
+            return
+        status, activity = presence_for(target)
+        try:
+            await self.change_presence(status=status, activity=activity)
+        except Exception as e:
+            log.warning("change_presence failed: %s", e)
+            self.presence.reset()  # retry on the next tick
+
+    async def presence_loop(self):
+        while not self.is_closed():
+            try:
+                await self.presence_tick()
+            except Exception as e:
+                log.warning("presence tick error: %s", e)
+            await asyncio.sleep(PRESENCE_POLL_SECONDS)
 
     async def on_message(self, message: discord.Message):
         """Route Discord message to agent"""
@@ -1283,6 +1422,8 @@ class DiscordAdapter(discord.Client):
 
     async def close(self):
         """Cleanup on shutdown"""
+        if self._presence_task:
+            self._presence_task.cancel()
         if self.http_session:
             await self.http_session.close()
         await super().close()
