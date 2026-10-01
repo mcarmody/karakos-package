@@ -8,6 +8,7 @@ line — came back as one oversize chunk and never arrived.
 
 import ast
 import re
+import sys
 from pathlib import Path
 
 import pytest
@@ -27,7 +28,10 @@ def load_splitter(script: str):
     start = src.index("def split_discord_message")
     match = re.search(r"\n(?=(async def |def |# ={10,}))", src[start:])
     body = src[start : start + match.start()]
-    ns = {"List": list, "MAX_DISCORD_MSG_LEN": MAX}
+    sys.path.insert(0, str(PACKAGE_ROOT / "lib"))
+    import tengwar
+
+    ns = {"List": list, "MAX_DISCORD_MSG_LEN": MAX, "tengwar": tengwar}
     exec(body, ns)
     return ns["split_discord_message"]
 
@@ -94,3 +98,20 @@ def test_post_to_discord_reports_a_failed_chunk():
     assert "failed += 1" in body
     assert "message is incomplete" in body
     assert "return None" in body.split("if failed:")[1]
+
+
+@pytest.mark.parametrize("script", SCRIPTS)
+def test_long_code_block_is_split_with_balanced_fences(script):
+    body = "```python\n" + "\n".join(f"line_{i} = {i}" for i in range(400)) + "\n```"
+    chunks = load_splitter(script)("intro\n\n" + body)
+    assert len(chunks) > 1
+    for c in chunks:
+        assert len(c) <= MAX
+        assert c.count("```") % 2 == 0, "dangling fence"
+    assert chunks[1].startswith("```python"), "language tag not carried over"
+
+
+def test_post_to_discord_renders_tables_before_splitting():
+    src = (PACKAGE_ROOT / "bin" / "agent-server.py").read_text()
+    body = src[src.index("async def post_to_discord") : src.index("async def post_discord_payload")]
+    assert body.index("tengwar.render_for_discord") < body.index("split_discord_message(content)")

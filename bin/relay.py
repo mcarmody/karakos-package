@@ -27,7 +27,10 @@ from logging.handlers import RotatingFileHandler
 # bin/ is a directory of scripts, not a package — see the same note in
 # bin/agent-server.py.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+# lib/ holds modules shared by more than one script; it sits beside bin/.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import ask_handler  # noqa: E402
+import tengwar  # noqa: E402
 
 # =============================================================================
 # Utilities
@@ -36,34 +39,26 @@ import ask_handler  # noqa: E402
 def split_discord_message(text: str, max_length: int = 2000) -> List[str]:
     """Split text into chunks Discord will accept (max 2000 chars each).
 
-    Splits on the largest boundary that fits — paragraph, then line, then a
-    hard cut mid-line. The hard cut is the part that matters: a reply with no
-    blank line and no newline in it has no boundary to split on, and the
-    previous implementation returned it as a single oversize chunk. Discord
-    rejects anything over 2000 with a 400 and the message is lost.
+    Delegates to tengwar.split_for_discord, which cuts on line/space
+    boundaries (hard cut when there are none), defers a whole fenced block to
+    the next chunk when it fits, and closes/reopens ``` fences across every
+    cut so no chunk carries a dangling fence. Discord rejects anything over
+    2000 with a 400 and the message is lost, so the result is size-checked.
     """
     if len(text) <= max_length:
         return [text] if text else []
 
-    chunks: List[str] = []
-    remaining = text
-
-    while len(remaining) > max_length:
-        window = remaining[:max_length]
-        cut = window.rfind("\n\n")
-        if cut <= 0:
-            cut = window.rfind("\n")
-        if cut <= 0:
-            # A solid wall of text. Cut it at the limit rather than handing
-            # Discord something it will refuse.
-            cut = max_length
-        chunks.append(remaining[:cut].rstrip())
-        remaining = remaining[cut:].lstrip("\n")
-
-    if remaining:
-        chunks.append(remaining)
-
-    return chunks if chunks else [text]
+    # Headroom for the "\n```" balance_fences appends and the "```lang\n"
+    # it prepends to the next chunk.
+    chunks = tengwar.split_for_discord(text, max_len=max_length - 100)
+    safe: List[str] = []
+    for chunk in chunks:
+        while len(chunk) > max_length:  # pathological fence info string
+            safe.append(chunk[:max_length])
+            chunk = chunk[max_length:]
+        if chunk:
+            safe.append(chunk)
+    return safe if safe else [text]
 
 
 # =============================================================================
