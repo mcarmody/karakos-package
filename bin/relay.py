@@ -164,6 +164,28 @@ def safe_attachment_name(filename: str, index: int) -> str:
     return f"{index}-{cleaned}"
 
 
+REPLY_CONTEXT_MAX_CHARS = 1000
+
+
+def format_reply_context(target, max_chars: int = REPLY_CONTEXT_MAX_CHARS) -> str:
+    """Render the replied-to message as a delimited block for the agent.
+
+    `target` is a discord message-like object, or None when the reference
+    could not be resolved (deleted, or not fetchable).
+    """
+    author = getattr(target, "author", None) if target is not None else None
+    if target is None or author is None:
+        return "[In reply to a message that is no longer available]"
+    name = getattr(author, "display_name", None) or getattr(author, "name", None) or "unknown"
+    text = (getattr(target, "content", None) or "").strip()
+    if not text:
+        atts = getattr(target, "attachments", None) or []
+        text = ("[attachments: " + ", ".join(a.filename for a in atts) + "]") if atts else "[no text content]"
+    if len(text) > max_chars:
+        text = text[:max_chars].rstrip() + "… [truncated]"
+    return f"[In reply to {name}:\n{text}\n]"
+
+
 def parse_sys_command(content: str):
     """Return (command, args) if `content` is a system command, else None.
 
@@ -1204,6 +1226,29 @@ class DiscordAdapter(discord.Client):
 
         return described
 
+    async def resolve_reply_context(self, message: discord.Message) -> Optional[str]:
+        """Return a delimited block quoting the message this one replies to.
+
+        Uses `reference.resolved` when Discord supplied it, otherwise fetches
+        the referenced message. A deleted or unfetchable target yields a short
+        placeholder rather than an exception, since the reply itself must
+        still reach the agent. Returns None when the message is not a reply.
+        """
+        ref = getattr(message, "reference", None)
+        if ref is None:
+            return None
+        target = getattr(ref, "resolved", None)
+        if target is None or getattr(target, "author", None) is None:
+            # Missing, or a DeletedReferencedMessage stub (no author).
+            target = None
+            ref_id = getattr(ref, "message_id", None)
+            if ref_id:
+                try:
+                    target = await message.channel.fetch_message(ref_id)
+                except Exception as e:
+                    log.info("Could not fetch replied-to message %s: %s", ref_id, e)
+        return format_reply_context(target)
+
     async def send_to_agent_server(self, message: discord.Message, agent: str):
         """Send message to agent server"""
         channel_name = self.get_channel_name(str(message.channel.id))
@@ -1211,6 +1256,15 @@ class DiscordAdapter(discord.Client):
             channel_name = "unknown"
 
         attachments = await self.download_attachments(message)
+
+        content = message.content
+        try:
+            reply_block = await self.resolve_reply_context(message)
+        except Exception as e:
+            log.error(f"Reply context lookup failed: {e}")
+            reply_block = None
+        if reply_block:
+            content = f"{reply_block}\n{content}" if content else reply_block
 
         payload = {
             "agent": agent,
@@ -1220,7 +1274,7 @@ class DiscordAdapter(discord.Client):
             "author": message.author.display_name,
             "author_id": str(message.author.id),
             "is_bot": message.author.bot,
-            "content": message.content,
+            "content": content,
             "message_id": str(message.id),
             "mentions_agent": any(m.id in discord_id_to_agent for m in message.mentions),
             "attachments": attachments,
