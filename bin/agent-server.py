@@ -244,7 +244,8 @@ async def init_db():
             discord_response_id TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             processing_started_at TIMESTAMP,
-            processed_at TIMESTAMP
+            processed_at TIMESTAMP,
+            not_before INTEGER
         )
     """)
 
@@ -307,6 +308,9 @@ async def init_db():
     # IF NOT EXISTS is a no-op against an existing table, so a new column in
     # the definition above reaches upgraded installs only through here.
     await ensure_column("message_queue", "attachments", "TEXT")
+    # Epoch seconds before which a QUEUED row must not be dispatched: a turn
+    # that hit the usage wall is held here rather than consumed.
+    await ensure_column("message_queue", "not_before", "INTEGER")
     # Conversation metrics: which session (== one context window; a cleared
     # or respawned session is a new conversation) a cost row belongs to, so
     # spend/tokens can be rolled up per conversation rather than only per
@@ -1865,6 +1869,7 @@ async def read_agent_response(
     final_text = ""
     metadata = {}
     last_posted_chunk = ""
+    rejected_rl_info = None  # last rate_limit_event with status=rejected this turn
 
     # turn_events sequence number for this turn, and burst-collapse state
     # for content-less thinking blocks. Some builds strip thinking TEXT from
@@ -1915,6 +1920,9 @@ async def read_agent_response(
             # must never cost the agent's actual reply, which is still
             # arriving on this same loop.
             if event_type == "rate_limit_event":
+                _rl = event.get("rate_limit_info")
+                if isinstance(_rl, dict) and _rl.get("status") == "rejected":
+                    rejected_rl_info = _rl
                 try:
                     await record_rate_limit_event(agent, event.get("rate_limit_info"))
                 except Exception as e:
@@ -1998,6 +2006,7 @@ async def read_agent_response(
                     "total_cost_usd": event.get("total_cost_usd", 0.0),
                     "duration_ms": event.get("duration_ms", 0),
                     "is_error": event.get("is_error", False),
+                    "rate_limit_rejected": rejected_rl_info,
                 }
                 # If the assistant stream produced nothing, fall back to
                 # the result's flat `result` string (success) or `error`.
@@ -2037,6 +2046,147 @@ async def read_agent_response(
     write_agent_beacon(agent, "IDLE", force=True)
     return final_text, metadata
 
+
+# =============================================================================
+# Usage-limit wall: hold the batch, don't consume it
+# =============================================================================
+
+# When a turn hits the Claude usage wall the `result` event's error text used
+# to become the reply: it was posted to the channel and the batch marked
+# COMPLETE, so the human's message was consumed and nothing replayed it once
+# the window reset. Now the batch goes back to STATUS_QUEUED with a
+# `not_before` time, one short notice is posted, and a wake timer replays it.
+# Ported from the household's usage-wall hold (59caa0c2b, 2bcc9c110,
+# 39953b5c9, f6b5baaaf) and rate-limit breaker (2548524f9), minus the
+# tmux/PTY pane mechanics.
+
+WALL_USAGE = "usage"
+WALL_MODEL = "model"
+
+# Context overflow is a different failure with a different cure (compaction /
+# reset); never treat it as a wall even if the text mentions "limit".
+CONTEXT_OVERFLOW_RE = re.compile(
+    r"prompt is too long|context (window|length|limit)|maximum context|too many tokens",
+    re.IGNORECASE)
+USAGE_WALL_RE = re.compile(
+    r"hit your (\w+ )?limit|(session|weekly|usage|opus|sonnet) limit"
+    r"|usage limit reached|limit reached\b.*\bresets?|5-hour limit",
+    re.IGNORECASE)
+MODEL_WALL_RE = re.compile(
+    r"issue with the selected model|model .{0,40}(may not exist|not available|unavailable)"
+    r"|do(es)? not have access to .{0,20}model|model_not_found",
+    re.IGNORECASE)
+
+WALL_BACKOFF_BASE_SECONDS = 300
+WALL_BACKOFF_MAX_SECONDS = 3600
+WALL_MIN_HOLD_SECONDS = 60
+WALL_RESET_MARGIN_SECONDS = 30
+
+agent_wall_strikes: Dict[str, int] = {}
+agent_hold_tasks: Dict[str, Any] = {}
+agent_hold_notice_until: Dict[str, int] = {}
+
+
+def classify_wall(text, is_error=False, rate_limit_rejected=None):
+    """Return WALL_USAGE / WALL_MODEL / None for a finished turn.
+
+    Only an errored turn can be a wall: a successful reply that merely
+    mentions "session limit" must not be held. A `rejected` rate_limit_event
+    on an errored turn counts as a usage wall even if the wording is new.
+    """
+    if not is_error:
+        return None
+    text = text or ""
+    if CONTEXT_OVERFLOW_RE.search(text):
+        return None
+    if MODEL_WALL_RE.search(text):
+        return WALL_MODEL
+    if USAGE_WALL_RE.search(text):
+        return WALL_USAGE
+    if isinstance(rate_limit_rejected, dict):
+        return WALL_USAGE
+    return None
+
+
+def wall_not_before(kind, text, rate_limit_rejected, strikes, now=None):
+    """Epoch second before which the held batch must not be replayed.
+
+    Prefers the CLI's own `resetsAt`, then an epoch in the error text
+    ("usage limit reached|1760000000"). A reset that is missing or already
+    past (it would hot-loop against the wall) falls back to exponential
+    backoff keyed on consecutive strikes.
+    """
+    now = int(time.time() if now is None else now)
+    reset = None
+    if kind == WALL_USAGE:
+        if isinstance(rate_limit_rejected, dict):
+            r = rate_limit_rejected.get("resetsAt")
+            if isinstance(r, (int, float)):
+                reset = int(r)
+        if reset is None:
+            m = re.search(r"\|(\d{10})\b", text or "")
+            if m:
+                reset = int(m.group(1))
+    if reset is not None and reset > now:
+        return reset + WALL_RESET_MARGIN_SECONDS
+    delay = min(WALL_BACKOFF_BASE_SECONDS * (2 ** max(strikes, 0)), WALL_BACKOFF_MAX_SECONDS)
+    return now + max(delay, WALL_MIN_HOLD_SECONDS)
+
+
+def format_wall_notice(kind, until):
+    when = datetime.fromtimestamp(until, tz=timezone.utc).strftime("%H:%M UTC")
+    what = "model unavailable" if kind == WALL_MODEL else "usage limit reached"
+    return f"⏸️ {what} — your message is held and will be processed after {when}."
+
+
+async def agent_hold_until(agent: str, now=None):
+    """Latest future `not_before` among the agent's queued rows, or None."""
+    now = int(time.time() if now is None else now)
+    async with db.execute(
+        "SELECT MAX(not_before) AS nb FROM message_queue"
+        " WHERE agent = ? AND processed = ? AND not_before > ?",
+        (agent, STATUS_QUEUED, now),
+    ) as cursor:
+        row = await cursor.fetchone()
+    return row["nb"] if row and row["nb"] else None
+
+
+def schedule_hold_wake(agent: str, until: int) -> None:
+    """Arm (or re-arm) the single timer that replays a held agent's queue."""
+    existing = agent_hold_tasks.get(agent)
+    if existing and not existing.done():
+        if getattr(existing, "hold_until", None) == until:
+            return
+        existing.cancel()
+
+    async def wake():
+        await asyncio.sleep(max(until - time.time(), 0) + 1)
+        agent_hold_tasks.pop(agent, None)
+        agent_hold_notice_until.pop(agent, None)
+        await process_agent_queue(agent)
+
+    task = asyncio.create_task(wake())
+    task.hold_until = until
+    agent_hold_tasks[agent] = task
+
+
+async def hold_batch(agent, channel_id, message_ids, kind, until):
+    """Put a batch back on the queue until `until`; notice at most once."""
+    await db.execute(
+        f"""
+        UPDATE message_queue
+        SET processed = ?, not_before = ?, processing_started_at = NULL
+        WHERE message_id IN ({','.join('?' * len(message_ids))})
+        """,
+        (STATUS_QUEUED, until, *message_ids),
+    )
+    await db.commit()
+    log.warning(f"{agent} hit a {kind} wall; holding {len(message_ids)} message(s) until {until}")
+    if channel_id != "0" and agent_hold_notice_until.get(agent) != until:
+        agent_hold_notice_until[agent] = until
+        await post_to_discord(agent, channel_id, format_wall_notice(kind, until))
+    schedule_hold_wake(agent, until)
+
 async def process_agent_queue(agent: str):
     """Process pending messages for agent"""
     lock = agent_locks.get(agent)
@@ -2045,6 +2195,14 @@ async def process_agent_queue(agent: str):
 
     async with lock:
         if agent_states.get(agent) != "IDLE":
+            return
+
+        # Held behind a usage wall: do not dispatch (it would hit the wall
+        # again). New arrivals wait with the held batch; the wake timer
+        # replays all of it after the reset.
+        held_until = await agent_hold_until(agent)
+        if held_until:
+            schedule_hold_wake(agent, held_until)
             return
 
         # Get pending messages
@@ -2148,6 +2306,18 @@ async def process_agent_queue(agent: str):
         if metadata:
             await post_cost_update(agent, metadata)
             await update_session_tokens(agent, metadata.get("input_tokens", 0))
+
+        # Usage / model wall: hold the batch instead of consuming it.
+        wall = classify_wall(response_text, metadata.get("is_error", False),
+                             metadata.get("rate_limit_rejected")) if metadata else None
+        if wall:
+            until = wall_not_before(wall, response_text,
+                                    metadata.get("rate_limit_rejected"),
+                                    agent_wall_strikes.get(agent, 0))
+            agent_wall_strikes[agent] = agent_wall_strikes.get(agent, 0) + 1
+            await hold_batch(agent, channel_id, message_ids, wall, until)
+            return
+        agent_wall_strikes.pop(agent, None)
 
         # Post response to Discord
         discord_msg_id = None
@@ -3102,6 +3272,12 @@ async def startup(app):
     # Start agent subprocesses
     for agent in agent_config:
         await start_agent_subprocess(agent)
+
+    # Re-arm replay timers for batches held behind a usage wall before restart.
+    for agent in agent_config:
+        held_until = await agent_hold_until(agent)
+        if held_until:
+            schedule_hold_wake(agent, held_until)
 
     # Register signal handlers in event loop context
     loop = asyncio.get_running_loop()
