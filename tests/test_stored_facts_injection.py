@@ -9,31 +9,48 @@ Verifies:
 5. start_agent_subprocess injects stored facts into --append-system-prompt.
 """
 
+import importlib.util
+import os
 import sqlite3
+import sys
 import pytest
 from pathlib import Path
 
+AGENT_SERVER = Path(__file__).parent.parent / "bin" / "agent-server.py"
 
-def test_load_stored_facts_empty(monkeypatch, tmp_path):
-    import importlib.util
-    spec = importlib.util.spec_from_file_location("agent_server", "bin/agent-server.py")
-    mod = importlib.util.module_from_spec(spec)
-    # mock aiosqlite before exec if needed, but import_script or standard import
-    # we can test the standalone functions directly
-    spec.loader.exec_module(mod)
-    monkeypatch.setattr(mod, "WORKSPACE_ROOT", tmp_path)
+
+@pytest.fixture
+def mod(tmp_path):
+    """Load agent-server.py with WORKSPACE_ROOT pointing at a tmp dir.
+
+    The module creates dirs under WORKSPACE_ROOT at import time, so the env var
+    must be set before exec (default /workspace is unwritable in CI).
+    """
+    ws = tmp_path / "ws"
+    (ws / "logs").mkdir(parents=True)
+    prev = os.environ.get("WORKSPACE_ROOT")
+    os.environ["WORKSPACE_ROOT"] = str(ws)
+    try:
+        spec = importlib.util.spec_from_file_location("ags_facts_under_test", AGENT_SERVER)
+        m = importlib.util.module_from_spec(spec)
+        sys.modules["ags_facts_under_test"] = m
+        spec.loader.exec_module(m)
+    finally:
+        if prev is None:
+            os.environ.pop("WORKSPACE_ROOT", None)
+        else:
+            os.environ["WORKSPACE_ROOT"] = prev
+    return m
+
+
+def test_load_stored_facts_empty(mod):
 
     assert mod.load_stored_facts("Marvin") == ""
 
 
-def test_load_stored_facts_from_db(monkeypatch, tmp_path):
-    import importlib.util
-    spec = importlib.util.spec_from_file_location("agent_server", "bin/agent-server.py")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    monkeypatch.setattr(mod, "WORKSPACE_ROOT", tmp_path)
+def test_load_stored_facts_from_db(mod):
 
-    db_dir = tmp_path / "data" / "memory"
+    db_dir = mod.WORKSPACE_ROOT / "data" / "memory"
     db_dir.mkdir(parents=True, exist_ok=True)
     db_path = db_dir / "memory.db"
 
@@ -62,14 +79,9 @@ def test_load_stored_facts_from_db(monkeypatch, tmp_path):
     assert "**Agora Chapter 11 [gaming]:** Roguelite bankruptcy trading game mechanics" in result
 
 
-def test_load_stored_facts_candidate_fallback(monkeypatch, tmp_path):
-    import importlib.util
-    spec = importlib.util.spec_from_file_location("agent_server", "bin/agent-server.py")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    monkeypatch.setattr(mod, "WORKSPACE_ROOT", tmp_path)
+def test_load_stored_facts_candidate_fallback(mod):
 
-    cand_dir = tmp_path / "data" / "memory-candidates"
+    cand_dir = mod.WORKSPACE_ROOT / "data" / "memory-candidates"
     cand_dir.mkdir(parents=True, exist_ok=True)
     (cand_dir / "2026-09-28.md").write_text(
         "# Memory candidates\n- **Consensus Clamping:** Use kind: consensus for terminal envelopes\n"
@@ -80,18 +92,13 @@ def test_load_stored_facts_candidate_fallback(monkeypatch, tmp_path):
     assert "**Consensus Clamping:** Use kind: consensus for terminal envelopes" in result
 
 
-def test_load_memory_index(monkeypatch, tmp_path):
-    import importlib.util
-    spec = importlib.util.spec_from_file_location("agent_server", "bin/agent-server.py")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    monkeypatch.setattr(mod, "WORKSPACE_ROOT", tmp_path)
+def test_load_memory_index(mod):
 
     # Empty when missing
     assert mod.load_memory_index("Marvin") == ""
 
     # Returns content when present
-    mem_dir = tmp_path / "agents" / "Marvin" / "memory"
+    mem_dir = mod.WORKSPACE_ROOT / "agents" / "Marvin" / "memory"
     mem_dir.mkdir(parents=True, exist_ok=True)
     (mem_dir / "MEMORY.md").write_text("# Marvin Memory Index\n- [Topic](facts/topic.md)")
 
