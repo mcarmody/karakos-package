@@ -272,10 +272,22 @@ class Harness:
             return []
         return [json.loads(l)["text"] for l in path.read_text().splitlines() if l]
 
-    def argv(self, shard):
-        """argv (without the program name) of the shard's latest spawn."""
+    def argv(self, shard, wait_s=3.0):
+        """argv (without the program name) of the shard's latest spawn. The fake
+        CLI writes it from its own process just after exec, so a test can get
+        here first; poll briefly (the writer is another process, so a blocking
+        wait cannot starve it). None if it never appears."""
         path = self.log_dir / f"{self.session_id(shard)}.argv.json"
-        return json.loads(path.read_text()) if path.exists() else None
+        deadline = time.monotonic() + wait_s
+        while True:
+            if path.exists():
+                try:
+                    return json.loads(path.read_text())
+                except ValueError:
+                    pass                      # caught mid-write; retry
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.02)
 
     def io(self, shard):
         """Parsed <session>.io.jsonl the fake wrote in queued-stdin mode: every
