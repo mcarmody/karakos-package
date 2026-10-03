@@ -1,6 +1,6 @@
 # Package backend contract
 
-What the dashboard may call on the Karakos package backend (`bin/agent-server.py`) when it runs with `KARAKOS_PROFILE=package`, and what it reads from disk. Written against `mcarmody/karakos-package` `release/2.0` (steps 1.1a/1.1b registry, 1.5 `context_tokens` and `shards`). The package copy of this file lives in that repo's `docs/`; this repo's copy is the source.
+What the dashboard may call on the Karakos package backend (`bin/agent-server.py`) when it runs with `KARAKOS_PROFILE=package`, and what it reads from disk. Written against `mcarmody/karakos-package` `release/2.0` (steps 1.1a/1.1b registry, 1.5 `context_tokens`, 2.1 shard rows, 2.3 hive call log, 2.7 usage sections). The package copy of this file lives in that repo's `docs/`; this repo's copy is the source.
 
 The dashboard never talks to a queue broker, `shards.json`, ssh, systemd or tmux under this profile. Those are household-only (see `docs/package-profile-inventory.md`).
 
@@ -46,9 +46,11 @@ Liveness for the nav header and the roster's per-agent liveness and queue depth.
 
 `state` is whatever the server holds for the agent: on `release/2.0` that is `IDLE`, `PROCESSING` or `ERROR_RECOVERY`, or `UNKNOWN` for an agent that has not started. Treat it as an open string. `session_id` is truncated to 8 characters. `context_tokens` 0 means unknown. `dead_letters` above 0 means replies were generated and not delivered.
 
+`/health` keeps its per-agent `shards` as a map `{shard_id: {context_tokens}}`; it is not the shard list. The dashboard reads shard rows from `/agents` only and uses `/health` for `alive`, `session_id` and the queue depth of an agent that reports no shard rows.
+
 ### `GET /agents`
 
-The roster. Source of the dashboard's agent list, chat picker and `context_tokens`.
+The roster. Source of the dashboard's agent list, chat picker, `context_tokens` and shard rows.
 
 ```json
 {
@@ -56,7 +58,20 @@ The roster. Source of the dashboard's agent list, chat picker and `context_token
     {
       "name": "alpha",
       "context_tokens": 4200,
-      "shards": { "alpha": { "context_tokens": 4200 } },
+      "shards": [
+        {
+          "id": "alpha", "is_default": true, "state": "IDLE", "alive": true,
+          "pid": 4101, "session_id": "abcd1234", "queue_depth": 0,
+          "context_tokens": 4200, "channels": ["general"], "last_channel": "general",
+          "paused": null
+        },
+        {
+          "id": "alpha-ops", "is_default": false, "state": "IDLE", "alive": true,
+          "pid": 4102, "session_id": "ef567890", "queue_depth": 2,
+          "context_tokens": 0, "channels": ["ops"], "last_channel": "ops",
+          "paused": { "reason": "budget", "until": 1791020000 }
+        }
+      ],
       "model": "opus",
       "max_turns": 200,
       "timeout": 10800,
@@ -70,7 +85,7 @@ The roster. Source of the dashboard's agent list, chat picker and `context_token
 ```
 
 - `context_tokens`: max over the agent's shards; `0` = unknown (1.5).
-- `shards`: shard id -> `{context_tokens}` (1.5). Until 2.1 the only shard is the agent itself.
+- `shards`: a list of rows (2.1), not the 1.5 dict `{shard_id: {context_tokens}}`. `state` is an open string (`IDLE`, `PROCESSING`, `ERROR_RECOVERY`, `UNKNOWN`). `paused` is `null` or `{reason, until}` (2.7): `reason` is `breaker`, `budget` or `governor`, `until` is epoch seconds or `null` (held until usage drops). A shard with no `channels` has none configured. The dashboard also accepts the 1.5 dict from an older server (one row per key, other fields defaulted) and passes unknown row keys through.
 - `dashboard_chat: false` marks a relay agent not meant for direct chat. `label` defaults to the agent id.
 
 ### `config/agents.yaml` (file, read only)
@@ -156,17 +171,57 @@ Rows from before `session_id` existed show `"session_id": "unknown"`. `current` 
 
 ### `GET /usage`
 
-Rate-limit headroom per agent. Example values are illustrative; types follow `handle_usage`. (On `release/2.0` the rows are still keyed by agent; the plan keys `rate_limit_state` by window type, so expect this shape to be revisited.)
+Rate-limit headroom and the pause state behind it. Example values are illustrative; types follow `handle_usage` and `usage_gate.usage_report`.
 
 ```json
-{ "agents": { "alpha": {
+{
+  "agents": { "alpha": {
     "status": "allowed", "rate_limit_type": "five_hour", "resets_at": 1791020000,
     "is_using_overage": false, "overage_status": null,
     "percent_of_window_used": 41.5, "summary": "5h window: 41.5% used",
-    "updated_at": "2026-10-03 12:00:00" } } }
+    "updated_at": "2026-10-03 12:00:00" } },
+  "windows": {
+    "five_hour": { "status": "allowed", "resets_at": 1791020000, "utilization_pct": 41,
+                   "percent_of_window_used": 41.5, "updated_at": "2026-10-03 12:00:00" },
+    "seven_day": { "status": "allowed", "resets_at": 1791400000, "utilization_pct": 73,
+                   "percent_of_window_used": 12.0, "updated_at": "2026-10-03 12:00:00" }
+  },
+  "breaker": { "paused": false, "until": null, "types": [] },
+  "budgets": { "alpha": { "used": 900000, "budget": 1000000, "paused_since": null, "until": null } },
+  "governor": { "weekly_pct": 73, "enabled": true, "policy_broken": false }
+}
 ```
 
-`summary` is human prose. Fields are `null` when there is no reading yet; `percent_of_window_used: null` is "no reading", never 0.
+- `agents` is unchanged: per agent, the account's worst window. `summary` is human prose. Fields are `null` when there is no reading yet; `percent_of_window_used: null` is "no reading", never 0.
+- `windows` (2.7) is keyed by `rate_limit_type`. `utilization_pct` is the account's consumption of that window (`null` = no reading); `resets_at` is epoch seconds.
+- `breaker`: `paused` is true while the account limit is rejecting dispatch; `until` is epoch seconds or `null`; `types` names the windows holding it.
+- `budgets`: one entry per agent that has a token budget (agents without one are absent). `used` and `budget` count uncached input plus output tokens in the budget window; `paused_since` and `until` are epoch seconds or `null`.
+- `governor`: `weekly_pct` is the weekly window utilisation or `null`; `enabled` is false when the policy is off or broken; `policy_broken` is true when `config/governor.yaml` is invalid.
+
+The dashboard serves this through `GET /api/usage`, trimming `agents` and `budgets` to the account's agent allowlist (`windows`, `breaker` and `governor` are account facts).
+
+### `GET /hive/calls`
+
+The log of hive calls between shards (2.3), newest first. Full field and status tables are in the package's `docs/hive-call-log.md`.
+
+| Query | Meaning |
+|---|---|
+| `limit` | 1 to 500, default 100 |
+| `since` | ISO time; calls created at or after it |
+| `shard` | calls where this shard is the caller or the callee |
+| `status` | `pending`, `answered`, `expired`, `error`, `timeout` or `abandoned` |
+
+```json
+{ "calls": [{
+  "call_id": "c-3f9a1b2c4d5e", "from": "alpha", "to": "alpha-ops",
+  "from_agent": "alpha", "to_agent": "alpha", "depth": 1, "status": "answered",
+  "created_at": "2026-10-03 10:00:00", "started_at": "2026-10-03 10:00:01",
+  "answered_at": "2026-10-03 10:00:04", "duration_ms": 3120,
+  "question": "first 200 characters of the question",
+  "answer": "first 200 characters of the answer", "error": null }] }
+```
+
+`from` and `to` are shard ids; `from_agent` and `to_agent` are the agents they belong to. Times are UTC `YYYY-MM-DD HH:MM:SS`. The dashboard serves this through `GET /api/hive/calls`, which validates the four filters (unknown parameters are dropped) and returns only calls whose `from_agent` and `to_agent` are both allowed for the account, because `question` and `answer` carry message text.
 
 ### Admin actions (used by the agent detail panel)
 
@@ -184,8 +239,8 @@ All `POST`, no body, `200`/`404 {"error": "Unknown agent"}`:
 
 | # | Need | Today | Owner |
 |---|---|---|---|
-| G1 | Shard rows: per-shard state, queue depth, spawn status and channels in `/agents` | `shards` is `{shard_id: {context_tokens}}` only; the adapter lays the registry's `channels` over it | 2.1 (shards spawn). The adapter passes unknown shard keys through, so no dashboard change is needed when 2.1 adds them |
-| G2 | Hive call log: which agent called which, when, outcome | No endpoint | 2.3. Needed by the 5.4 fleet/hive page |
+| G1 | Shard rows: per-shard state, queue depth, spawn status and channels in `/agents` | **Closed by 2.1** (rows in `/agents`) and consumed by 5.4 (`normalizeShards`, shard table). The adapter still lays the registry's `channels` over rows that report none | - |
+| G2 | Hive call log: which agent called which, when, outcome | **Closed by 2.3** (`GET /hive/calls`) and consumed by 5.4 (`/api/hive/calls`, hive call log on `/fleet`) | - |
 | G3 | Per-agent last message, `messages_processed`, session age and compaction count for the roster | Not in `/agents` or `/health`; the roster shows blanks/zeros under this profile | Unowned; propose adding to `/agents` alongside 2.1 |
 | G4 | A cost endpoint the dashboard can use instead of opening the sqlite file | `GET /cost` exists, but `app/api/cost` (and `finance/usage-timeseries`, `conversations/metrics`, `chat/history|result|stream`, `history/*`) read `agent-server.db` directly via `AGENT_SERVER_DB_PATH`, which needs the file mounted into the dashboard container and the sqlite drivers | 5.3 (image build) decides: mount the DB, or 5.1 re-points these routes at HTTP. Time series and chat history have no HTTP endpoint at all |
 | G5 | Server-side session/transcript replay for `chat/stream` | Read from the sqlite file only | Same decision as G4 |
@@ -197,7 +252,7 @@ These already exist in the household dashboard and are not changed by 5.0. They 
 
 | Dashboard calls | Package server has |
 |---|---|
-| `POST /interrupt` with `{agent, reason}` (`app/api/agents/[name]/interrupt`) | `POST /agents/{name}/interrupt` |
+| `POST /interrupt` with `{agent, reason}` (`app/api/agents/[name]/interrupt`, household profile only; under package the route calls `POST /agents/{name}/interrupt`, 5.4) | `POST /agents/{name}/interrupt` |
 | `GET /queue/{name}`, `DELETE /queue/{name}/{id}` (`app/api/agents/[name]/queue`) | `GET /agents/{name}/queue`, `DELETE /agents/{name}/queue/{queue_id}` |
 | `GET /status` (`app/api/sys`) | `/health` and `/agents` |
 | `POST /flush` (`app/api/sys`) | `POST /agents/{name}/flush` |
