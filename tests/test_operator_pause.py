@@ -249,6 +249,34 @@ def test_paused_shard_is_not_a_hive_callee_and_calls_are_failed(harness, clock):
     run(scenario())
 
 
+def test_post_hive_call_to_a_paused_shard_is_409_callee_paused(harness, clock):
+    """The POST gate on its own (no queued call to fail): paused_view makes the
+    shard unavailable to a call, a time-limited pause counts like an open-ended
+    one, a buzz is still accepted, and resume reopens it. The caller must be in
+    a turn, so `a` is held busy."""
+    h = harness(agents=["a", "b"], steering=NO_STEER)
+    call = {"from": "a", "to": "b", "question": "q"}
+
+    async def scenario():
+        async with h:
+            h.script(rules=[{"match": "hold", "step": {"text": "ok", "delay_ms": 1500}}])
+            await h.send("a", "hold")
+            await h.wait_for(lambda: h.module.agent_states.get("a") == "PROCESSING")
+            for body in ({"minutes": None}, {"minutes": 5}):
+                assert (await post(h, "/agents/b/pause", body))[0] == 200
+                assert operator_pause.paused_view(h.module.STATE, "b")["reason"] == "manual"
+                code, resp = await post(h, "/hive/call", call)
+                assert code == 409 and resp["error"] == "callee_paused", resp
+                assert [r for r in h.queue_rows("b") if r["call_id"]] == []   # no call row
+                code, _ = await post(h, "/hive/buzz", {"from": "a", "to": "b", "message": "m"})
+                assert code == 202                              # a buzz waits; it is not refused
+                assert (await post(h, "/agents/b/resume"))[0] == 200
+            code, resp = await post(h, "/hive/call", call)
+            assert code == 202, resp                            # resumed: callable again
+
+    run(scenario())
+
+
 def test_steerable_is_false_for_a_paused_shard(harness, clock):
     h = harness(agents=["a", "b"])
 
