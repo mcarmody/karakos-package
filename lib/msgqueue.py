@@ -7,6 +7,7 @@ shadow the stdlib module that logging.handlers and aiosqlite import.
 """
 import asyncio
 import json
+import math
 import sqlite3
 from datetime import datetime, timezone
 
@@ -102,6 +103,107 @@ async def claim_batch(db, shard, limit, now=None) -> list:
         (STATUS_IN_PROGRESS, shard, *args, STATUS_QUEUED))
     await db.commit()
     return sorted(rows, key=lambda r: (-(r["priority"] or 0), r["created_at"], r["id"]))
+
+
+# Rows a thief may take: plain human/bot rows, never addressed to one shard.
+def _stealable(a=""):
+    return (f"{a}call_id IS NULL AND {a}reply_to_agent IS NULL"
+            f" AND {a}channel NOT IN ('hive', 'call')"
+            f" AND {a}priority = 0"
+            f" AND ({a}not_before IS NULL OR {a}not_before <= :now_epoch)")
+
+
+_AGE_FMT = "%Y-%m-%d %H:%M:%S"
+
+
+def _now_dt(now):
+    if now is None:
+        return datetime.now(timezone.utc)
+    if isinstance(now, (int, float)):
+        return datetime.fromtimestamp(now, tz=timezone.utc)
+    if isinstance(now, str):
+        return datetime.strptime(now, _TS).replace(tzinfo=timezone.utc)
+    return now.astimezone(timezone.utc) if now.tzinfo else now.replace(tzinfo=timezone.utc)
+
+
+def _age_cutoff(now_dt, min_age_s) -> str:
+    """Newest created_at a thief may take. created_at has one-second
+    resolution (the true time is in [c, c+1)), so the floor is rounded up:
+    a row is stealable only once c + 1 <= now - min_age_s, i.e. never younger."""
+    t = now_dt.timestamp() - float(min_age_s)
+    return datetime.fromtimestamp(math.floor(t) - 1, tz=timezone.utc).strftime(_AGE_FMT)
+
+
+async def claim_stolen(db, thief, victim, limit, min_age_s, now=None) -> list:
+    """Claim up to `limit` of `victim`'s waiting rows for `thief` (step 2.4).
+
+    The row keeps agent = victim and gets claimed_by = thief. Same single
+    UPDATE ... RETURNING shape as claim_batch, so a row is never in two
+    callers' results. Never takes a call, reply, buzz or priority row, a row
+    held behind a wall, an expired or too-young row, or anything in a channel
+    the victim is mid-conversation in (or has an earlier row there that a thief
+    may not take). Channel '0' is exempt from continuity.
+    """
+    now_dt = _now_dt(now)
+    await expire(db, victim, now_dt)
+    params = {"victim": victim, "thief": thief, "limit": int(limit),
+              "q": STATUS_QUEUED, "ip": STATUS_IN_PROGRESS,
+              "now_epoch": int(now_dt.timestamp()),
+              "cutoff": _age_cutoff(now_dt, min_age_s)}
+    rows = await db.execute_fetchall(
+        "UPDATE message_queue SET processed = :ip, claimed_by = :thief,"
+        " processing_started_at = CURRENT_TIMESTAMP"
+        " WHERE id IN (SELECT m.id FROM message_queue m"
+        "  WHERE m.agent = :victim AND m.processed = :q"
+        f"  AND {_stealable('m.')}"
+        "  AND m.created_at <= :cutoff"
+        "  AND (m.channel_id = '0' OR ("
+        "   NOT EXISTS (SELECT 1 FROM message_queue p WHERE p.agent = :victim"
+        "    AND p.channel_id = m.channel_id AND p.processed = :ip)"
+        "   AND NOT EXISTS (SELECT 1 FROM message_queue e WHERE e.agent = :victim"
+        "    AND e.channel_id = m.channel_id AND e.processed = :q"
+        "    AND (e.created_at < m.created_at"
+        "         OR (e.created_at = m.created_at AND e.id < m.id))"
+        f"    AND NOT ({_stealable('e.')} AND e.created_at <= :cutoff))))"
+        "  ORDER BY m.created_at ASC, m.id ASC LIMIT :limit)"
+        " AND processed = :q RETURNING *", params)
+    await db.commit()
+    return sorted(rows, key=lambda r: (r["created_at"], r["id"]))
+
+
+async def steal_wait_s(db, victim, min_age_s, now=None):
+    """Seconds until the oldest otherwise-stealable row of `victim` is old
+    enough to take (<= 0 when one already is), or None when no row of the
+    victim is of a stealable kind. Lets the caller arm one timer instead of
+    polling."""
+    now_dt = _now_dt(now)
+    rows = await db.execute_fetchall(
+        "SELECT MIN(created_at) AS c FROM message_queue"
+        f" WHERE agent = :victim AND processed = :q AND {_stealable()}"
+        " AND (expires_at IS NULL OR expires_at >= :exp)",
+        {"victim": victim, "q": STATUS_QUEUED,
+         "now_epoch": int(now_dt.timestamp()), "exp": utc_iso(now_dt)})
+    c = rows[0]["c"] if rows else None
+    if not c:
+        return None
+    t = datetime.strptime(c, _AGE_FMT).replace(tzinfo=timezone.utc).timestamp()
+    return t + 1 + float(min_age_s) - now_dt.timestamp()
+
+
+async def queued_depths(db, shards) -> dict:
+    """Queued row count per shard, not counting reply rows (nobody runs those
+    as a turn). Every requested shard appears."""
+    shards = list(shards)
+    out = {s: 0 for s in shards}
+    if not shards:
+        return out
+    rows = await db.execute_fetchall(
+        f"SELECT agent, COUNT(*) AS n FROM message_queue WHERE processed = ?"
+        f" AND {_NOT_REPLY} AND agent IN ({','.join('?' * len(shards))})"
+        " GROUP BY agent", (STATUS_QUEUED, *shards))
+    for r in rows:
+        out[r["agent"]] = r["n"]
+    return out
 
 
 async def reap_hive_rows(db, now=None, ttl=600) -> int:
