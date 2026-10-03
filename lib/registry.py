@@ -1,0 +1,445 @@
+#!/usr/bin/env python3
+"""Agent registry: the one parser for ``config/agents.yaml`` (schema version 2).
+
+    from registry import load_registry
+    reg = load_registry(workspace)        # raises RegistryError listing every problem
+    reg.primary(); reg.monitor(); reg.shards(); reg.legacy_view()
+
+CLI:  python3 lib/registry.py [--workspace DIR] ids | field <id> <key> | role <role> | validate
+
+Keying rule: a shard ``id`` is the runtime key everywhere (queue, sessions, cost
+rows, states, locks). The default shard of agent ``X`` has id ``X``. Account-level
+resources (rate-limit state) are never keyed by agent or shard.
+
+This module only reads (and, via ``write_agent``, appends to) agents.yaml. It
+never mutates 1.x data.
+"""
+
+import json
+import os
+import re
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import yaml
+
+REGISTRY_VERSION = 2
+ID_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
+ROLES = ("primary", "monitor", "builder", "reviewer", "custom")
+EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+# key -> (default, type-check description). Order is the canonical key order.
+_DEFAULTS = {
+    "model": "sonnet",
+    "effort": None,
+    "max_turns": 200,
+    "timeout": 10800,
+    "token_budget_4h": None,
+    "context_budget_tokens": None,
+    "handoff_on_reset": False,
+    "system_prompt": None,
+    "tool_streaming": True,
+    "stream_to_channel": False,
+    "dashboard_chat": True,
+    "allowed_tools": [],
+    "disallowed_tools": [],
+    "env": {},
+}
+_KNOWN_KEYS = {"name", "role", "shards", "discord"} | set(_DEFAULTS)
+
+# Keys copied verbatim into legacy_view() when explicitly set.
+_LEGACY_PASSTHROUGH = (
+    "system_prompt", "model", "max_turns", "timeout", "tool_streaming",
+    "stream_to_channel", "dashboard_chat", "allowed_tools", "disallowed_tools", "env",
+)
+
+
+class RegistryError(Exception):
+    """Invalid registry. ``problems`` holds every error found."""
+
+    def __init__(self, problems):
+        self.problems = list(problems)
+        super().__init__("invalid agent registry:\n  - " + "\n  - ".join(self.problems))
+
+
+@dataclass(frozen=True)
+class Shard:
+    id: str
+    agent: str
+    channels: tuple = ()
+
+    def __post_init__(self):
+        object.__setattr__(self, "channels", tuple(self.channels))
+
+
+@dataclass
+class Agent:
+    id: str
+    name: str
+    role: str
+    settings: dict            # every schema key with defaults applied
+    explicit: dict            # keys exactly as written in the file
+    discord: dict = field(default_factory=dict)
+    shard_defs: list = field(default_factory=list)   # [(shard_id, [channels])]
+
+    def get(self, key, default=None):
+        if key in ("name", "role"):
+            return getattr(self, key)
+        if key == "discord":
+            return self.discord
+        return self.settings.get(key, default)
+
+
+# --------------------------------------------------------------------------
+# parsing / validation
+# --------------------------------------------------------------------------
+
+def _is_int(v):
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _is_str_list(v):
+    return isinstance(v, list) and all(isinstance(x, str) for x in v)
+
+
+def _check_type(aid, key, val, errors):
+    p = f"agent '{aid}': '{key}'"
+    if key == "model" and not (isinstance(val, str) and val):
+        errors.append(f"{p} must be a non-empty string")
+    elif key == "effort" and val is not None and val not in EFFORTS:
+        errors.append(f"{p} must be one of {', '.join(EFFORTS)} or null")
+    elif key in ("max_turns", "timeout") and not (_is_int(val) and val > 0):
+        errors.append(f"{p} must be a positive integer")
+    elif key in ("token_budget_4h", "context_budget_tokens") and val is not None \
+            and not (_is_int(val) and val > 0):
+        errors.append(f"{p} must be a positive integer or null")
+    elif key in ("handoff_on_reset", "tool_streaming", "stream_to_channel",
+                 "dashboard_chat") and not isinstance(val, bool):
+        errors.append(f"{p} must be true or false")
+    elif key == "system_prompt" and val is not None and not isinstance(val, str):
+        errors.append(f"{p} must be a path string")
+    elif key in ("allowed_tools", "disallowed_tools") and not _is_str_list(val):
+        errors.append(f"{p} must be a list of strings")
+    elif key == "env" and not (isinstance(val, dict)
+                               and all(isinstance(k, str) for k in val)):
+        errors.append(f"{p} must be a mapping of names to values")
+
+
+class Registry:
+    def __init__(self, agents, warnings=None):
+        self._agents = dict(agents)          # insertion order == file order
+        self.warnings = list(warnings or [])
+
+    # -- lookups ----------------------------------------------------------
+    def agents(self):
+        return list(self._agents.values())
+
+    def agent(self, agent_id):
+        return self._agents[agent_id]
+
+    def ids(self):
+        return list(self._agents)
+
+    def by_role(self, role):
+        return [a for a in self._agents.values() if a.role == role]
+
+    def primary(self):
+        return self.by_role("primary")[0]
+
+    def monitor(self):
+        return self.by_role("monitor")[0]
+
+    def shards(self):
+        out = []
+        for a in self._agents.values():
+            out.extend(Shard(sid, a.id, chans) for sid, chans in a.shard_defs)
+        return out
+
+    def shards_of(self, agent_id):
+        return [s for s in self.shards() if s.agent == agent_id]
+
+    def shard_for_channel(self, name):
+        for s in self.shards():
+            if name in s.channels:
+                return s
+        return None
+
+    # -- compatibility ----------------------------------------------------
+    def legacy_view(self):
+        """The old ``{"agents": {id: {...1.x keys}}}`` dict. Only keys that were
+        explicitly set appear, so a registry migrated from a 1.x file yields
+        that file's dict back unchanged."""
+        out = {}
+        for a in self._agents.values():
+            entry = {}
+            for key in _LEGACY_PASSTHROUGH:
+                if key in a.explicit:
+                    val = a.explicit[key]
+                    entry[key] = list(val) if isinstance(val, list) else \
+                        dict(val) if isinstance(val, dict) else val
+            if a.discord.get("token_env"):
+                entry["discord_bot_token_env"] = a.discord["token_env"]
+            if a.discord.get("bot_id_env"):
+                entry["discord_bot_id_env"] = a.discord["bot_id_env"]
+            out[a.id] = entry
+        return {"agents": out}
+
+
+def _channel_names(workspace):
+    path = Path(workspace) / "config" / "channels.json"
+    if not path.exists():
+        return set(), None
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError) as exc:
+        return set(), f"config/channels.json unreadable: {exc}"
+    chans = data.get("channels", {}) if isinstance(data, dict) else {}
+    return (set(chans) if isinstance(chans, dict) else set()), None
+
+
+def parse_registry(data, channel_names=None):
+    """Validate a parsed agents.yaml mapping. Returns a Registry or raises
+    RegistryError carrying every problem. ``channel_names=None`` skips the
+    channel-existence check."""
+    errors, warnings = [], []
+    if not isinstance(data, dict):
+        raise RegistryError(["agents.yaml must be a mapping"])
+    if data.get("version") != REGISTRY_VERSION:
+        errors.append(f"version must be {REGISTRY_VERSION} (got {data.get('version')!r})")
+    for k in data:
+        if k not in ("version", "agents"):
+            warnings.append(f"unknown top-level key '{k}'")
+    raw = data.get("agents")
+    if not isinstance(raw, dict) or not raw:
+        errors.append("'agents' must be a non-empty mapping")
+        raise RegistryError(errors)
+
+    agents = {}
+    for aid, body in raw.items():
+        aid = str(aid)
+        if not ID_RE.match(aid):
+            errors.append(f"agent id '{aid}' must match {ID_RE.pattern}")
+        if not isinstance(body, dict):
+            errors.append(f"agent '{aid}' must be a mapping")
+            continue
+        for k in body:
+            if k not in _KNOWN_KEYS:
+                warnings.append(f"agent '{aid}': unknown key '{k}'")
+        name = body.get("name")
+        if not (isinstance(name, str) and name.strip()):
+            errors.append(f"agent '{aid}': 'name' is required")
+            name = aid
+        role = body.get("role")
+        if role is None:
+            errors.append(f"agent '{aid}': 'role' is required")
+        elif role not in ROLES:
+            errors.append(f"agent '{aid}': role '{role}' must be one of {', '.join(ROLES)}")
+        settings, explicit = {}, {}
+        for key, default in _DEFAULTS.items():
+            if key in body:
+                _check_type(aid, key, body[key], errors)
+                explicit[key] = body[key]
+                settings[key] = body[key]
+            else:
+                settings[key] = type(default)(default) if isinstance(default, (list, dict)) \
+                    else default
+        disc = body.get("discord") or {}
+        if not isinstance(disc, dict):
+            errors.append(f"agent '{aid}': 'discord' must be a mapping")
+            disc = {}
+        else:
+            for k, v in disc.items():
+                if k not in ("token_env", "bot_id_env"):
+                    warnings.append(f"agent '{aid}': unknown key 'discord.{k}'")
+                elif not isinstance(v, str):
+                    errors.append(f"agent '{aid}': 'discord.{k}' must be a string")
+        shard_defs = []
+        raw_shards = body.get("shards")
+        if raw_shards is None:
+            shard_defs = [(aid, [])]
+        elif not isinstance(raw_shards, list) or not raw_shards:
+            errors.append(f"agent '{aid}': 'shards' must be a non-empty list")
+        else:
+            for i, s in enumerate(raw_shards):
+                if not isinstance(s, dict) or not isinstance(s.get("id"), str):
+                    errors.append(f"agent '{aid}': shards[{i}] needs a string 'id'")
+                    continue
+                chans = s.get("channels", [])
+                if not _is_str_list(chans):
+                    errors.append(f"agent '{aid}': shard '{s['id']}' channels must be a list of names")
+                    chans = []
+                for k in s:
+                    if k not in ("id", "channels"):
+                        warnings.append(f"agent '{aid}': shard '{s['id']}': unknown key '{k}'")
+                shard_defs.append((s["id"], list(chans)))
+        agents[aid] = Agent(aid, name, role if role in ROLES else "custom", settings,
+                            explicit, {k: v for k, v in disc.items() if isinstance(v, str)},
+                            shard_defs)
+
+    # -- cross-agent rules ---------------------------------------------------
+    for role in ("primary", "monitor"):
+        n = sum(1 for b in raw.values() if isinstance(b, dict) and b.get("role") == role)
+        if n == 0:
+            errors.append(f"no '{role}' agent: exactly one is required")
+        elif n > 1:
+            errors.append(f"{n} agents have role '{role}': exactly one is allowed")
+
+    seen = {}
+    channel_owner = {}
+    for a in agents.values():
+        for sid, chans in a.shard_defs:
+            if not ID_RE.match(sid):
+                errors.append(f"shard id '{sid}' (agent '{a.id}') must match {ID_RE.pattern}")
+            if sid in agents and sid != a.id:
+                errors.append(f"shard id '{sid}' (agent '{a.id}') equals another agent's id")
+            if sid in seen:
+                errors.append(f"shard id '{sid}' is not unique (agents '{seen[sid]}' and '{a.id}')")
+            seen.setdefault(sid, a.id)
+            for ch in chans:
+                if channel_names is not None and ch not in channel_names:
+                    errors.append(f"shard '{sid}': channel '{ch}' is not in channels.json")
+                if ch in channel_owner and channel_owner[ch] != sid:
+                    errors.append(f"channel '{ch}' belongs to more than one shard "
+                                  f"('{channel_owner[ch]}' and '{sid}')")
+                channel_owner.setdefault(ch, sid)
+    if errors:
+        raise RegistryError(errors)
+    return Registry(agents, warnings)
+
+
+def agents_yaml_path(workspace):
+    return Path(workspace) / "config" / "agents.yaml"
+
+
+def load_registry(workspace):
+    path = agents_yaml_path(workspace)
+    if not path.exists():
+        raise RegistryError([f"{path} not found"])
+    try:
+        data = yaml.safe_load(path.read_text())
+    except yaml.YAMLError as exc:
+        raise RegistryError([f"{path.name} is not valid YAML: {exc}"])
+    names, chan_err = _channel_names(workspace)
+    reg = parse_registry(data, names)
+    if chan_err:
+        reg.warnings.append(chan_err)
+    return reg
+
+
+# --------------------------------------------------------------------------
+# writing
+# --------------------------------------------------------------------------
+
+def write_agent(workspace, agent_id, body):
+    """Add agent ``agent_id`` (a schema-shaped dict) to agents.yaml.
+
+    With ruamel.yaml importable the file is edited via a comment-preserving round
+    trip; otherwise a new block is appended as text and existing lines are never
+    touched. The result is re-validated first and an invalid result is refused
+    (RegistryError, file untouched).
+    """
+    path = agents_yaml_path(workspace)
+    names, _ = _channel_names(workspace)
+    if not ID_RE.match(agent_id):
+        raise RegistryError([f"agent id '{agent_id}' must match {ID_RE.pattern}"])
+    original = path.read_text() if path.exists() else f"version: {REGISTRY_VERSION}\nagents:\n"
+    try:
+        current = yaml.safe_load(original) or {}
+    except yaml.YAMLError as exc:
+        raise RegistryError([f"{path.name} is not valid YAML: {exc}"])
+    if agent_id in (current.get("agents") or {}):
+        raise RegistryError([f"agent '{agent_id}' already exists"])
+
+    candidate = {**current, "agents": {**(current.get("agents") or {}), agent_id: body}}
+    parse_registry(candidate, names)       # raises on invalid; nothing written yet
+
+    try:
+        from ruamel.yaml import YAML       # type: ignore
+    except ImportError:
+        YAML = None
+    if YAML is not None:
+        import io
+        rt = YAML()
+        rt.preserve_quotes = True
+        doc = rt.load(original)
+        doc["agents"][agent_id] = body
+        buf = io.StringIO()
+        rt.dump(doc, buf)
+        new_text = buf.getvalue()
+    else:
+        block = yaml.safe_dump({agent_id: body}, sort_keys=False, default_flow_style=False)
+        block = "".join("  " + ln if ln.strip() else ln for ln in block.splitlines(True))
+        new_text = original + ("" if original.endswith("\n") else "\n") + block
+    # Re-validate what will actually land on disk.
+    parse_registry(yaml.safe_load(new_text), names)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(new_text)
+    os.replace(tmp, path)
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+def _fmt(val):
+    if isinstance(val, bool):
+        return "true" if val else "false"
+    if val is None:
+        return ""
+    if isinstance(val, (list, dict)):
+        return json.dumps(val)
+    return str(val)
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    ws = os.environ.get("WORKSPACE_ROOT") or str(Path(__file__).resolve().parent.parent)
+    if argv[:1] == ["--workspace"] and len(argv) >= 2:
+        ws, argv = argv[1], argv[2:]
+    usage = "usage: registry.py [--workspace DIR] ids | field <id> <key> | role <role> | validate"
+    if not argv:
+        print(usage, file=sys.stderr)
+        return 2
+    cmd, args = argv[0], argv[1:]
+    try:
+        reg = load_registry(ws)
+    except RegistryError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+    for w in reg.warnings:
+        print(f"warning: {w}", file=sys.stderr)
+    if cmd == "validate" and not args:
+        print("ok")
+        return 0
+    if cmd == "ids" and not args:
+        print("\n".join(reg.ids()))
+        return 0
+    if cmd == "role" and len(args) == 1:
+        if args[0] not in ROLES:
+            print(f"unknown role '{args[0]}'", file=sys.stderr)
+            return 2
+        print("\n".join(a.id for a in reg.by_role(args[0])))
+        return 0
+    if cmd == "field" and len(args) == 2:
+        aid, key = args
+        if aid not in reg.ids():
+            print(f"unknown agent '{aid}'", file=sys.stderr)
+            return 1
+        a = reg.agent(aid)
+        if key not in _KNOWN_KEYS:
+            print(f"unknown field '{key}'", file=sys.stderr)
+            return 1
+        if key == "shards":
+            val = [{"id": s.id, "channels": list(s.channels)} for s in reg.shards_of(aid)]
+        else:
+            val = a.get(key)
+        print(_fmt(val))
+        return 0
+    print(usage, file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
