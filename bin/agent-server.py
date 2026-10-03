@@ -33,8 +33,11 @@ from aiohttp import web
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 # lib/ holds modules shared by more than one script; it sits beside bin/.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+# lib/ is a package root for lib.migrate (the schema-stamp guard).
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import ask_handler  # noqa: E402
 import tengwar  # noqa: E402
+from lib.migrate.guard import require_stamp  # noqa: E402
 
 # =============================================================================
 # Configuration
@@ -3246,6 +3249,10 @@ async def startup(app):
     """Initialize server on startup"""
     global http_session
 
+    # Refuse to boot on unstamped/old data before any DB is opened. The
+    # migrator is the only writer of 1.x data; boot only checks the stamp.
+    require_stamp(WORKSPACE_ROOT / "data")
+
     log.info("Starting Karakos Agent Server")
 
     # Initialize HTTP session
@@ -3352,6 +3359,7 @@ def create_app(with_lifecycle: bool = True) -> web.Application:
 
 def main():
     """Main entry point"""
+    require_stamp(WORKSPACE_ROOT / "data")
     # Signal handlers will be registered after event loop starts (in startup)
     # For now, just set flag to handle in asyncio context
     web.run_app(create_app(), host="0.0.0.0", port=PORT, access_log=None)
