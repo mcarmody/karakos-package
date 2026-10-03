@@ -27,6 +27,8 @@ def scrub(s):
     s = re.sub(r"msg_[A-Za-z0-9]+", lambda m: _stable("msg", m.group(0), "msg_SCRUBBED%03d"), s)
     s = re.sub(r"toolu_[A-Za-z0-9]+", lambda m: _stable("toolu", m.group(0), "toolu_SCRUBBED%03d"), s)
     s = re.sub(r'"task_id": ?"[a-z0-9]{10,}"', lambda m: '"task_id": "%s"' % _stable("task", m.group(0), "task%03d"), s)
+    # float noise in cost fields (0.01971819999999998) trips the 17-digit "discord-snowflake" coupling check
+    s = re.sub(r"(?<![\d.])(\d+)\.(\d{6})\d{6,}", lambda m: str(round(float(m.group(0)), 6)), s)
     return s
 
 
