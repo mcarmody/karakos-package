@@ -52,6 +52,7 @@ import spawn_env as spawn_env_lib  # noqa: E402
 import tengwar  # noqa: E402
 import turn_loop  # noqa: E402
 import usage_gate  # noqa: E402
+import operator_pause  # noqa: E402
 from lib.migrate.guard import require_stamp  # noqa: E402
 
 # =============================================================================
@@ -3059,10 +3060,9 @@ async def handle_health(request):
     })
 
 def _paused_entry(shard):
-    """null, or {reason, until} while the usage gate is deferring this shard."""
-    gate = getattr(STATE, "usage_gate", None)
-    p = gate.paused.get(shard) if gate else None
-    return {"reason": p[0], "until": p[1]} if p else None
+    """null, or {reason, until} while this shard is held: an operator pause
+    ("manual") first, then the usage gate. The one read of the paused view."""
+    return operator_pause.paused_view(STATE, shard)
 
 
 async def handle_agents(request):
@@ -3321,6 +3321,47 @@ async def handle_agent_interrupt(request):
     if len(targets) > 1:
         body["shards"] = hit
     return web.json_response(body)
+
+
+async def handle_agent_pause(request):
+    """POST /agents/{name}/pause - hold the queue; the turn in progress finishes.
+    Body {"minutes": 1..1440|null, "by": str|null}."""
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer ") or auth_header[7:] != AGENT_SERVER_TOKEN:
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    targets = _resolve_request_targets(request)
+    if not targets:
+        return web.json_response({"error": "Unknown agent"}, status=404)
+    body_in = {}
+    if request.can_read_body:
+        try:
+            parsed = await request.json()
+            body_in = parsed if isinstance(parsed, dict) else {}
+        except ValueError:
+            body_in = {}
+    minutes = body_in.get("minutes")
+    if minutes is not None and (isinstance(minutes, bool) or not isinstance(minutes, int)
+                                or not (operator_pause.MIN_MINUTES <= minutes
+                                        <= operator_pause.MAX_MINUTES)):
+        return web.json_response(
+            {"error": f"minutes must be {operator_pause.MIN_MINUTES} to "
+                      f"{operator_pause.MAX_MINUTES} or null"}, status=400)
+    by = body_in.get("by")
+    until = await operator_pause.pause(
+        STATE, targets, minutes, by if isinstance(by, str) else None)
+    return web.json_response({"paused": targets, "until": until})
+
+
+async def handle_agent_resume(request):
+    """POST /agents/{name}/resume - release an operator pause and drain."""
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer ") or auth_header[7:] != AGENT_SERVER_TOKEN:
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    targets = _resolve_request_targets(request)
+    if not targets:
+        return web.json_response({"error": "Unknown agent"}, status=404)
+    gone = await operator_pause.resume(STATE, targets)
+    return web.json_response({"resumed": gone})
 
 
 async def handle_agent_kill(request):
@@ -3900,9 +3941,12 @@ def _hive_pick(to, caller, kind, counts):
     # Spec 2.7: a breaker- or budget-paused shard is unavailable to a call (a
     # governor deferral only holds machine rows, so it does not count). A buzz
     # to a paused shard is accepted and waits.
-    gate = getattr(STATE, "usage_gate", None)
-    paused = ({s for s, (why, _) in gate.paused.items() if why in ("breaker", "budget")}
-              if gate and kind == "call" else set())
+    paused = set()
+    if kind == "call":
+        for sp in specs:
+            view = operator_pause.paused_view(STATE, sp.id)
+            if view and view["reason"] in ("manual", "breaker", "budget"):
+                paused.add(sp.id)
     return hive_lib.pick_callee(specs, to, caller, states, counts,
                                 STATE.hive.waits_for(), kind=kind, paused=paused)
 
@@ -4641,6 +4685,8 @@ async def graceful_shutdown(sig):
     # No summarizer and no handoff turn here: the stop timeout cannot hold a
     # model turn. Sessions persist and the next boot resumes them.
     await turn_loop.cancel_background(STATE)
+    for t in list(getattr(getattr(STATE, "operator_pause", None), "timers", {}).values()):
+        t.cancel()
     # Kill subprocesses
     log.info("Terminating agent subprocesses...")
     for agent in list(agent_processes.keys()):
@@ -4694,6 +4740,11 @@ async def startup(app):
     # Account breaker, token budget and weekly governor (spec 2.7).
     usage_gate.install(STATE)
 
+    # Operator pause (spec 6.4): /pause holds the queue, /resume releases it.
+    operator_pause.install(
+        STATE, on_change=lambda sh: write_agent_beacon(
+            sh, agent_states.get(sh, "IDLE"), force=True))
+
     # Session policy last: it only schedules work, after hive and the gate.
     register_session_policy(STATE)
 
@@ -4708,6 +4759,8 @@ async def startup(app):
         # so without this every restart-after-crash pages forever about an
         # agent that is now fine.
         write_agent_beacon(sid, "IDLE", force=True)
+    # Timers for pauses that survived the restart (locks exist now).
+    operator_pause.rearm_all(STATE)
 
     # Rows keyed by an agent's own id that no shard of that agent carries are
     # unreachable history; say so, never fail over it.
@@ -4794,6 +4847,8 @@ def create_app(with_lifecycle: bool = True) -> web.Application:
     app.router.add_post("/agents/{name}/session/finalize", handle_session_finalize)
     app.router.add_post("/agents/{name}/register", handle_agent_register)
     app.router.add_post("/agents/{name}/interrupt", handle_agent_interrupt)
+    app.router.add_post("/agents/{name}/pause", handle_agent_pause)
+    app.router.add_post("/agents/{name}/resume", handle_agent_resume)
     app.router.add_post("/agents/{name}/kill", handle_agent_kill)
     app.router.add_post("/agents/{name}/flush", handle_agent_flush)
     app.router.add_get("/agents/{name}/queue", handle_agent_queue)

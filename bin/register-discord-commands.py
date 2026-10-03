@@ -70,6 +70,11 @@ COMMANDS = [
     _cmd("interrupt", "Stop an agent's current generation, keep the session", [AGENT_OPTION]),
     _cmd("kill", "Kill an agent's subprocess without respawning it", [AGENT_OPTION]),
     _cmd("flush", "Drop an agent's pending message queue", [AGENT_OPTION]),
+    _cmd("pause", "Hold an agent's queue; the turn in progress finishes", [
+        {"name": "minutes", "description": "How long, 1 to 1440 (default: until resumed)",
+         "type": INTEGER, "required": False, "min_value": 1, "max_value": 1440},
+        AGENT_OPTION]),
+    _cmd("resume", "Release a paused agent's queue", [AGENT_OPTION]),
 
     # --- shaped arguments ---
     _cmd("logs", "Tail a service log", [

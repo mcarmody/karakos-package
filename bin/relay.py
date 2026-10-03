@@ -20,7 +20,7 @@ import sys
 import textwrap
 import time
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional, Dict, List
@@ -94,7 +94,7 @@ SYS_COMMANDS = frozenset({"clear", "reload", "status", "usage"})
 SLASH_COMMANDS = frozenset({
     "status", "health", "usage", "help",
     "cost", "clear", "reload", "interrupt", "kill", "flush",
-    "logs",
+    "logs", "pause", "resume",
 })
 
 # Commands that report on the whole install rather than one agent, so they
@@ -127,6 +127,8 @@ def slash_args(cmd: str, options: Dict) -> str:
 
     if cmd == "logs":
         return " ".join(p for p in (s("service"), s("lines")) if p)
+    if cmd == "pause":
+        return s("minutes")
     # Everything else is either untargeted or agent-targeted, and the target
     # travels as `mentioned` (the same slot a text-path @mention fills), not
     # as args — so there is nothing left to rebuild.
@@ -1218,8 +1220,38 @@ class DiscordAdapter(discord.Client):
                 message,
                 f"`{agent}` queue flushed — {body.get('flushed', 0)} message(s) dropped."
                 if ok else f"flush failed for `{agent}` — {detail}")
+        elif cmd == "pause":
+            await self.sys_pause(message, agent, args)
+        elif cmd == "resume":
+            ok, detail, body = await self.agent_server_post_json(f"/agents/{agent}/resume")
+            await self.sys_reply(
+                message,
+                f"`{agent}` resumed." if ok else f"resume failed for `{agent}` — {detail}")
         elif cmd == "cost":
             await self.sys_cost(message, agent)
+
+    async def sys_pause(self, message, agent: str, args: str):
+        """Hold the agent's queue (owner only, via handle_sys_command)."""
+        minutes = None
+        if args:
+            try:
+                minutes = int(args)
+            except ValueError:
+                minutes = -1
+            if not 1 <= minutes <= 1440:
+                await self.sys_reply(message, "pause minutes must be 1 to 1440.")
+                return
+        ok, detail, body = await self.agent_server_post_json(
+            f"/agents/{agent}/pause",
+            {"minutes": minutes, "by": message.author.display_name})
+        if not ok:
+            await self.sys_reply(message, f"pause failed for `{agent}` — {detail}")
+            return
+        until = body.get("until")
+        when = (f"until {datetime.fromtimestamp(until, tz=timezone.utc).strftime('%H:%M UTC')}"
+                if until else "until resumed")
+        await self.sys_reply(
+            message, f"`{agent}` paused {when}; the turn in progress will finish.")
 
     async def sys_status(self, message: discord.Message):
         """Report each agent's state, liveness and queue depth."""
