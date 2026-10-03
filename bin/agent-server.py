@@ -3549,9 +3549,11 @@ def session_policy_on_turn_end(shard, result):
     cfg = STATE.cfg(shard)
     budget = cfg.get("context_budget_tokens")
     requested = sp.reset_requested.get(shard)
-    if not budget and not requested:
-        return
     md = result.metadata or {}
+    # No budget and no request: only an errored turn can still mean overflow
+    # (a regex on text already in hand, no database access).
+    if not budget and not requested and not md.get("is_error"):
+        return
     overflow = bool(md.get("is_error")) and bool(
         CONTEXT_OVERFLOW_RE.search(result.raw_response_text or ""))
     reason = sp_lib.should_reset(md.get("context_tokens", 0) or 0, budget, overflow)

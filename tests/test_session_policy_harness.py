@@ -188,6 +188,39 @@ def test_overflow_resets_at_once_with_no_handoff(harness):
     assert not [r for r in h.queue_rows("a") if r["not_before"]]      # no hold
 
 
+def test_overflow_resets_an_agent_with_no_budget(harness):
+    h = make(harness, agents={"a": {"handoff_on_reset": True}, "b": {}}, shards=None)
+
+    async def scenario():
+        async with h:
+            h.script(default={"text": "ok"}, rules=[
+                rule("OVER", {"text": "prompt is too long", "is_error": True}, shard="^a$"),
+                handoff_rule(NOTE, shard="^a$")])
+            old = h.session_id("a")
+            await h.send("a", "OVER")
+            await reset_done(h, "a", old)
+            return old
+
+    old = run(scenario())
+    assert h.session_id("a") != old
+    assert not handoff_rows(h, "a")
+
+
+def test_an_ordinary_error_without_overflow_text_does_not_reset(harness):
+    h = make(harness, agents={"a": {"context_budget_tokens": 50000}, "b": {}}, shards=None)
+
+    async def scenario():
+        async with h:
+            h.script(default={"text": "ok"}, rules=[
+                rule("BOOM", {"text": "some other failure", "is_error": True}, shard="^a$")])
+            old = h.session_id("a")
+            await h.send("a", "BOOM")
+            await h.wait_idle("a")
+            return old
+
+    assert h.session_id("a") == run(scenario())
+
+
 def test_a_held_shard_resets_without_a_handoff(harness):
     h = make(harness)
 
@@ -316,8 +349,11 @@ def test_reload_leaves_the_note_and_the_next_reset_consumes_it_once(harness):
             note = h.workspace / "data" / "handoff" / "a.md"
             note.parent.mkdir(parents=True, exist_ok=True)
             note.write_text("RELOAD-NOTE")
+            argv_file = h.log_dir / f"{h.session_id('a')}.argv.json"
+            argv_file.unlink()          # same session id after a reload: wait for the new spawn's
             r = await h.client.post("/agents/a/reload", headers=h._headers())
             assert r.status == 200
+            await h.wait_for(lambda: h.argv("a") is not None)
             after_reload = (note.exists(), "RELOAD-NOTE" in " ".join(h.argv("a")))
             r = await h.client.post("/agents/a/reset", headers=h._headers())
             assert (await r.json())["status"] == "reset"

@@ -25,6 +25,7 @@ that was broken.
 import asyncio
 import json
 import os
+import re
 import time
 
 import pytest
@@ -223,6 +224,17 @@ class TestStreamLogIsWritten:
             drive(ags, [assistant_event(text_block(f"turn {i} " + "x" * 100)),
                         result_event()])
 
+        # Files written within one timestamp tick tie on mtime; give them the
+        # strictly increasing mtimes real time would have (creation order: the
+        # base name, then -1, -2, ...).
+        files = list(ags.STREAM_LOG_DIR.glob("amos_*.jsonl"))
+        def order(p):
+            m = re.match(r"amos_(\d+-\d+)(?:-(\d+))?$", p.stem)
+            return (m.group(1), int(m.group(2) or 0))
+        files.sort(key=order)
+        base = time.time() - 100
+        for n, f in enumerate(files):
+            os.utime(f, (base + n, base + n))
         summarizer.STREAM_LOG_DIR = ags.STREAM_LOG_DIR
         assert "turn 5" in summarizer.read_recent_stream("amos")
 

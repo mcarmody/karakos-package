@@ -168,17 +168,18 @@ def test_handoff_prompt_contents(tmp_path):
 
 def test_handoff_prompt_is_free_of_household_coupling():
     text = sp.build_handoff_prompt("/data/handoff/a.md")
-    deny = (PACKAGE_ROOT / "system" / "coupling-denylist.txt").read_text().splitlines()
-    for line in deny:
+    checked = 0
+    for line in (PACKAGE_ROOT / "system" / "coupling-denylist.txt").read_text().splitlines():
         if not line.strip() or line.startswith("#"):
             continue
         parts = line.split("\t")
-        if len(parts) > 1 and not parts[2:3] == [""] and len(parts) > 2 and parts[2]:
-            continue                                # path-scoped rule
-        try:
-            assert not re.search(parts[1], text), parts[0]
-        except re.error:
-            pass
+        name, regex = parts[0], parts[1] if len(parts) > 1 else ""
+        path_scope = parts[2] if len(parts) > 2 else ""
+        if not regex or path_scope:        # path-scoped rules do not apply to a string
+            continue
+        checked += 1
+        assert not re.search(regex, text), name
+    assert checked > 0
 
 
 def test_format_handoff_block():
