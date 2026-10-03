@@ -9,6 +9,7 @@ Port: 18791 (configurable via AGENT_SERVER_PORT env var)
 """
 
 import asyncio
+import errno
 import json
 import logging
 import os
@@ -863,13 +864,27 @@ async def kill_agent_subprocess(agent: str):
     deliberate_kills.add(agent)
 
     log.info(f"Killing {agent} subprocess (PID {proc.pid})")
+    def _already_dead(exc: BaseException) -> bool:
+        # The process exited between the lookup and the signal (or the
+        # respawn watcher reaped it): nothing left to kill.
+        return isinstance(exc, ProcessLookupError) or (
+            isinstance(exc, OSError) and exc.errno == errno.ESRCH)
+
     try:
         proc.terminate()
         await asyncio.wait_for(proc.wait(), timeout=5)
     except asyncio.TimeoutError:
         log.warning(f"{agent} didn't terminate, sending SIGKILL")
-        proc.kill()
-        await proc.wait()
+        try:
+            proc.kill()
+            await proc.wait()
+        except OSError as e:
+            if not _already_dead(e):
+                raise
+    except OSError as e:
+        if not _already_dead(e):
+            raise
+        log.info(f"{agent} subprocess already gone at kill time")
 
     agent_processes.pop(agent, None)
 
@@ -1895,6 +1910,26 @@ def _open_stream_log(agent: str):
     return open(path, "ab", buffering=0), now.strftime("%Y-%m-%d"), path
 
 
+_REDACT_PATTERNS = (
+    re.compile(r"(?:sk|pk|xox[a-z]|gh[pousr]|glpat)[-_][A-Za-z0-9_\-]{10,}"),
+    re.compile(r"(?i)\b(bearer|token|api[_-]?key|secret|password)([\"'\s:=]+)[^\s\"',}]{6,}"),
+    re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]*"),
+)
+
+
+def redact_for_log(text, limit: int = 200) -> str:
+    """Truncate and mask credential-shaped strings before text reaches the log.
+
+    Raw CLI output (a garbled stream line, an auth failure body) can carry
+    tokens. This is a best-effort mask, not a guarantee.
+    """
+    out = str(text if text is not None else "")[:limit]
+    out = _REDACT_PATTERNS[0].sub("[redacted]", out)
+    out = _REDACT_PATTERNS[1].sub(lambda m: f"{m.group(1)}{m.group(2)}[redacted]", out)
+    out = _REDACT_PATTERNS[2].sub("[redacted]", out)
+    return out
+
+
 def write_stream_log(agent: str, line: bytes) -> None:
     """Tee one raw stream-json event to the agent's stream log.
 
@@ -1986,6 +2021,7 @@ async def read_agent_response(
     # pulsing "thinking" label instead of a flood of identical empty rows.
     event_seq = 0
     in_empty_think_burst = False
+    decode_errors = 0
 
     try:
         while True:
@@ -1998,7 +2034,12 @@ async def read_agent_response(
 
             try:
                 event = json.loads(line.decode())
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                decode_errors += 1
+                log.warning(
+                    f"{agent} stream-json decode error ({type(e).__name__}): "
+                    f"{redact_for_log(line.decode(errors='replace').strip())!r}"
+                )
                 continue
 
             event_type = event.get("type")
@@ -2142,8 +2183,15 @@ async def read_agent_response(
                     )
                 break
 
+    except SystemExit as e:
+        # Not a crash: something in the reader asked to exit. Say so, and end
+        # the turn with whatever has been read.
+        log.warning(f"Reader for {agent} ended by SystemExit (code={e.code!r})")
     except Exception as e:
         log.error(f"Error reading response from {agent}: {e}")
+
+    if decode_errors and metadata:
+        metadata["decode_errors"] = decode_errors
 
     # Strip any inline thinking blocks (defense in depth)
     final_text = THINKING_BLOCK_RE.sub("", final_text).strip()
@@ -2174,6 +2222,8 @@ async def read_agent_response(
 # Ported from the household's usage-wall hold (59caa0c2b, 2bcc9c110,
 # 39953b5c9, f6b5baaaf) and rate-limit breaker (2548524f9), minus the
 # tmux/PTY pane mechanics.
+
+GENERIC_TURN_ERROR = "The agent hit an error and the turn did not complete."
 
 WALL_USAGE = "usage"
 WALL_MODEL = "model"
@@ -2421,6 +2471,17 @@ async def process_agent_queue(agent: str):
             return
         agent_wall_strikes.pop(agent, None)
 
+        # Any other errored turn: the `result` text is raw CLI output (an
+        # OAuth failure body, a stack trace), not a reply. It never goes to
+        # the channel; the server log keeps a redacted copy and the row is
+        # marked failed rather than complete.
+        final_status = STATUS_COMPLETE
+        if metadata and metadata.get("is_error"):
+            log.error(f"{agent} turn ended with is_error; raw result (redacted): "
+                      f"{redact_for_log(response_text, 500)!r}")
+            response_text = GENERIC_TURN_ERROR
+            final_status = STATUS_CRASHED
+
         # Post response to Discord
         discord_msg_id = None
         if response_text and channel_id != "0":
@@ -2434,7 +2495,7 @@ async def process_agent_queue(agent: str):
             SET processed = ?, response = ?, discord_response_id = ?, processed_at = CURRENT_TIMESTAMP
             WHERE message_id IN ({','.join('?' * len(message_ids))})
             """,
-            (STATUS_COMPLETE, response_text, discord_msg_id, *message_ids)
+            (final_status, response_text, discord_msg_id, *message_ids)
         )
         await db.commit()
 

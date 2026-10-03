@@ -201,7 +201,7 @@ CORE_TOOLS = [
                 },
                 "title": {
                     "type": "string",
-                    "description": "Task title (for add)"
+                    "description": "Task title (for add/update)"
                 },
                 "id": {
                     "type": "string",
@@ -210,6 +210,14 @@ CORE_TOOLS = [
                 "status": {
                     "type": "string",
                     "description": "New status (for update)"
+                },
+                "notes": {
+                    "type": "string",
+                    "description": "Task notes (for update)"
+                },
+                "assignee": {
+                    "type": "string",
+                    "description": "Task assignee (for update)"
                 }
             },
             "required": ["action"]
@@ -1070,6 +1078,19 @@ def handle_core_tool(tool_name: str, args: dict) -> dict:
             tasks.append(task)
             tasks_file.write_text(json.dumps({"tasks": tasks}, indent=2))
             return {"task": task}
+        elif action == "update":
+            task_id = args.get("id", "")
+            for task in tasks:
+                if task["id"] == task_id:
+                    changed = {k: args[k] for k in ("status", "title", "notes", "assignee")
+                               if args.get(k) is not None}
+                    if not changed:
+                        return {"error": "Nothing to update: give status, title, notes or assignee"}
+                    task.update(changed)
+                    task["updated_at"] = datetime.now(timezone.utc).isoformat()
+                    tasks_file.write_text(json.dumps({"tasks": tasks}, indent=2))
+                    return {"task": task}
+            return {"error": f"Task not found: {task_id}"}
         elif action == "complete":
             task_id = args.get("id", "")
             for task in tasks:

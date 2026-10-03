@@ -137,7 +137,8 @@ def test_error_step_fails_turn_without_crashing_server(harness):
 
     run(scenario())
     rows = h.queue_rows("a")
-    assert rows[0]["response"] == "something broke"
+    # An errored turn never surfaces raw CLI text (B8).
+    assert rows[0]["response"] == "The agent hit an error and the turn did not complete."
     assert rows[1]["response"] == "fine"
 
 
