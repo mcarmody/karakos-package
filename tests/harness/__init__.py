@@ -200,6 +200,15 @@ class Harness:
         path = self.log_dir / f"{self.session_id(shard)}.argv.json"
         return json.loads(path.read_text()) if path.exists() else None
 
+    def io(self, shard):
+        """Parsed <session>.io.jsonl the fake wrote in queued-stdin mode: every
+        stdin line (dir "in") and emitted event (dir "out") with seconds since
+        the fake started, in the recorded fixtures' {"t","dir","event"} shape."""
+        path = self.log_dir / f"{self.session_id(shard)}.io.jsonl"
+        if not path.exists():
+            return []
+        return [json.loads(l) for l in path.read_text().splitlines() if l]
+
     def queue_rows(self, shard):
         return self._query(
             "SELECT * FROM message_queue WHERE agent = ? ORDER BY id", (shard,))
