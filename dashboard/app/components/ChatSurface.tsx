@@ -13,7 +13,7 @@ import remarkGfm from "remark-gfm";
 import { usePoll } from "@/lib/hooks";
 import ConversationMetricsBadge from "@/app/components/ConversationMetricsBadge";
 import { buildSessionList, defaultSessionName, friendlyName, type SessionOption } from "@/lib/sessionRoster";
-import { isPassResponse, type ChatAttachment } from "@/lib/chatMessage";
+import { isPassResponse, terminalStatusMessage, type ChatAttachment } from "@/lib/chatMessage";
 import { isAtBottom, shouldFollow, onScrollState } from "@/lib/chatScroll";
 import SessionPicker from "@/app/components/SessionPicker";
 
@@ -87,6 +87,8 @@ interface ChatMessage {
    * all still ends, and that silence is the case the rule exists for.
    */
   turnEndedAt?: string;
+  /** role: "assistant" only — non-complete terminal status banner text (crashed / skipped / ...). */
+  terminalNote?: string;
   /** Files sent with a user message (discordParity surfaces). */
   attachments?: ChatAttachment[];
   /** role: "sys" only — the command and its args, for the slip's echo line. */
@@ -1319,6 +1321,16 @@ export default function ChatSurface({ agent: pinnedAgent, variant = "page", disc
                 : m
             )
           );
+          // Surface a non-complete terminal status (crashed / skipped / ...)
+          // instead of letting it render like a clean finish.
+          const note = terminalStatusMessage(payload.status, payload.error);
+          if (note) {
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.role === "assistant" && m.messageId === messageId ? { ...m, terminalNote: note } : m
+              )
+            );
+          }
           // Belt-and-braces: if buffering ate the chunk events, the server
           // row still has the full text — patch the bubble from it.
           void reconcileMessage(messageId);
@@ -1590,6 +1602,19 @@ export default function ChatSurface({ agent: pinnedAgent, variant = "page", disc
               {body}
             </ReactMarkdown>
           </FinalAnswer>
+        );
+      }
+
+      if (msg.terminalNote) {
+        main.push(
+          <div
+            key={`terminal-note-${i}`}
+            role="alert"
+            data-testid="terminal-status-note"
+            style={{ fontSize: 12, color: "var(--warn)", padding: "4px 0" }}
+          >
+            {msg.terminalNote}
+          </div>
         );
       }
 

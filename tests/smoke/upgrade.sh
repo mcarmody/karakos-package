@@ -95,7 +95,7 @@ if [ -n "${KARAKOS_SMOKE_IMAGE_TAR:-}" ]; then
   docker tag "$loaded" "$NEW_IMAGE"
 else
   git -C "$REPO" archive HEAD | tar -x -C "$SMOKE_WORK" --one-top-level=head-src
-  (cd "$SMOKE_WORK/head-src" && docker build --build-arg DASHBOARD_REF="$(cat dashboard.ref)" -t "$NEW_IMAGE" .)
+  (cd "$SMOKE_WORK/head-src" && docker build -t "$NEW_IMAGE" .)
 fi
 claude_path() { docker run --rm --entrypoint sh "$1" -c 'command -v claude'; }
 OLD_CLAUDE="$(claude_path "$OLD_IMAGE")"; NEW_CLAUDE="$(claude_path "$NEW_IMAGE")"

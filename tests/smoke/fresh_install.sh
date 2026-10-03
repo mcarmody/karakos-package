@@ -67,7 +67,7 @@ if [ -n "${KARAKOS_SMOKE_IMAGE_TAR:-}" ]; then
   [ -n "$loaded" ] || { echo "no image in $KARAKOS_SMOKE_IMAGE_TAR" >&2; exit 1; }
   docker tag "$loaded" "$IMAGE"
 else
-  docker build --build-arg DASHBOARD_REF="$(cat dashboard.ref)" -t "$IMAGE" .
+  docker build -t "$IMAGE" .
 fi
 
 # The path is resolved per image, not assumed (a Node global CLI usually lands in /usr/bin).

@@ -352,11 +352,11 @@ def test_every_job_has_a_timeout():
 
 def test_release_gate_missing_secrets_behave_as_stated():
     gate = load("release-gate.yml")["jobs"]
-    build = json.dumps(gate["build-image"])
-    # DASHBOARD_FETCH_TOKEN absent: skip with a warning, never fail (as 5.3's docker-smoke does)
-    assert "::warning::DASHBOARD_FETCH_TOKEN" in build and "exit 1" not in build
-    assert gate["fresh-install-smoke"]["if"] == "needs.build-image.outputs.built == 'true'"
-    assert gate["upgrade-smoke"]["if"] == "needs.build-image.outputs.built == 'true'"
+    # The dashboard is in-repo: no secret, so the image build and both Docker smokes never skip.
+    for name in ("build-image", "fresh-install-smoke", "upgrade-smoke"):
+        assert "if" not in gate[name], name
+    for wf in WORKFLOWS.glob("*.yml"):
+        assert "DASHBOARD_FETCH_TOKEN" not in wf.read_text(), wf.name
     # CLAUDE_CODE_OAUTH_TOKEN absent: skip on a PR, fail otherwise
     real = json.dumps(gate["real-cli-smoke"])
     assert "= pull_request" in real and "exit 1" in real
