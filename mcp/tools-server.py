@@ -67,7 +67,7 @@ CORE_TOOLS = [
     },
     {
         "name": "session",
-        "description": "Session lifecycle management. Actions: finalize (generate summary), load_last (retrieve checkpoint).",
+        "description": "Session lifecycle. Actions: finalize (ask for a fresh session; the reset happens at the end of this turn and a handoff note you write is given to the new session), load_last (the pending handoff note, if any).",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -78,7 +78,7 @@ CORE_TOOLS = [
                 },
                 "agent": {
                     "type": "string",
-                    "description": "Agent to finalize. Defaults to the calling agent (KARAKOS_AGENT)."
+                    "description": "Shard to act on. Defaults to the calling shard (KARAKOS_SHARD, else KARAKOS_AGENT)."
                 }
             },
             "required": ["action"]
@@ -807,43 +807,28 @@ def handle_core_tool(tool_name: str, args: dict) -> dict:
     elif tool_name == "session":
         action = args.get("action", "load_last")
         if action == "finalize":
-            # summarize-session.py declares `agent` as a REQUIRED positional.
-            # Calling it bare exited 2 on argparse every time (#148), which
-            # surfaced here only as an empty "output" because stderr was
-            # dropped. Identity comes from KARAKOS_AGENT, which
-            # bin/agent-server.py sets on the agent subprocess this server
-            # is a child of — the same source ask_user uses.
-            agent = (args.get("agent") or KARAKOS_SHARD or KARAKOS_AGENT).strip()
-            if not agent:
+            # "I want a fresh session." The server resets this shard at the end
+            # of the current turn, after a handoff note written by this session.
+            # Identity is the shard id the server set on the agent subprocess
+            # (KARAKOS_SHARD, else KARAKOS_AGENT), the same source ask_user uses.
+            shard = (args.get("agent") or KARAKOS_SHARD or KARAKOS_AGENT).strip()
+            if not shard:
                 return {"error": "No agent identity (KARAKOS_AGENT unset); "
-                                 "cannot finalize a session"}
-            try:
-                result = subprocess.run(
-                    ["python3", str(WORKSPACE / "bin" / "summarize-session.py"), agent],
-                    capture_output=True, text=True, timeout=30, cwd=str(WORKSPACE)
-                )
-                if result.returncode != 0:
-                    return {"status": "error", "agent": agent,
-                            "output": result.stdout.strip(),
-                            "error": result.stderr.strip() or
-                                     f"summarize-session.py exited {result.returncode}"}
-                return {"status": "ok", "agent": agent,
-                        "output": result.stdout.strip()}
-            except Exception as e:
-                return {"error": str(e)}
+                                 "cannot request a fresh session"}
+            status, body = agent_server_request(
+                "POST", f"/agents/{shard}/session/finalize", {}, timeout=10)
+            if status != 200:
+                return {"status": "error", "agent": shard,
+                        "error": body.get("error") or f"agent server returned {status}"}
+            return body
         elif action == "load_last":
-            # Check for session summary files
-            data_dir = WORKSPACE / "data"
-            summaries = sorted(data_dir.glob("last-session-summary-*.md"))
-            if summaries:
-                latest = summaries[-1]
-                age_hours = (time.time() - latest.stat().st_mtime) / 3600
-                return {
-                    "status": "success",
-                    "summary": latest.read_text(),
-                    "age_hours": round(age_hours, 1),
-                    "path": str(latest),
-                }
+            # The pending handoff note for this shard, if one is on disk.
+            shard = (args.get("agent") or KARAKOS_SHARD or KARAKOS_AGENT).strip()
+            path = WORKSPACE / "data" / "handoff" / f"{shard}.md"
+            if shard and path.is_file():
+                age_hours = (time.time() - path.stat().st_mtime) / 3600
+                return {"status": "success", "summary": path.read_text(),
+                        "age_hours": round(age_hours, 1), "path": str(path)}
             return {"status": "not_found"}
 
     elif tool_name == "schedule":

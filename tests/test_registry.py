@@ -140,7 +140,11 @@ def test_legacy_view_equals_conftest_dict(legacy_workspace):
         "monitor": {"name": "monitor", "role": "monitor"}}}
     reg = parse_registry(data, {"general", "signals"})
     view = reg.legacy_view()
-    assert view["agents"]["test-agent"] == old["agents"]["test-agent"]
+    # handoff_on_reset is always written (effective value, 2.6); a primary
+    # that never set it gets the carry-over.
+    got = dict(view["agents"]["test-agent"])
+    assert got.pop("handoff_on_reset") is True
+    assert got == old["agents"]["test-agent"]
 
 
 def test_legacy_view_full_keys():
@@ -149,7 +153,8 @@ def test_legacy_view_full_keys():
         discord={"token_env": "T", "bot_id_env": "I"}))
     h = parse_registry(data, CHANNELS).legacy_view()["agents"]["helper"]
     assert h == {"model": "haiku", "max_turns": 5, "allowed_tools": ["Read"],
-                 "env": {"A": "b"}, "discord_bot_token_env": "T", "discord_bot_id_env": "I"}
+                 "env": {"A": "b"}, "handoff_on_reset": True,
+                 "discord_bot_token_env": "T", "discord_bot_id_env": "I"}
 
 
 NEW = {"name": "New", "role": "builder", "model": "haiku"}
@@ -221,7 +226,7 @@ def test_cli(tmp_path):
     assert (r.returncode, r.stdout.strip()) == (0, "relay")
     r = run_cli(ws, "field", "amos", "model")
     assert (r.returncode, r.stdout.strip()) == (0, "opus")
-    assert run_cli(ws, "field", "amos", "handoff_on_reset").stdout.strip() == "false"
+    assert run_cli(ws, "field", "amos", "handoff_on_reset").stdout.strip() == "true"
     assert run_cli(ws, "validate").returncode == 0
     assert run_cli(ws, "field", "ghost", "model").returncode == 1
     assert run_cli(ws, "field", "amos", "bogus").returncode == 1
@@ -263,3 +268,58 @@ def test_monitor_cannot_have_a_budget_and_legacy_view_copies_both():
     legacy = reg.legacy_view()["agents"]["helper"]
     assert legacy["token_budget_4h"] == 5000 and legacy["token_budget_min_pause_s"] == 600
     assert "token_budget_4h" not in reg.legacy_view()["agents"]["amos"]
+
+
+# -- step 2.6: context budget, reset mode, handoff default by role ------------
+
+def _with26(agent, **kw):
+    return mutated(lambda d: d["agents"][agent].update(**kw))
+
+
+def test_handoff_on_reset_effective_default_by_role():
+    reg = parse_registry(VALID, CHANNELS)
+    assert reg.agent("amos").get("handoff_on_reset") is True      # primary
+    assert reg.agent("helper").get("handoff_on_reset") is True    # custom
+    assert reg.agent("relay").get("handoff_on_reset") is False    # monitor
+    data = copy.deepcopy(VALID)
+    data["agents"]["bld"] = {"name": "Bld", "role": "builder"}
+    data["agents"]["rev"] = {"name": "Rev", "role": "reviewer"}
+    reg = parse_registry(data, CHANNELS)
+    assert reg.agent("bld").get("handoff_on_reset") is False
+    assert reg.agent("rev").get("handoff_on_reset") is False
+
+
+def test_handoff_on_reset_explicit_wins():
+    reg = parse_registry(_with26("amos", handoff_on_reset=False), CHANNELS)
+    assert reg.agent("amos").get("handoff_on_reset") is False
+    assert reg.legacy_view()["agents"]["amos"]["handoff_on_reset"] is False
+    data = copy.deepcopy(VALID)
+    data["agents"]["bld"] = {"name": "Bld", "role": "builder", "handoff_on_reset": True}
+    assert parse_registry(data, CHANNELS).legacy_view()["agents"]["bld"]["handoff_on_reset"] is True
+
+
+def test_context_budget_validation():
+    for bad in (19999, 0, -5, "big", True, 1.5):
+        assert problems(_with26("amos", context_budget_tokens=bad)), bad
+    assert parse_registry(_with26("amos", context_budget_tokens=20000), CHANNELS)
+    assert parse_registry(_with26("amos", context_budget_tokens=None), CHANNELS)
+    reg = parse_registry(_with26("amos", context_budget_tokens=2000000), CHANNELS)
+    assert any("context_budget_tokens" in w for w in reg.warnings)
+    reg = parse_registry(_with26("amos", context_budget_tokens=500000), CHANNELS)
+    assert not any("context_budget_tokens" in w for w in reg.warnings)
+
+
+def test_reset_mode_enum():
+    assert parse_registry(VALID, CHANNELS).agent("amos").get("reset_mode") == "reset"
+    assert parse_registry(_with26("amos", reset_mode="compact"), CHANNELS)
+    assert problems(_with26("amos", reset_mode="nuke"))
+
+
+def test_legacy_view_carries_budget_mode_and_handoff():
+    reg = parse_registry(_with26("amos", context_budget_tokens=50000,
+                                 reset_mode="compact", handoff_on_reset=False), CHANNELS)
+    a = reg.legacy_view()["agents"]["amos"]
+    assert (a["context_budget_tokens"], a["reset_mode"], a["handoff_on_reset"]) == \
+        (50000, "compact", False)
+    plain = parse_registry(VALID, CHANNELS).legacy_view()["agents"]["amos"]
+    assert "context_budget_tokens" not in plain and "reset_mode" not in plain

@@ -44,8 +44,10 @@ def make(tmp_path, legacy=LEGACY, channels=CHANNELS, settings=True):
 
 
 def _no_prompt(agents):
-    """legacy_view minus the prompt flags the migration adds."""
-    return {a: {k: v for k, v in e.items() if k != "prompt"} for a, e in agents.items()}
+    """legacy_view minus the prompt flags the migration adds and the effective
+    handoff_on_reset (2.6 always writes it)."""
+    return {a: {k: v for k, v in e.items() if k not in ("prompt", "handoff_on_reset")}
+            for a, e in agents.items()}
 
 
 def migrate(ws):

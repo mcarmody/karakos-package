@@ -104,6 +104,7 @@ class TurnResult:
     wall: Optional[str] = None
     suppress_post: bool = False
     followups: List[Callable] = field(default_factory=list)
+    raw_response_text: str = ""   # before an errored turn's text is replaced (2.6)
 
 
 class ServerState:
@@ -563,6 +564,7 @@ async def finish_turn(state: ServerState, shard: str, result: TurnResult):
     # the channel; the server log keeps a redacted copy and the row is
     # marked failed rather than complete.
     final_status = state.STATUS_COMPLETE
+    result.raw_response_text = response_text
     if metadata and metadata.get("is_error"):
         state.log.error(f"{agent} turn ended with is_error; raw result (redacted): "
                         f"{state.redact_for_log(response_text, 500)!r}")
