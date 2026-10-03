@@ -101,6 +101,56 @@ async def claim_batch(db, shard, limit, now=None) -> list:
     return sorted(rows, key=lambda r: (-(r["priority"] or 0), r["created_at"], r["id"]))
 
 
+async def fail_calls(db, shard, code, detail="") -> int:
+    """Answer every queued call row addressed to `shard` with an error reply
+    row {"call_id", "error": code, "detail"} (same insert `expire` uses) and
+    skip the call row (`response = code`). Returns the count."""
+    rows = await db.execute_fetchall(
+        "UPDATE message_queue SET processed = ?, response = ?,"
+        " processed_at = CURRENT_TIMESTAMP"
+        " WHERE agent = ? AND processed = ? AND call_id IS NOT NULL"
+        " RETURNING id, call_id, reply_to_agent",
+        (STATUS_SKIPPED, code, shard, STATUS_QUEUED))
+    for r in rows:
+        if r["reply_to_agent"]:
+            await db.execute(
+                "INSERT OR IGNORE INTO message_queue"
+                " (agent, channel, channel_id, server, author, author_id, is_bot,"
+                "  content, message_id, call_id, owner_agent)"
+                " VALUES (?, 'call', '0', 'local', ?, '0', 1, ?, ?, ?, ?)",
+                (r["reply_to_agent"], shard,
+                 json.dumps({"call_id": r["call_id"], "error": code, "detail": detail}),
+                 f"{code}-{r['call_id']}-{r['id']}", r["call_id"],
+                 r["reply_to_agent"]))
+    await db.commit()
+    for target in {r["reply_to_agent"] for r in rows if r["reply_to_agent"]}:
+        notify(target)
+    return len(rows)
+
+
+async def peek_claimable(db, shard, limit=20, now=None) -> list:
+    """The rows the next `claim_batch(db, shard, limit)` would claim, without
+    claiming them: same predicates and ordering, no UPDATE, and no expiry side
+    effects (an already-expired row is simply left out, as claim_batch's
+    expire step would have skipped it first)."""
+    live = " AND (expires_at IS NULL OR expires_at >= ?)"
+    now = utc_iso(now)
+    async with db.execute(
+        f"SELECT id, call_id FROM message_queue WHERE agent = ? AND processed = ?{live}"
+        f" ORDER BY {_ORDER} LIMIT 1", (shard, STATUS_QUEUED, now)) as cur:
+        head = await cur.fetchone()
+    if head is None:
+        return []
+    if head["call_id"] is not None:
+        return list(await db.execute_fetchall(
+            "SELECT * FROM message_queue WHERE id = ?", (head["id"],)))
+    rows = await db.execute_fetchall(
+        f"SELECT * FROM message_queue WHERE agent = ? AND processed = ?"
+        f" AND call_id IS NULL{live} ORDER BY {_ORDER} LIMIT ?",
+        (shard, STATUS_QUEUED, now, limit))
+    return sorted(rows, key=lambda r: (-(r["priority"] or 0), r["created_at"], r["id"]))
+
+
 async def release(db, ids) -> int:
     """Return claimed rows to the queue (still-in-progress only)."""
     ids = list(ids)

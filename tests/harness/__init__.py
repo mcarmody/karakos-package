@@ -159,6 +159,16 @@ class Harness:
         assert resp.status == 202, await resp.text()
         return await resp.json()
 
+    async def poke(self, shard, source, text, channel_id="0"):
+        """Post a machine-started row the way bin/poke.sh does: is_bot true,
+        server local, author = the --source label."""
+        resp = await self.client.post(
+            "/message", headers=self._headers(),
+            json={"agent": shard, "content": text, "channel_id": channel_id,
+                  "server": "local", "author": source, "is_bot": True})
+        assert resp.status == 202, await resp.text()
+        return await resp.json()
+
     async def interrupt(self, agent):
         resp = await self.client.post(f"/agents/{agent}/interrupt",
                                       headers=self._headers())

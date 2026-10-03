@@ -40,10 +40,12 @@ import ask_handler  # noqa: E402
 import msgqueue  # noqa: E402
 import registry as agent_registry  # noqa: E402
 import prompt_compose  # noqa: E402
+import rate_limits  # noqa: E402
 import shards as shards_lib  # noqa: E402
 import spawn_env as spawn_env_lib  # noqa: E402
 import tengwar  # noqa: E402
 import turn_loop  # noqa: E402
+import usage_gate  # noqa: E402
 from lib.migrate.guard import require_stamp  # noqa: E402
 
 # =============================================================================
@@ -252,6 +254,9 @@ agent_turn_context: Dict[str, Dict[str, Any]] = {}
 AGENT_TOKENS: Dict[str, str] = {}
 DISCORD_ID_TO_AGENT: Dict[int, str] = {}
 
+# agent id -> registry role; the usage gate never gates a `monitor`.
+agent_roles: Dict[str, str] = {}
+
 # Graceful shutdown flag
 shutting_down = False
 
@@ -357,20 +362,28 @@ async def init_db():
         )
     """)
 
-    # Rate-limit state table. One row per agent, overwritten — this is a
-    # current-headroom reading, not a history, and the CLI resends it.
+    # Rate-limit state table. Account-level: one row per window type
+    # (`five_hour`, `seven_day`, ...), never per agent or shard (spec 2.7). A
+    # current-headroom reading, not a history; the CLI resends it. Upgraded
+    # installs are re-keyed by the 35_rate_limit migrator step, never by boot.
     await db.execute("""
         CREATE TABLE IF NOT EXISTS rate_limit_state (
-            agent TEXT PRIMARY KEY,
+            rate_limit_type TEXT PRIMARY KEY,
             status TEXT,
-            rate_limit_type TEXT,
             resets_at INTEGER,
             overage_status TEXT,
             is_using_overage INTEGER DEFAULT 0,
+            utilization REAL,
             alerted_for_resets_at INTEGER,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    async with db.execute("PRAGMA table_info(rate_limit_state)") as cursor:
+        rl_pk = [row[1] for row in await cursor.fetchall() if row[5]]
+    if rl_pk != ["rate_limit_type"]:
+        await db.close()
+        raise SystemExit(
+            "rate_limit_state is still keyed by agent; run: karakos migrate")
 
     await db.execute(TURN_EVENTS_DDL)
     await db.execute(
@@ -428,6 +441,8 @@ async def load_config():
         for w in reg.warnings:
             log.warning(f"registry: {w}")
         agent_config = reg.legacy_view()["agents"]
+        agent_roles.clear()
+        agent_roles.update({a.id: a.role for a in reg.agents()})
         _set_shard_specs(shards_lib.plan_shards(reg))
         log.info(f"Loaded configuration for {len(agent_config)} agents "
                  f"({len(shard_specs)} shards)")
@@ -1385,61 +1400,46 @@ async def record_rate_limit_event(agent: str, info, now=None) -> None:
     if not isinstance(info, dict) or not info:
         return
 
-    status = info.get("status")
-    resets_at = info.get("resetsAt")
-    resets_at = int(resets_at) if isinstance(resets_at, (int, float)) else None
+    updates = rate_limits.parse_event(info, now=now)
+    await rate_limits.upsert_windows(db, updates, now)
+    usage_gate.update_breaker(STATE, await usage_gate.read_rate_rows(STATE))
 
-    async with db.execute(
-        "SELECT alerted_for_resets_at FROM rate_limit_state WHERE agent = ?", (agent,)
-    ) as cursor:
-        prior = await cursor.fetchone()
-    already_alerted = prior["alerted_for_resets_at"] if prior else None
-
-    await db.execute(
-        """
-        INSERT INTO rate_limit_state
-            (agent, status, rate_limit_type, resets_at, overage_status,
-             is_using_overage, alerted_for_resets_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-        ON CONFLICT(agent) DO UPDATE SET
-            status = excluded.status,
-            rate_limit_type = excluded.rate_limit_type,
-            resets_at = excluded.resets_at,
-            overage_status = excluded.overage_status,
-            is_using_overage = excluded.is_using_overage,
-            updated_at = CURRENT_TIMESTAMP
-        """,
-        (agent, status, info.get("rateLimitType"), resets_at,
-         info.get("overageStatus"), int(bool(info.get("isUsingOverage"))),
-         already_alerted)
-    )
-    await db.commit()
-
-    progress = rate_limit_window_progress(info, now=now)
-    should_alert = (
-        status in RATE_LIMIT_ALERT_STATUSES
-        or (progress is not None and progress >= RATE_LIMIT_ALERT_FRACTION)
-    )
-    if not should_alert:
-        return
-    if resets_at is not None and already_alerted == resets_at:
-        return  # already said so for this window
-
-    await db.execute(
-        "UPDATE rate_limit_state SET alerted_for_resets_at = ? WHERE agent = ?",
-        (resets_at, agent)
-    )
-    await db.commit()
-
-    consumed = "in the warning band" if progress is None else f"{progress * 100:.0f}% through the window"
-    log.warning(f"{agent} rate-limit headroom low: status={status}, {consumed}")
-
-    channel_id = RATE_LIMIT_ALERT_CHANNEL_ID
-    if channel_id and channel_id != "0":
-        await post_to_discord(
-            agent, channel_id,
-            f"⚠️ `{agent}` rate-limit headroom low — status `{status}`, {consumed}."
+    # `agent` is only wording below: the limit belongs to the account.
+    for u in updates:
+        progress = rate_limit_window_progress(
+            {"resetsAt": u.resets_at, "rateLimitType": u.type}, now=now)
+        should_alert = (
+            u.status in RATE_LIMIT_ALERT_STATUSES
+            or (progress is not None and progress >= RATE_LIMIT_ALERT_FRACTION)
         )
+        if not should_alert:
+            continue
+        resets_at = int(u.resets_at) if u.resets_at is not None else None
+        async with db.execute(
+            "SELECT alerted_for_resets_at FROM rate_limit_state"
+            " WHERE rate_limit_type = ?", (u.type,)
+        ) as cursor:
+            prior = await cursor.fetchone()
+        if resets_at is not None and prior and prior["alerted_for_resets_at"] == resets_at:
+            continue  # already said so for this window
+
+        await db.execute(
+            "UPDATE rate_limit_state SET alerted_for_resets_at = ?"
+            " WHERE rate_limit_type = ?", (resets_at, u.type))
+        await db.commit()
+
+        consumed = ("in the warning band" if progress is None
+                    else f"{progress * 100:.0f}% through the window")
+        log.warning(f"{agent} rate-limit headroom low: type={u.type}, "
+                    f"status={u.status}, {consumed}")
+
+        channel_id = RATE_LIMIT_ALERT_CHANNEL_ID
+        if channel_id and channel_id != "0":
+            await post_to_discord(
+                agent, channel_id,
+                f"⚠️ rate-limit headroom low on the `{u.type}` window "
+                f"(seen by `{agent}`) — status `{u.status}`, {consumed}."
+            )
 
 
 # =============================================================================
@@ -2409,6 +2409,13 @@ async def handle_health(request):
         "dead_letter_path": str(DEAD_LETTER_PATH),
     })
 
+def _paused_entry(shard):
+    """null, or {reason, until} while the usage gate is deferring this shard."""
+    gate = getattr(STATE, "usage_gate", None)
+    p = gate.paused.get(shard) if gate else None
+    return {"reason": p[0], "until": p[1]} if p else None
+
+
 async def handle_agents(request):
     """GET /agents - List agents"""
     # Check bearer token
@@ -2441,6 +2448,7 @@ async def handle_agents(request):
                 "context_tokens": ctx_by_shard.get(sp.id, 0),
                 "channels": list(sp.channels),
                 "last_channel": agent_last_channel.get(sp.id),
+                "paused": _paused_entry(sp.id),
             })
         agents_list.append({
             "name": agent,
@@ -2863,12 +2871,19 @@ async def handle_usage(request):
     if not auth_header.startswith("Bearer ") or auth_header[7:] != AGENT_SERVER_TOKEN:
         return web.json_response({"error": "Unauthorized"}, status=401)
 
-    async with db.execute("SELECT * FROM rate_limit_state") as cursor:
-        rows = {row["agent"]: row for row in await cursor.fetchall()}
+    report = await usage_gate.usage_report(STATE)
+    rows = report.pop("_rows")
+    now = time.time()
+    # A limit is an account fact: every agent shows the account's worst window
+    # (a rejected type first, else the nearest reset).
+    def _rank(r):
+        reset = r["resets_at"]
+        future = isinstance(reset, (int, float)) and reset > now
+        return (r["status"] != "rejected", not future, reset if future else 0)
+    row = min(rows, key=_rank) if rows else None
 
     agents = {}
     for name in agent_config:
-        row = rows.get(name)
         info = {
             "resetsAt": row["resets_at"],
             "rateLimitType": row["rate_limit_type"],
@@ -2886,8 +2901,13 @@ async def handle_usage(request):
             "summary": format_usage_report(row),
             "updated_at": row["updated_at"] if row else None,
         }
+    for t, w in report["windows"].items():
+        r = next(x for x in rows if x["rate_limit_type"] == t)
+        p = rate_limit_window_progress(
+            {"resetsAt": r["resets_at"], "rateLimitType": t})
+        w["percent_of_window_used"] = round(p * 100, 1) if p is not None else None
 
-    return web.json_response({"agents": agents})
+    return web.json_response({"agents": agents, **report})
 
 
 async def handle_cost_get_all(request):
@@ -3256,6 +3276,9 @@ async def startup(app):
 
     # Load configuration
     await load_config()
+
+    # Account breaker, token budget and weekly governor (spec 2.7).
+    usage_gate.install(STATE)
 
     # Initialize locks and state for every shard before any spawn.
     for sid in STATE.shard_ids():

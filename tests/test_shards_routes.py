@@ -64,7 +64,7 @@ def test_agents_and_health_shapes(harness):
     assert [s["id"] for s in a["shards"]] == ["a", "a-2"]
     assert a["shards"][0]["is_default"] is True and a["shards"][1]["is_default"] is False
     assert set(a["shards"][1]) == {"id", "is_default", "state", "alive", "pid", "session_id",
-                                   "queue_depth", "context_tokens", "channels", "last_channel"}
+                                   "queue_depth", "context_tokens", "channels", "last_channel", "paused"}
     assert a["shards"][1]["state"] == "PROCESSING" and a["shards"][0]["state"] == "IDLE"
     assert a["shards"][1]["last_channel"] == "55"
     assert len(a["shards"][1]["session_id"]) == 8
@@ -290,7 +290,8 @@ def test_no_schema_change_and_no_new_migrator_step(harness):
 
     run(scenario())
     steps = sorted(p.name for p in (PACKAGE_ROOT / "lib" / "migrate" / "steps").glob("*.py"))
-    assert steps == ["00_noop.py", "10_registry.py", "20_queue.py", "30_sessions.py", "__init__.py"]
+    assert steps == ["00_noop.py", "10_registry.py", "20_queue.py", "30_sessions.py",
+                     "35_rate_limit.py", "__init__.py"]  # 2.7 adds 35
     cols = {t: [r["name"] for r in h._query(f"PRAGMA table_info({t})")]
             for t in ("sessions", "message_queue", "cost_events")}
     assert "owner_agent" in cols["message_queue"]  # 1.2's column, not 2.1's
