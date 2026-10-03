@@ -54,6 +54,7 @@ import turn_loop  # noqa: E402
 import usage_gate  # noqa: E402
 import operator_pause  # noqa: E402
 import runtime_overrides  # noqa: E402
+import redact  # noqa: E402
 from lib.migrate.guard import require_stamp  # noqa: E402
 
 # =============================================================================
@@ -883,6 +884,7 @@ async def start_agent_subprocess(shard: str):
         spawn_env = {**os.environ, **spawn_env_lib.resolve_agent_env(env_overrides, os.environ, agent), **extra}
     else:
         spawn_env = spawn_env_lib.build_subprocess_env(os.environ, env_overrides, extra)
+    redact.register_literals(spawn_env)     # secret values, masked wherever they appear
     if env_overrides:
         log.info(f"{label} env overrides: {sorted(env_overrides.keys())}")
 
@@ -2221,7 +2223,9 @@ def describe_tool_call(tool_name: str, tool_input: Optional[Dict]) -> str:
     unknown tool degrades to the bare name rather than dumping its input —
     tool inputs carry file contents, patch bodies and credentials, and this
     reaches both a Discord channel (#91) and the dashboard chat page. Both
-    surfaces go through here so neither can be redacted less than the other.
+    surfaces go through here so neither can be redacted less than the other:
+    the chosen detail is masked (lib/redact.py) before it is truncated, so a
+    token is not cut in half and left unmatched.
     """
     name = str(tool_name or "unknown")
     detail = ""
@@ -2237,7 +2241,7 @@ def describe_tool_call(tool_name: str, tool_input: Optional[Dict]) -> str:
                 break
 
     if detail:
-        detail = " ".join(detail.split())
+        detail = redact.redact_text(" ".join(detail.split()))
         if len(detail) > TOOL_EVENT_DETAIL_CHARS:
             detail = detail[:TOOL_EVENT_DETAIL_CHARS - 1].rstrip() + "…"
         # Backticks and newlines would break out of the subtext line.
@@ -2269,6 +2273,7 @@ async def write_turn_event(message_ids: List[str], seq: int, kind: str, content:
     """
     if not message_ids or db is None:
         return
+    content = redact.redact_text(content)
     try:
         def job(conn):
             try:
@@ -2390,24 +2395,14 @@ def _open_stream_log(agent: str):
     return open(path, "ab", buffering=0), now.strftime("%Y-%m-%d"), path
 
 
-_REDACT_PATTERNS = (
-    re.compile(r"(?:sk|pk|xox[a-z]|gh[pousr]|glpat)[-_][A-Za-z0-9_\-]{10,}"),
-    re.compile(r"(?i)\b(bearer|token|api[_-]?key|secret|password)([\"'\s:=]+)[^\s\"',}]{6,}"),
-    re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]*"),
-)
-
-
 def redact_for_log(text, limit: int = 200) -> str:
-    """Truncate and mask credential-shaped strings before text reaches the log.
+    """Mask credential-shaped strings, then truncate (a token must not be cut
+    in half and escape the patterns). lib/redact.py owns the pattern list.
 
     Raw CLI output (a garbled stream line, an auth failure body) can carry
     tokens. This is a best-effort mask, not a guarantee.
     """
-    out = str(text if text is not None else "")[:limit]
-    out = _REDACT_PATTERNS[0].sub("[redacted]", out)
-    out = _REDACT_PATTERNS[1].sub(lambda m: f"{m.group(1)}{m.group(2)}[redacted]", out)
-    out = _REDACT_PATTERNS[2].sub("[redacted]", out)
-    return out
+    return redact.redact_text(str(text if text is not None else ""))[:limit]
 
 
 def write_stream_log(agent: str, line: bytes) -> None:
@@ -2418,6 +2413,13 @@ def write_stream_log(agent: str, line: bytes) -> None:
     never the agent's reply. Nothing here raises.
     """
     if not line:
+        return
+    # The tee is masked; the event the loop parses and acts on is the original.
+    # A redaction failure costs the line, never the reply.
+    try:
+        line = redact.redact_line(line)
+    except Exception as e:
+        log.debug(f"stream log redaction failed: {e}")
         return
     if not line.endswith(b"\n"):
         line = line + b"\n"
@@ -4805,6 +4807,8 @@ async def startup(app):
     require_stamp(WORKSPACE_ROOT / "data")
 
     log.info("Starting Karakos Agent Server")
+
+    redact.register_literals(os.environ)
 
     # Hive first, so its on_turn_end precedes every other turn hook.
     register_hive_hooks()
