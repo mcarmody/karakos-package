@@ -40,7 +40,8 @@ CREATE TABLE IF NOT EXISTS outbox(
   status TEXT NOT NULL CHECK(status IN ('pending','sending','delivered','dead','discarded')),
   chunks_total INTEGER, chunks_done INTEGER DEFAULT 0, message_ids TEXT DEFAULT '[]',
   attempts INTEGER DEFAULT 0, next_attempt_at REAL, last_status INTEGER,
-  last_error TEXT, dead_reason TEXT, content_sha TEXT NOT NULL);
+  last_error TEXT, dead_reason TEXT, content_sha TEXT NOT NULL,
+  queue_message_id TEXT);
 CREATE INDEX IF NOT EXISTS idx_outbox_due ON outbox(status, next_attempt_at);
 CREATE INDEX IF NOT EXISTS idx_outbox_chan ON outbox(agent, channel_id, created_at);
 CREATE TABLE IF NOT EXISTS outbox_events(
@@ -72,6 +73,12 @@ def content_sha(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
 
 
+def ensure_column(conn, table, column, decl):
+    """Add `column` to `table` if an older build created the table without it."""
+    if column not in {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
+
 def open_store(path) -> sqlite3.Connection:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -84,6 +91,8 @@ def open_store(path) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")
     conn.executescript(SCHEMA)
+    ensure_column(conn, "outbox", "queue_message_id", "TEXT")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_outbox_qmid ON outbox(queue_message_id)")
     conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
     try:
         os.chmod(path, 0o600)
@@ -133,7 +142,7 @@ def _older_active(conn, agent, channel_id):
 
 
 def enqueue(conn, agent, channel_id, content, reply_to=None, flags=0, claimed=False,
-            now=None, content_sha=None, chunks_total=None):
+            now=None, content_sha=None, chunks_total=None, queue_message_id=None):
     """Insert a row. `claimed` (inline owner) is honoured only when no older
     pending/sending row exists for (agent, channel). Returns (id, claimed)."""
     now = _now(now)
@@ -144,10 +153,10 @@ def enqueue(conn, agent, channel_id, content, reply_to=None, flags=0, claimed=Fa
         claimed = bool(claimed) and not _older_active(conn, agent, channel_id)
         conn.execute(
             "INSERT INTO outbox(id, created_at, updated_at, agent, channel_id, reply_to, content,"
-            " flags, status, chunks_total, next_attempt_at, content_sha)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            " flags, status, chunks_total, next_attempt_at, content_sha, queue_message_id)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (rid, now, now, agent, str(channel_id), reply_to, content, flags,
-             "sending" if claimed else "pending", chunks_total, now, sha))
+             "sending" if claimed else "pending", chunks_total, now, sha, queue_message_id))
         _event(conn, rid, "enqueued", now, detail="claimed inline" if claimed else "queued")
         conn.execute("COMMIT")
     except BaseException:
@@ -283,6 +292,16 @@ def stats(conn, now=None) -> dict:
     old = conn.execute("SELECT MIN(created_at) FROM outbox WHERE status IN ('pending','sending')").fetchone()[0]
     counts["oldest_pending_age_s"] = None if old is None else max(now - old, 0.0)
     return counts
+
+
+def find_by_queue_id(conn, queue_message_id):
+    """The outbox row a queue row's reply was enqueued under (stable key, no
+    clock). Newest first if a reply was ever enqueued twice."""
+    if not queue_message_id:
+        return None
+    return _row(conn.execute(
+        "SELECT * FROM outbox WHERE queue_message_id=? ORDER BY created_at DESC LIMIT 1",
+        (str(queue_message_id),)).fetchone())
 
 
 def find_for_reply(conn, agent, channel_id, content_sha, around_ts, window_s=120):

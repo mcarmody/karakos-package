@@ -689,13 +689,14 @@ async def finish_turn(state: ServerState, shard: str, result: TurnResult):
     discord_msg_id = None
     if response_text and channel_id != "0" and not result.suppress_post:
         discord_msg_id = await state.post_to_discord(agent, channel_id, response_text,
-                                                     dead_letter=True)
+                                                     dead_letter=True,
+                                                     queue_message_id=message_ids[0])
 
     # Mark complete
     await state.db.execute(
         f"""
         UPDATE message_queue
-        SET processed = ?, response = ?, discord_response_id = ?, processed_at = CURRENT_TIMESTAMP
+        SET processed = ?, response = ?, discord_response_id = COALESCE(?, discord_response_id), processed_at = CURRENT_TIMESTAMP
         WHERE message_id IN ({','.join('?' * len(message_ids))})
         """,
         (final_status, response_text, discord_msg_id, *message_ids)

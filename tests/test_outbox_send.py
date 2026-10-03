@@ -624,6 +624,83 @@ def test_sweep_leaves_dead_rows_to_the_operator(real_clock):
     assert fake.calls == 0 and out[0][1] is None
 
 
+def _sweep_scenario(ags, fake, steps):
+    """One event loop, one open db: insert a recent COMPLETE row, then run
+    `steps` (async callables taking ags) after each of which state is observable."""
+    ags.http_session = fake
+
+    async def go():
+        await ags.init_db()
+        await ags.db.execute(
+            "INSERT INTO message_queue (agent, channel, channel_id, author, content, message_id,"
+            " processed, response, processed_at) VALUES ('amos','c','55','u','x','m0',2,"
+            " 'the reply', datetime('now', '-1 hours'))")
+        await ags.db.commit()
+        out = []
+        for step in steps:
+            await step(ags)
+            async with ags.db.execute("SELECT discord_response_id FROM message_queue") as c:
+                out.append([r[0] for r in await c.fetchall()])
+        await ags.db.close()
+        return out
+    return asyncio.run(go())
+
+
+async def _sweep_step(a):
+    await a.crash_recovery()
+
+
+def _advance(seconds):
+    async def step(a):
+        a.CLOCK["t"] += seconds
+    return step
+
+
+def test_sweep_does_not_re_enqueue_after_a_long_outage(ags):
+    """A reply the sweep enqueued while Discord was down is found by key on a
+    later boot, however much later: one row, one successful POST."""
+    fake = FakeDiscord([503])
+    _sweep_scenario(ags, fake, [_sweep_step, _advance(600), _sweep_step])
+    (row,) = rows(ags)
+    assert row["queue_message_id"] == "m0" and row["status"] == "pending"
+    assert fake.calls == 1
+    run_pass(ags, advance=3600)
+    assert fake.calls == 2 and rows(ags)[0]["status"] == "delivered"
+    assert [r["queue_message_id"] for r in rows(ags)] == ["m0"]
+
+
+def test_loop_delivery_writes_the_id_back_and_a_later_sweep_posts_nothing(ags):
+    fake = FakeDiscord([503])
+
+    async def loop_pass(a):
+        a.CLOCK["t"] += 3600
+        await a.outbox_pass()
+
+    out = _sweep_scenario(ags, fake, [_sweep_step, loop_pass, _advance(600), _sweep_step])
+    assert out[0] == [None] and out[1] == [["msg-2"]][0]
+    assert out[3] == ["msg-2"]
+    assert fake.calls == 2 and len(rows(ags)) == 1
+
+
+def test_turn_path_enqueue_carries_the_queue_key(ags):
+    src = (PACKAGE_ROOT / "lib" / "turn_loop.py").read_text()
+    call = [c for c in ast.walk(ast.parse(src)) if isinstance(c, ast.Call)
+            and _kwarg(c, "dead_letter") is not None]
+    assert call and all(_kwarg(c, "queue_message_id") is not None for c in call)
+
+
+def test_an_outbox_db_from_an_earlier_build_gains_the_key_column(tmp_path):
+    import sqlite3
+    path = tmp_path / "o.db"
+    old = sqlite3.connect(path)
+    old.executescript(ob.SCHEMA.replace(",\n  queue_message_id TEXT", ""))
+    old.close()
+    conn = ob.open_store(path)
+    assert "queue_message_id" in {r[1] for r in conn.execute("PRAGMA table_info(outbox)")}
+    rid, _ = ob.enqueue(conn, "a", "1", "x", queue_message_id="q1")
+    assert ob.find_by_queue_id(conn, "q1")["id"] == rid and ob.find_by_queue_id(conn, "q2") is None
+
+
 # ---------------------------------------------------------------------------
 # One door: every channel-messages POST is guarded
 # ---------------------------------------------------------------------------

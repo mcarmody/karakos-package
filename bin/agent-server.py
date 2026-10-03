@@ -1827,7 +1827,28 @@ async def outbox_send_row(row: Dict[str, Any]) -> Optional[str]:
         _outbox_notify()
         return None
     outbox_lib.mark_delivered(conn, rid, _outbox_now())
-    return ids[-1] if ids else None
+    last = ids[-1] if ids else None
+    if last and row.get("queue_message_id"):
+        await _writeback_discord_id(row["queue_message_id"], last)
+    return last
+
+
+async def _writeback_discord_id(queue_message_id: str, discord_id: str) -> None:
+    """Record a delivered reply's Discord id on its message_queue row(s), so the
+    crash sweep never sees it as unposted. Best effort: never blocks delivery.
+    Rows of the same turn (same agent, channel, response, processed_at) share
+    the reply, so they are marked together."""
+    try:
+        await db.execute(
+            "UPDATE message_queue SET discord_response_id = ? WHERE discord_response_id IS NULL "
+            "AND (message_id = ? OR (processed_at IS NOT NULL AND (agent, channel_id, response, processed_at) = "
+            "(SELECT agent, channel_id, response, processed_at FROM message_queue "
+            "WHERE message_id = ? AND processed_at IS NOT NULL)))",
+            (discord_id, queue_message_id, queue_message_id))
+        await db.commit()
+    except Exception as e:
+        log.warning(f"Discord outbox: could not write id back for {queue_message_id} "
+                    f"({type(e).__name__}: {e})")
 
 
 async def outbox_pass(now: Optional[float] = None) -> int:
@@ -1890,7 +1911,8 @@ async def outbox_loop() -> None:
 
 async def post_to_discord(agent: str, channel_id: str, content: str,
                           reply_to: Optional[str] = None,
-                          dead_letter: bool = False) -> Optional[str]:
+                          dead_letter: bool = False,
+                          queue_message_id: Optional[str] = None) -> Optional[str]:
     """Post message to Discord as agent, splitting if over 2000 chars.
 
     Empty/whitespace text and a reply that is exactly PASS are never posted
@@ -1905,6 +1927,9 @@ async def post_to_discord(agent: str, channel_id: str, content: str,
     is returned at once, so a fresh reply never overtakes one in backoff. If
     the store is unusable the call falls back to the direct path.
     Delivery is at-least-once, narrowed by a per-chunk nonce.
+    `queue_message_id` is the originating message_queue row; the outbox stores
+    it so the crash sweep finds the reply by key, and delivery writes the
+    Discord id back to that row.
 
     With `dead_letter=False` (tool lines, cost updates, notices) the direct
     path runs: DISCORD_POST_MAX_ATTEMPTS tries per chunk, nothing stored.
@@ -1948,7 +1973,8 @@ async def post_to_discord(agent: str, channel_id: str, content: str,
                 rid, claimed = outbox_lib.enqueue(
                     conn, agent, channel_id, rendered, reply_to=reply_to, claimed=True,
                     now=_outbox_now(), content_sha=outbox_lib.content_sha(content),
-                    chunks_total=len(chunks))
+                    chunks_total=len(chunks),
+                    queue_message_id=queue_message_id)
             except Exception as e:
                 _outbox_broken("enqueue", e)
             else:
@@ -2519,12 +2545,16 @@ async def crash_recovery():
                     processed = datetime.strptime(
                         msg["processed_at"], "%Y-%m-%d %H:%M:%S"
                     ).replace(tzinfo=timezone.utc).timestamp()
-                    matched = outbox_lib.find_for_reply(
-                        conn, poster, msg["channel_id"], sha, processed)
+                    # Stable key first: a row enqueued on any earlier boot,
+                    # still pending or delivered later by the loop, is found
+                    # however long ago. Content/time is only the fallback for
+                    # rows without a key.
+                    matched = outbox_lib.find_by_queue_id(conn, msg["message_id"])
                     if matched is None:
-                        # A row this sweep enqueued on an earlier boot is dated
-                        # by that boot, not by the turn. Only catches a restart
-                        # within the 120 s window (a crash loop).
+                        matched = outbox_lib.find_for_reply(
+                            conn, poster, msg["channel_id"], sha, processed)
+                    if matched is None:
+                        # Fallback for keyless rows enqueued by this sweep.
                         matched = outbox_lib.find_for_reply(
                             conn, poster, msg["channel_id"], sha, _outbox_now())
                 except Exception as e:
@@ -2538,7 +2568,8 @@ async def crash_recovery():
                 # Through the outbox (durable), so the reply survives another
                 # outage instead of being reposted on every boot.
                 discord_id = await post_to_discord(poster, msg["channel_id"], msg["response"],
-                                                   dead_letter=True)
+                                                   dead_letter=True,
+                                                   queue_message_id=msg["message_id"])
             if discord_id:
                 # Commit per-message, not once after the whole loop. The
                 # record of delivery (discord_response_id written) and the
