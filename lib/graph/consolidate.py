@@ -238,8 +238,10 @@ def _pass_prune(tx, store, now, messages_dir, score_fn, cfg, stats, log):
             conn.execute("UPDATE observations SET archived_at=? WHERE id=?",
                          (_iso(now), r["id"]))
             archived += 1
+        # Episodes only: this pass archived them. Any other kind with archived_at
+        # set was archived by something else and is not this job's to delete.
         for r in conn.execute("SELECT id, archived_at FROM observations "
-                              "WHERE archived_at IS NOT NULL").fetchall():
+                              "WHERE kind='episode' AND archived_at IS NOT NULL").fetchall():
             at = _parse(r["archived_at"])
             if at is None or at > keep_until:
                 continue

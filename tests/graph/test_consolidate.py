@@ -217,6 +217,19 @@ def test_archive_then_retention_delete(store, tmp_path):
         assert conn.execute("SELECT COUNT(*) FROM observations WHERE id=?", (a,)).fetchone()[0] == 0
 
 
+
+def test_retention_never_deletes_an_archived_fact(store, tmp_path):
+    """Only episodes this job archived are hard-deleted; a fact archived by
+    anything else stays."""
+    f = store.add_observation("the boiler code is 4471", kind="fact", importance=5.0,
+                              embed=False)[0]
+    with store.write() as conn:
+        conn.execute("UPDATE observations SET archived_at=? WHERE id=?",
+                     ((NOW - timedelta(days=90)).strftime("%Y-%m-%dT%H:%M:%S+00:00"), f))
+    stats = go(store, tmp_path, now=NOW + timedelta(days=31))
+    assert stats["prune"]["deleted"] == 0
+    assert row(store, f)
+
 def test_recall_ignores_archived_rows(store, tmp_path):
     a = add_episode(store, "zebra stampede notes", importance=2.0, age_days=10)
     go(store, tmp_path)
