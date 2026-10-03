@@ -30,6 +30,10 @@ _ENV_KEYS = ("PATH", "WORKSPACE_ROOT", "AGENT_SERVER_TOKEN", "FAKE_CLAUDE_LOG_DI
              "FAKE_CLAUDE_SCRIPT", "DISCORD_BOT_TOKEN", "OWNER_DISCORD_ID")
 
 
+FAKE_ENV_KEYS = ("FAKE_CLAUDE_LOG_DIR", "FAKE_CLAUDE_SCRIPT", "FAKE_CLAUDE_QUEUED",
+                 "FAKE_CLAUDE_MCP_FAILED", "FAKE_CLAUDE_INIT_DELAY_MS")
+
+
 def write_agents_config(workspace: Path, agents) -> None:
     """The one place the harness writes agent config. Emits config/agents.yaml
     (validated through lib/registry.py) and, because the server's readers move
@@ -53,6 +57,11 @@ def write_agents_config(workspace: Path, agents) -> None:
         entries[name] = {"name": name, "role": "primary" if i == 0 else "custom",
                          "system_prompt": f"agents/{name}/SYSTEM_PROMPT.md",
                          "model": "fake-model", **(extra or {})}
+        # The server spawns claude with an allowlisted env, so the fake's own
+        # knobs reach it the way a real secret would: a `${NAME}` reference in
+        # the agent's `env:`, resolved from the server env at spawn.
+        entries[name]["env"] = {**{k: "${%s}" % k for k in FAKE_ENV_KEYS},
+                                **(entries[name].get("env") or {})}
     if not any(e["role"] == "monitor" for e in entries.values()):
         entries["monitor"] = {"name": "monitor", "role": "monitor", "model": "fake-model"}
     config = workspace / "config"

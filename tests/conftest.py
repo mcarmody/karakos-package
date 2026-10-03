@@ -183,6 +183,6 @@ def harness(tmp_workspace):
     from harness import Harness
 
     def make(agents=("a", "b")):
-        return Harness(tmp_workspace, agents=list(agents))
+        return Harness(tmp_workspace, agents=agents if isinstance(agents, dict) else list(agents))
 
     return make

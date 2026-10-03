@@ -38,6 +38,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import ask_handler  # noqa: E402
 import registry as agent_registry  # noqa: E402
 import prompt_compose  # noqa: E402
+import spawn_env as spawn_env_lib  # noqa: E402
 import tengwar  # noqa: E402
 from lib.migrate.guard import require_stamp  # noqa: E402
 
@@ -730,17 +731,26 @@ async def start_agent_subprocess(agent: str):
         cmd.extend(["--allowedTools", ",".join(allowed)])
 
     # Per-agent environment (#99) — the registry's `env` dict is layered onto
-    # the server's own environment rather than replacing it, so the agent
-    # still inherits API keys, WORKSPACE_ROOT, etc. Per-agent entries win on
-    # collision, which is the point: an operator scoping one agent to a
-    # different API base URL or timeout without touching every other agent.
+    # an ALLOWLISTED slice of the server's environment (lib/spawn_env.py), not
+    # the whole thing: Discord/API tokens stay out unless the agent's `env:`
+    # names them (`${NAME}` pulls a value from the server env at spawn).
+    # Per-agent entries win over the base; `extra` (identity) wins over both.
     env_overrides = config.get("env") or {}
-    # KARAKOS_AGENT is not an override — it is identity. The MCP tool server
-    # runs as a child of this subprocess and otherwise has no way to say
-    # which agent is calling `ask_user`, which is what decides where the
-    # question is posted (#101). Set first so an operator's `env` block can
-    # still win if they really mean to.
-    spawn_env = {**os.environ, "KARAKOS_AGENT": agent, **env_overrides}
+    # KARAKOS_AGENT is identity: the MCP tool server runs as a child of this
+    # subprocess and otherwise cannot say which agent is calling `ask_user`
+    # (#101). WORKSPACE_ROOT and the agent-server address/token are for the
+    # package's own hooks and MCP servers (tools-server/admin-server call back
+    # into this server); they are not in the inert allowlist, so set them here.
+    extra = {"KARAKOS_AGENT": agent, "WORKSPACE_ROOT": str(WORKSPACE_ROOT),
+             "AGENT_SERVER_PORT": str(PORT)}
+    if AGENT_SERVER_TOKEN:
+        extra["AGENT_SERVER_TOKEN"] = AGENT_SERVER_TOKEN
+    if "AGENT_SERVER_URL" in os.environ:
+        extra["AGENT_SERVER_URL"] = os.environ["AGENT_SERVER_URL"]
+    if spawn_env_lib.passthrough_requested(os.environ):
+        spawn_env = {**os.environ, **spawn_env_lib.resolve_agent_env(env_overrides, os.environ, agent), **extra}
+    else:
+        spawn_env = spawn_env_lib.build_subprocess_env(os.environ, env_overrides, extra)
     if env_overrides:
         log.info(f"{agent} env overrides: {sorted(env_overrides.keys())}")
 

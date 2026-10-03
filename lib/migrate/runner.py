@@ -50,6 +50,56 @@ def unknown_report(detected: Detected) -> List[str]:
     return ["unknown schema; evidence:"] + [f"  - {e}" for e in detected.evidence]
 
 
+def unreferenced_env_report(config_dir) -> List[str]:
+    """Variables in config/.env that no agent's `env:` references. From 2.0 the
+    server no longer hands its environment to agent subprocesses, so an agent
+    that relied on an inherited variable must now name it (`NAME: ${NAME}`)."""
+    import json
+    import re
+    config_dir = Path(config_dir)
+    env_file = config_dir / ".env"
+    if not env_file.is_file():
+        return []
+    names = []
+    for line in env_file.read_text(errors="replace").splitlines():
+        m = re.match(r"\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=", line)
+        if m:
+            names.append(m.group(1))
+    referenced = set()
+    try:
+        if (config_dir / "agents.yaml").is_file():
+            import yaml
+            doc = yaml.safe_load((config_dir / "agents.yaml").read_text()) or {}
+            agents = list((doc.get("agents") or {}).values())
+        elif (config_dir / "agents.json").is_file():
+            doc = json.loads((config_dir / "agents.json").read_text())
+            agents = list((doc.get("agents") or doc).values())
+        else:
+            agents = []
+    except Exception:
+        agents = []
+    for a in agents:
+        if not isinstance(a, dict):
+            continue
+        for k, v in (a.get("env") or {}).items():
+            referenced.add(str(k))
+            referenced.update(re.findall(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", str(v)))
+        d = a.get("discord") or {}
+        for key in ("token_env", "bot_id_env"):
+            if d.get(key):
+                referenced.add(d[key])
+        for key in ("discord_bot_token_env", "discord_bot_id_env"):
+            if a.get(key):
+                referenced.add(a[key])
+    missing = [n for n in dict.fromkeys(names) if n not in referenced]
+    if not missing:
+        return []
+    return (["env: agent subprocesses no longer inherit the server environment.",
+             "  Variables in config/.env that no agent's `env:` references",
+             "  (add `NAME: ${NAME}` to an agent's env: if it needs one):"]
+            + [f"  - {n}" for n in missing])
+
+
 def run(data_dir, config_dir, backup_root=None, steps=None, dry_run=False,
         force=False, out=print) -> int:
     data_dir, config_dir = Path(data_dir), Path(config_dir)
@@ -79,6 +129,8 @@ def run(data_dir, config_dir, backup_root=None, steps=None, dry_run=False,
     plan = [s for s in steps if s.detect(ctx)]
     out("plan: " + (", ".join(s.name for s in plan) or "no data steps") + ", stamp")
     if dry_run:
+        for line in unreferenced_env_report(config_dir):
+            out(line)
         out("dry-run: nothing written")
         return EXIT_OK
 

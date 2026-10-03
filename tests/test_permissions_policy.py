@@ -265,31 +265,40 @@ def test_start_agent_subprocess_applies_per_agent_env(monkeypatch, tmp_workspace
     env = captured["kwargs"].get("env")
     assert env is not None
     assert env["KARAKOS_TEST_OVERRIDE"] == "override-value"
-    # Overrides layer onto the inherited environment rather than replacing it.
-    assert env["KARAKOS_TEST_AMBIENT"] == "ambient-value"
+    # Overrides layer onto the allowlisted base; arbitrary ambient vars are
+    # not inherited (2.0 step 1.6).
+    assert "KARAKOS_TEST_AMBIENT" not in env
+    assert "PATH" in env
 
 
-def test_start_agent_subprocess_without_env_key_still_inherits_everything(
+def test_start_agent_subprocess_without_env_key_uses_allowlist(
         monkeypatch, tmp_workspace):
-    """No `env` key in the agent's config must still mean plain inherit.
-
-    This used to assert `env is None`, which was the same guarantee spelled
-    differently. Since #101 the spawn environment is always an explicit dict
-    — the agent's own name has to reach the MCP tool server somehow, and the
-    environment is the only channel a subprocess-of-a-subprocess has — so the
-    property under test is that the dict is os.environ plus that one key, and
-    never a replacement for it.
-    """
+    """No `env` key: the spawn env is the allowlisted slice of os.environ plus
+    identity, never the whole server environment (2.0 step 1.6)."""
     monkeypatch.setenv("KARAKOS_TEST_AMBIENT", "ambient-value")
+    monkeypatch.setenv("DISCORD_BOT_TOKEN_X", "secret")
+    monkeypatch.delenv("KARAKOS_ENV_PASSTHROUGH", raising=False)
     _write_agent(tmp_workspace, "plain-agent")
 
     captured = _spawn_and_capture(monkeypatch, tmp_workspace, "plain-agent")
 
     env = captured["kwargs"].get("env")
     assert env is not None
-    assert env["KARAKOS_TEST_AMBIENT"] == "ambient-value", \
-        "the spawn environment replaced the inherited one instead of layering onto it"
+    assert "KARAKOS_TEST_AMBIENT" not in env
+    assert "DISCORD_BOT_TOKEN_X" not in env
     assert env["KARAKOS_AGENT"] == "plain-agent"
+    assert "WORKSPACE_ROOT" in env
+
+
+def test_passthrough_flag_restores_full_environment(monkeypatch, tmp_workspace):
+    monkeypatch.setenv("KARAKOS_TEST_AMBIENT", "ambient-value")
+    monkeypatch.setenv("KARAKOS_ENV_PASSTHROUGH", "1")
+    monkeypatch.delenv("KARAKOS_ENV", raising=False)
+    _write_agent(tmp_workspace, "plain-agent")
+
+    captured = _spawn_and_capture(monkeypatch, tmp_workspace, "plain-agent")
+
+    assert captured["kwargs"]["env"]["KARAKOS_TEST_AMBIENT"] == "ambient-value"
 
 
 # ---------------------------------------------------------------------------
