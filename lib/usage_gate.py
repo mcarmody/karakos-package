@@ -161,9 +161,8 @@ async def _enter_pause(state, shard, reason, until, detail, claimable):
     # A caller must not wait for queue expiry on a paused callee. Cheap when
     # there is no queued call row, so it runs on every deferral: a call that
     # lands during a pause is answered on the next evaluation.
-    # TODO(2.3): POST /hive/call 409 callee_paused and pick_callee skipping a
-    # paused shard land with lib/hive.py (not on release/2.0 yet); they read
-    # `state.usage_gate.paused`.
+    # POST /hive/call answers 409 callee_paused and pick_callee skips this
+    # shard while it is in `paused` (agent-server `_hive_pick`).
     try:
         await msgqueue.fail_calls(state.db, shard, "callee_paused", detail)
     except Exception as e:  # noqa: BLE001

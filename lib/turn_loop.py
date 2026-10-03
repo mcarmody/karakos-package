@@ -18,6 +18,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+import hive
 import msgqueue
 
 HOOK_NAMES = ("before_claim", "on_turn_start", "on_event", "on_turn_end")
@@ -113,6 +114,7 @@ class ServerState:
         self._server = server_module
         self.hooks = TurnHooks(lambda: self._server.log)
         self.active_turns: Dict[str, TurnBatch] = {}
+        self.hive = hive.HiveState()  # open hive calls (in memory only, step 2.3)
 
     def __getattr__(self, name):
         if name in _SERVER_NAMES:

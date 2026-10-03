@@ -22,6 +22,9 @@ STATUS_CRASHED = 3
 STATUS_SKIPPED = 4
 
 _ORDER = "priority DESC, created_at ASC, id ASC"
+# A reply row (call_id set, reply_to_agent NULL) is read by the waiting caller's
+# tool call, never run as a turn (step 2.3).
+_NOT_REPLY = "NOT (call_id IS NOT NULL AND reply_to_agent IS NULL)"
 _TS = "%Y-%m-%dT%H:%M:%SZ"
 
 
@@ -82,7 +85,7 @@ async def claim_batch(db, shard, limit, now=None) -> list:
     await expire(db, shard, now)
     async with db.execute(
         f"SELECT id, call_id FROM message_queue WHERE agent = ? AND processed = ?"
-        f" ORDER BY {_ORDER} LIMIT 1", (shard, STATUS_QUEUED)) as cur:
+        f" AND {_NOT_REPLY} ORDER BY {_ORDER} LIMIT 1", (shard, STATUS_QUEUED)) as cur:
         head = await cur.fetchone()
     if head is None:
         return []
@@ -95,10 +98,27 @@ async def claim_batch(db, shard, limit, now=None) -> list:
     rows = await db.execute_fetchall(
         "UPDATE message_queue SET processed = ?, claimed_by = ?,"
         " processing_started_at = CURRENT_TIMESTAMP"
-        f" WHERE {where} AND processed = ? RETURNING *",
+        f" WHERE {where} AND processed = ? AND {_NOT_REPLY} RETURNING *",
         (STATUS_IN_PROGRESS, shard, *args, STATUS_QUEUED))
     await db.commit()
     return sorted(rows, key=lambda r: (-(r["priority"] or 0), r["created_at"], r["id"]))
+
+
+async def reap_hive_rows(db, now=None, ttl=600) -> int:
+    """Skip reply rows nobody consumed within `ttl` seconds (step 2.3)."""
+    if now is None:
+        now = datetime.now(timezone.utc)
+    elif isinstance(now, (int, float)):
+        now = datetime.fromtimestamp(now, tz=timezone.utc)
+    cutoff = datetime.fromtimestamp(now.timestamp() - ttl, tz=timezone.utc)
+    rows = await db.execute_fetchall(
+        "UPDATE message_queue SET processed = ?, response = 'stale',"
+        " processed_at = CURRENT_TIMESTAMP"
+        " WHERE processed = ? AND call_id IS NOT NULL AND reply_to_agent IS NULL"
+        " AND created_at <= ? RETURNING id",
+        (STATUS_SKIPPED, STATUS_QUEUED, cutoff.strftime("%Y-%m-%d %H:%M:%S")))
+    await db.commit()
+    return len(rows)
 
 
 async def fail_calls(db, shard, code, detail="") -> int:
@@ -109,6 +129,7 @@ async def fail_calls(db, shard, code, detail="") -> int:
         "UPDATE message_queue SET processed = ?, response = ?,"
         " processed_at = CURRENT_TIMESTAMP"
         " WHERE agent = ? AND processed = ? AND call_id IS NOT NULL"
+        " AND reply_to_agent IS NOT NULL"
         " RETURNING id, call_id, reply_to_agent",
         (STATUS_SKIPPED, code, shard, STATUS_QUEUED))
     for r in rows:
@@ -137,6 +158,7 @@ async def peek_claimable(db, shard, limit=20, now=None) -> list:
     now = utc_iso(now)
     async with db.execute(
         f"SELECT id, call_id FROM message_queue WHERE agent = ? AND processed = ?{live}"
+        f" AND {_NOT_REPLY}"
         f" ORDER BY {_ORDER} LIMIT 1", (shard, STATUS_QUEUED, now)) as cur:
         head = await cur.fetchone()
     if head is None:
@@ -146,7 +168,7 @@ async def peek_claimable(db, shard, limit=20, now=None) -> list:
             "SELECT * FROM message_queue WHERE id = ?", (head["id"],)))
     rows = await db.execute_fetchall(
         f"SELECT * FROM message_queue WHERE agent = ? AND processed = ?"
-        f" AND call_id IS NULL{live} ORDER BY {_ORDER} LIMIT ?",
+        f" AND call_id IS NULL{live} AND {_NOT_REPLY} ORDER BY {_ORDER} LIMIT ?",
         (shard, STATUS_QUEUED, now, limit))
     return sorted(rows, key=lambda r: (-(r["priority"] or 0), r["created_at"], r["id"]))
 
