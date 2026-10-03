@@ -63,3 +63,41 @@ def test_poke(tmp_workspace):
     assert params("poke") == [("shard", EMPTY), ("source", EMPTY), ("text", EMPTY),
                               ("channel_id", "0")]
     assert inspect.iscoroutinefunction(Harness.poke)
+
+
+# --- step 3.3: build queue stubs (additive) ---------------------------------------------
+
+def test_build_queue_stubs_exist_and_fake_ssh_scrubs_the_environment(tmp_path):
+    import os
+    import subprocess
+    from harness import FAKE_BIN_DIR
+    for name in ("fake-ssh", "gh", "probe", "claude"):
+        assert os.access(FAKE_BIN_DIR / name, os.X_OK), name
+    env = {"PATH": os.environ["PATH"], "KARAKOS_FAKE_REMOTE_HOME": str(tmp_path),
+           "AGENT_SERVER_TOKEN": "sekret", "FAKE_CLAUDE_X": "kept"}
+    out = subprocess.run([str(FAKE_BIN_DIR / "fake-ssh"), "-o", "BatchMode=yes", "box",
+                          'echo "$HOME|${AGENT_SERVER_TOKEN:-none}|$FAKE_CLAUDE_X"'],
+                         capture_output=True, text=True, env=env).stdout
+    assert out.strip() == f"{tmp_path}|none|kept"
+    env["KARAKOS_FAKE_SSH_FAIL"] = "255"
+    assert subprocess.run([str(FAKE_BIN_DIR / "fake-ssh"), "box", "true"], env=env).returncode == 255
+
+
+def test_fake_claude_oneshot_runs_a_turn_and_never_commits_in_the_package_repo(tmp_path):
+    import json
+    import os
+    import subprocess
+    from harness import FAKE_BIN_DIR, PACKAGE_ROOT
+    script = tmp_path / "s.json"
+    script.write_text(json.dumps({"default": {"text": "hi {{text}}"}}))
+    env = dict(os.environ, FAKE_CLAUDE_SCRIPT=str(script), FAKE_CLAUDE_LOG_DIR=str(tmp_path))
+    out = subprocess.run([str(FAKE_BIN_DIR / "claude"), "-p", "the prompt", "--model", "m"],
+                         capture_output=True, text=True, env=env, cwd=tmp_path,
+                         stdin=subprocess.DEVNULL).stdout
+    result = [json.loads(l) for l in out.splitlines()][-1]
+    assert result["type"] == "result" and result["result"] == "hi the prompt"
+    script.write_text(json.dumps({"default": {"commit_push": {"path": "x.txt", "content": "x"}}}))
+    p = subprocess.run([str(FAKE_BIN_DIR / "claude"), "-p", "go"], capture_output=True, text=True,
+                       env=env, cwd=PACKAGE_ROOT, stdin=subprocess.DEVNULL)
+    assert p.returncode == 3 and "refusing" in p.stderr
+    assert not (PACKAGE_ROOT / "x.txt").exists()

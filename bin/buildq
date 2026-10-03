@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+"""buildq -- operate the build queue (spec 3.3).
+
+  buildq enqueue --kind build|review --repo owner/name --target-branch B
+                 [--brief-file F | --text T] [--origin human|machine]
+                 [--priority N] [--host H] [--requester AGENT]
+  buildq list [--status S] [--json]      buildq show ID      buildq cancel ID
+  buildq requeue ID    buildq hosts    buildq ingest
+
+Opens data/build-queue.db directly (WAL), so it works whether or not the
+dispatcher is running. Refuses while config/build-queue.yaml says
+`enabled: false` unless --force (briefs dropped in the inbox keep working in that
+state through the relay's own adapter).
+"""
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+PKG = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PKG / "lib"))
+
+import build_hosts  # noqa: E402
+import buildq  # noqa: E402
+
+
+def die(msg, code=1):
+    print(f"buildq: {msg}", file=sys.stderr)
+    return code
+
+
+def _row(r):
+    d = dict(r)
+    for k in ("run_ref", "result"):
+        if d.get(k):
+            try:
+                d[k] = json.loads(d[k])
+            except ValueError:
+                pass
+    return d
+
+
+def _line(r):
+    return f"{r['id']}  {r['status']:<9} {r['kind']:<6} {r['origin']:<7} p{r['priority'] or 0}  " \
+           f"{r['repo'] or '-'}  {r['exec_host'] or r['host'] or '-'}  {r['reason'] or ''}".rstrip()
+
+
+def _compose(brief, flags):
+    meta = buildq.parse_frontmatter(brief)
+    add = [f"{k}: {v}" for k, v in flags if v and k not in meta]
+    if not add:
+        return brief
+    if brief.startswith("---"):
+        head, _, rest = brief.partition("\n")
+        return head + "\n" + "\n".join(add) + "\n" + rest
+    return "---\n" + "\n".join(add) + "\n---\n" + brief
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="buildq")
+    ap.add_argument("--workspace", default=os.environ.get("WORKSPACE_ROOT", str(PKG)))
+    ap.add_argument("--force", action="store_true", help="run even when the queue is disabled")
+    ap.add_argument("--json", action="store_true", dest="as_json")
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true", dest="as_json", default=argparse.SUPPRESS)
+    common.add_argument("--force", action="store_true", default=argparse.SUPPRESS)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    e = sub.add_parser("enqueue", parents=[common])
+    e.add_argument("--kind", required=True, choices=buildq.KINDS)
+    e.add_argument("--repo")
+    e.add_argument("--target-branch")
+    e.add_argument("--brief-file")
+    e.add_argument("--text")
+    e.add_argument("--origin", default="human", choices=buildq.ORIGINS)
+    e.add_argument("--priority", type=int, default=0)
+    e.add_argument("--host")
+    e.add_argument("--requester")
+    ls = sub.add_parser("list", parents=[common])
+    ls.add_argument("--status", choices=buildq.STATUSES)
+    ls.add_argument("--limit", type=int, default=100)
+    for n in ("show", "cancel", "requeue"):
+        sub.add_parser(n, parents=[common]).add_argument("id")
+    sub.add_parser("hosts", parents=[common])
+    sub.add_parser("ingest", parents=[common])
+    args = ap.parse_args(argv)
+    ws = Path(args.workspace)
+    cfg = build_hosts.load_config(ws / "config" / "build-queue.yaml")
+    if cfg.invalid:
+        return die(f"invalid config: {cfg.invalid}")
+    if not cfg.enabled and not args.force:
+        return die("the build queue is disabled (config/build-queue.yaml: enabled: false); "
+                   "briefs in inbox/ still run through the relay. Use --force to operate it anyway.")
+    db = ws / "data" / "build-queue.db"
+    if not db.is_file():
+        return die("no build queue database; run karakos migrate")
+    conn = buildq.connect(db)
+    if not buildq.tables_present(conn):
+        return die("build queue tables are missing; run karakos migrate")
+    now = None
+
+    if args.cmd == "enqueue":
+        if args.brief_file:
+            body = Path(args.brief_file).read_text()
+        elif args.text:
+            body = args.text
+        else:
+            return die("give --brief-file or --text")
+        if args.host and args.host not in cfg.hosts:
+            return die(f"unknown host {args.host!r}; configured: {', '.join(sorted(cfg.hosts))}")
+        brief = _compose(body, [("repo", args.repo), ("target_branch", args.target_branch),
+                                ("requester", args.requester)])
+        try:
+            import registry
+            reg = registry.load_registry(ws)
+            qid = buildq.enqueue(conn, args.kind, brief, args.repo, args.target_branch,
+                                 args.requester, None, args.origin, "cli", args.priority,
+                                 args.host, registry=reg)
+        except buildq.BriefError as ex:
+            return die(f"refused: {ex}")
+        out = {"id": qid, "status": "queued"}
+        print(json.dumps(out) if args.as_json else f"queued {qid}")
+        return 0
+    if args.cmd == "list":
+        rows = buildq.list_rows(conn, args.status, args.limit)
+        if args.as_json:
+            print(json.dumps([_row(r) for r in rows]))
+        else:
+            for r in rows:
+                print(_line(r))
+        return 0
+    if args.cmd == "show":
+        r = buildq.get(conn, args.id)
+        if r is None:
+            return die(f"no such row {args.id}")
+        evs = [dict(x) for x in buildq.events(conn, args.id)]
+        if args.as_json:
+            print(json.dumps({"row": _row(r), "events": evs}))
+        else:
+            print(_line(r))
+            for x in evs:
+                print(f"  {x['ts']}  {x['event']}  {x['detail'] or ''}")
+        return 0
+    if args.cmd == "cancel":
+        prev = buildq.cancel(conn, args.id)
+        if prev is None:
+            return die(f"no such row {args.id}")
+        msg = {"queued": "cancelled", "running": "cancel requested; the dispatcher stops the run"
+               }.get(prev, f"nothing to cancel (already {prev})")
+        print(json.dumps({"id": args.id, "previous": prev, "result": msg}) if args.as_json else msg)
+        return 0
+    if args.cmd == "requeue":
+        new = buildq.requeue(conn, args.id)
+        if new is None:
+            return die(f"no such row {args.id}")
+        print(json.dumps({"id": new, "requeued_from": args.id}) if args.as_json else f"queued {new}")
+        return 0
+    if args.cmd == "hosts":
+        used = {r[0]: r[1] for r in conn.execute(
+            "SELECT exec_host, COUNT(*) FROM build_queue WHERE status='running' GROUP BY exec_host")}
+        cache = build_hosts.ProbeCache()
+        info = []
+        for name, hc in sorted(cfg.hosts.items()):
+            data, unreachable = cache.get(hc)
+            adm = build_hosts.admit(hc, data)
+            info.append({"host": name, "kind": hc.kind, "default": name == cfg.default_host,
+                         "concurrency": hc.concurrency, "free_slots": hc.concurrency - used.get(name, 0),
+                         "probe": data, "unreachable": unreachable,
+                         "admit": adm.ok, "reason": adm.reason})
+        if args.as_json:
+            print(json.dumps(info))
+        else:
+            for i in info:
+                print(f"{i['host']}  {i['kind']}{' (default)' if i['default'] else ''}  "
+                      f"slots {i['free_slots']}/{i['concurrency']}  "
+                      f"probe={json.dumps(i['probe'])}  "
+                      f"{'UNREACHABLE' if i['unreachable'] else ('admit' if i['admit'] else 'busy: ' + i['reason'])}")
+        return 0
+    if args.cmd == "ingest":
+        import build_dispatcher
+        qd = build_dispatcher.build_dispatcher(ws, cfg)
+        ids = qd.ingest_inboxes()
+        print(json.dumps({"queued": ids}) if args.as_json else f"ingested {len(ids)} brief(s)")
+        return 0
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

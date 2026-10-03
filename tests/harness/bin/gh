@@ -1,0 +1,8 @@
+#!/bin/bash
+# Stub `gh` (spec 3.3): `pr create` prints a PR URL for the repo of the cwd's origin.
+if [[ "$1" == "pr" && "$2" == "create" ]]; then
+    repo="${GH_STUB_REPO:-owner/name}"
+    echo "https://example.invalid/${repo}/pull/1"
+    exit 0
+fi
+exit 0

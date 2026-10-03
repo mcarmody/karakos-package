@@ -34,6 +34,15 @@ directory; `compact: true` emits a `system` `compact_boundary` event
 (`pre_tokens`/`post_tokens` from the step's `pre_tokens`/`post_tokens`) before
 the closing result, as `/compact` would.
 
+One-shot mode (step 3.3): `claude -p "<prompt>" ...` runs one turn on the prompt
+text (stdin is not read) and exits. Step keys: text, cost, exit, hang,
+ignore_term (a hanging fake that survives SIGTERM), spawn_child (its pid is
+appended to $FAKE_CLAUDE_LOG_DIR/children.pid), write_file {path, content},
+commit_push {path, content, to (remote ref, default HEAD), force} (edits a
+file in the cwd, commits and pushes as a builder would; the push result goes
+to $FAKE_CLAUDE_LOG_DIR/push.log), `no_pr: true` (a clean exit that does none
+of write_file/commit_push).
+
 Queued-stdin mode (step 0.3b) -- on only with `--replay-user-messages` or
 FAKE_CLAUDE_QUEUED=1; otherwise the fake behaves exactly as above. It replays
 the behaviour recorded from the real CLI (tests/harness/fixtures/real-cli):
@@ -559,6 +568,91 @@ class Queued:
                 return 0
 
 
+def oneshot_prompt(argv):
+    """The prompt of `claude -p <prompt>`, or None when not one-shot."""
+    for i, a in enumerate(argv):
+        if a in ("-p", "--print"):
+            if i + 1 < len(argv) and not argv[i + 1].startswith("-"):
+                return argv[i + 1]
+    return None
+
+
+def _git(*args):
+    env = dict(os.environ)
+    return subprocess.run(["git", "-c", "user.name=fake", "-c", "user.email=fake@example.invalid",
+                           *args], capture_output=True, text=True, env=env)
+
+
+def _in_package_repo():
+    """True when the cwd is inside the repository this fake lives in: a stray
+    local run must never `git add -A` / commit / push the developer's own tree."""
+    pkg = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    here = os.path.realpath(os.getcwd())
+    pkg = os.path.realpath(pkg)
+    return here == pkg or here.startswith(pkg + os.sep)
+
+
+def run_oneshot(prompt, flags):
+    sid = "oneshot-" + uuid.uuid4().hex[:8]
+    log_dir = os.environ.get("FAKE_CLAUDE_LOG_DIR")
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
+        with open(os.path.join(log_dir, f"{sid}.argv.json"), "w") as f:
+            json.dump(sys.argv[1:], f)
+        with open(os.path.join(log_dir, "prompts.jsonl"), "a") as f:
+            f.write(json.dumps({"prompt": prompt, "argv": sys.argv[1:], "cwd": os.getcwd(),
+                                "run_pid_exists": os.path.exists(os.path.join(
+                                    os.path.dirname(os.getcwd()), "run.pid")),
+                                "env_keys": sorted(os.environ)}) + "\n")
+    step = pick_step(load_script(), prompt)
+    started = time.time()
+    emit({"type": "system", "subtype": "init", "session_id": sid,
+          "model": (flags.get("--model") or [""])[0], "tools": ["Read", "Bash"]})
+    if step.get("ignore_term"):
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    if step.get("spawn_child"):
+        child = spawn_child(step["spawn_child"])
+        if log_dir:
+            with open(os.path.join(log_dir, "children.pid"), "a") as f:
+                f.write(f"{child.pid}\n")
+    if step.get("delay_ms"):
+        time.sleep(step["delay_ms"] / 1000.0)
+    if not step.get("no_pr"):
+        wf = step.get("write_file")
+        if (wf or step.get("commit_push")) and _in_package_repo():
+            sys.stderr.write("fake claude: refusing to write or commit inside the package repo\n")
+            return 3
+        if wf:
+            with open(wf["path"], "w") as f:
+                f.write(wf.get("content", ""))
+        cp = step.get("commit_push")
+        if cp:
+            with open(cp["path"], "w") as f:
+                f.write(cp.get("content", ""))
+            out = [_git("add", "-A"), _git("commit", "-m", cp.get("message", "fake build"))]
+            push = ["push"] + (["--force"] if cp.get("force") else []) + \
+                   ["origin", "HEAD" if not cp.get("to") else "HEAD:" + cp["to"]]
+            r = _git(*push)
+            out.append(r)
+            if log_dir:
+                with open(os.path.join(log_dir, "push.log"), "a") as f:
+                    f.write(json.dumps({"rc": r.returncode, "stderr": r.stderr}) + "\n")
+    if step.get("hang"):
+        while True:
+            time.sleep(3600)
+    reply = render(step.get("text", "ok"), prompt, {})
+    emit({"type": "assistant", "session_id": sid, "parent_tool_use_id": None,
+          "message": {"id": f"msg_{sid[:8]}", "role": "assistant",
+                      "content": [{"type": "text", "text": reply}], "usage": DEFAULT_USAGE}})
+    if step.get("exit"):
+        return int(step["exit"])
+    emit({"type": "result", "subtype": "success", "session_id": sid, "is_error": False,
+          "result": reply, "usage": DEFAULT_USAGE,
+          "total_cost_usd": step.get("cost", DEFAULT_COST),
+          "duration_ms": int((time.time() - started) * 1000)})
+    return 0
+
+
 def main():
     flags = parse_argv(sys.argv[1:])
     if "--replay-user-messages" in flags or os.environ.get("FAKE_CLAUDE_QUEUED") == "1":
@@ -569,6 +663,9 @@ def main():
             with open(os.path.join(log_dir, f"{sid}.argv.json"), "w") as f:
                 json.dump(sys.argv[1:], f)
         sys.exit(Queued(flags).run())
+    prompt = oneshot_prompt(sys.argv[1:])
+    if prompt is not None:
+        sys.exit(run_oneshot(prompt, flags))
     sid = (flags.get("--session-id") or ["no-session"])[0]
     log_dir = os.environ.get("FAKE_CLAUDE_LOG_DIR")
     if log_dir:
