@@ -247,7 +247,9 @@ def test_the_reply_path_opts_in(ags):
     """Pins the caller, not the helper: the queue is worthless if the one path
     that generates real replies forgets to ask for it."""
     opted_in = []
-    for node in ast.walk(_tree()):
+    # The reply path moved to lib/turn_loop.py (finish_turn) in 2.0.
+    turn_loop_tree = ast.parse((PACKAGE_ROOT / "lib" / "turn_loop.py").read_text())
+    for node in list(ast.walk(_tree())) + list(ast.walk(turn_loop_tree)):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             for call in _calls_to(node, "post_to_discord"):
                 value = _kwarg(call, "dead_letter")
@@ -256,7 +258,8 @@ def test_the_reply_path_opts_in(ags):
 
     assert opted_in, "nothing in the server ever asks for a reply to be preserved"
     # The one that matters is where a generated response goes out.
-    assert any("response" in name or "process" in name for name in opted_in), \
+    assert any("response" in name or "process" in name or "finish" in name
+               for name in opted_in), \
         f"the response path is not among the opted-in callers: {opted_in}"
 
 

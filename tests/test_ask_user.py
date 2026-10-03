@@ -34,6 +34,7 @@ import pytest
 
 PACKAGE_ROOT = Path(__file__).parent.parent
 AGENT_SERVER = PACKAGE_ROOT / "bin" / "agent-server.py"
+TURN_LOOP = PACKAGE_ROOT / "lib" / "turn_loop.py"
 RELAY_PATH = PACKAGE_ROOT / "bin" / "relay.py"
 TOOLS_SERVER = PACKAGE_ROOT / "mcp" / "tools-server.py"
 
@@ -902,8 +903,10 @@ def _assigned_names(func_node):
     for node in ast.walk(func_node):
         if isinstance(node, ast.Assign):
             for target in node.targets:
-                if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name):
-                    names.add(target.value.id)
+                if isinstance(target, ast.Subscript):
+                    # `d[k] = ...` or, since 2.0, `state.d[k] = ...`
+                    names.add(getattr(target.value, "id", None)
+                              or getattr(target.value, "attr", None))
     return names
 
 
@@ -920,7 +923,7 @@ def _calls_to(func_node, callee):
 def test_process_agent_queue_records_the_turn_context():
     """/ask reads this and has no other source for the channel. A grep would
     pass against the comment that explains it."""
-    func = _function(AGENT_SERVER, "process_agent_queue")
+    func = _function(TURN_LOOP, "run_turn")  # moved from agent-server.py (2.0)
     assert "agent_turn_context" in _assigned_names(func)
     assert _calls_to(func, "discard_agent"), (
         "questions outliving their turn would answer into a dead subprocess"
