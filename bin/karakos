@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# karakos: host-side wrapper. Today one subcommand:
+#
+#   karakos migrate [--auto] [--dry-run] [--force] [--keep-bind]
+#                   [--backup-to DIR] [--report-to FILE] [--parity-queries N]
+#   karakos migrate --restore <backup-dir>
+#
+# Stops the stack, runs the in-container migrator (bin/karakos-migrate) with the
+# volumes mounted, with the backup written to a host path, and prints the restore
+# command. The 2.0 image is selected with KARAKOS_VERSION (default 2.0.0).
+# Run it from a checkout / install directory that holds config/docker-compose.yml.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+COMPOSE_FILE="${KARAKOS_COMPOSE_FILE:-$ROOT/config/docker-compose.yml}"
+DOCKER="${KARAKOS_DOCKER:-docker}"
+
+usage() { sed -n '2,11p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+
+cmd="${1:-}"
+[ "$cmd" = "migrate" ] || { usage >&2; exit 2; }
+shift
+
+BACKUP_TO="${KARAKOS_BACKUP_DIR:-$ROOT/backups}"
+RESTORE=""
+KEEP_BIND=0
+PASS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --restore)    RESTORE="${2:?--restore needs a backup directory}"; shift 2 ;;
+    --backup-to)  BACKUP_TO="${2:?--backup-to needs a directory}"; shift 2 ;;
+    --keep-bind)  KEEP_BIND=1; shift ;;
+    --auto|--dry-run|--force) PASS+=("$1"); shift ;;
+    --parity-queries|--report-to) PASS+=("$1" "${2:?$1 needs a value}"); shift 2 ;;
+    -h|--help)    usage; exit 0 ;;
+    *) echo "karakos migrate: unknown option $1" >&2; exit 2 ;;
+  esac
+done
+
+[ -f "$COMPOSE_FILE" ] || { echo "no compose file at $COMPOSE_FILE" >&2; exit 2; }
+mkdir -p "$BACKUP_TO"
+BACKUP_ABS="$(cd "$BACKUP_TO" && pwd)"
+export KARAKOS_VERSION="${KARAKOS_VERSION:-2.0.0}"
+DC=("$DOCKER" compose -f "$COMPOSE_FILE")
+MIGRATE=(/workspace/bin/karakos-migrate)
+
+dry=0; for a in ${PASS[@]+"${PASS[@]}"}; do [ "$a" = "--dry-run" ] && dry=1; done
+
+auto=0; for a in ${PASS[@]+"${PASS[@]}"}; do [ "$a" = "--auto" ] && auto=1; done
+if [ "$auto" = 0 ] && [ "$dry" = 0 ] && [ -z "$RESTORE" ] && [ -t 0 ]; then
+  echo "This stops the stack, backs up to $BACKUP_ABS, and migrates in place."
+  echo "Memory has no downgrade: the backup is the only way back."
+  read -r -p "Proceed? [y/N] " yn
+  case "$yn" in y|Y|yes) ;; *) echo "aborted"; exit 1 ;; esac
+fi
+
+# (a) stop the stack; a dry run leaves it running
+if [ -z "$RESTORE" ] && [ "$dry" = 0 ]; then
+  echo "stopping the stack ..."
+  "${DC[@]}" down
+fi
+
+run_in_container() {   # extra docker args first, migrator args after "--"
+  local extra=() margs=() seen=0
+  for a in "$@"; do
+    if [ "$a" = "--" ]; then seen=1; elif [ $seen = 0 ]; then extra+=("$a"); else margs+=("$a"); fi
+  done
+  "${DC[@]}" run --rm --no-deps --entrypoint "${MIGRATE[0]}" \
+    -v "$BACKUP_ABS:/backups" ${extra[@]+"${extra[@]}"} karakos "${margs[@]}"
+}
+
+if [ -n "$RESTORE" ]; then
+  "${DC[@]}" down
+  src="$(cd "$RESTORE" && pwd)"
+  # restore verifies the manifest first; --to-backup is the shipped flag
+  run_in_container -v "$src:/restore:ro" -- --to-backup /restore --backup-to /backups
+  echo "restored from $RESTORE; start the stack with: docker compose -f $COMPOSE_FILE up -d"
+  exit 0
+fi
+
+EXTRA=(); MARGS=(--backup-to /backups)
+if [ "$KEEP_BIND" = 1 ]; then
+  MARGS+=(--keep-bind "$ROOT")
+else
+  EXTRA+=(-v "$ROOT:/old:ro"); MARGS+=(--import-from /old)
+fi
+[ ${#PASS[@]} -eq 0 ] || MARGS+=("${PASS[@]}")
+
+rc=0
+run_in_container ${EXTRA[@]+"${EXTRA[@]}"} -- "${MARGS[@]}" || rc=$?
+if [ "$rc" -ne 0 ]; then
+  echo "karakos migrate: failed (exit $rc). Nothing is stamped; the next run restores the backup first." >&2
+fi
+latest="$(ls -1d "$BACKUP_ABS"/pre-2.0-* 2>/dev/null | tail -1 || true)"
+if [ -n "$latest" ]; then
+  echo "to go back: karakos migrate --restore $latest"
+fi
+exit "$rc"
