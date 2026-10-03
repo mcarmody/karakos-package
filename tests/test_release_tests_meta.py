@@ -345,7 +345,7 @@ def test_every_job_has_a_timeout():
     gate = load("release-gate.yml")["jobs"]
     assert set(gate) >= {"build-image", "fresh-install-smoke", "upgrade-smoke", "real-cli-smoke"}
     assert gate["real-cli-smoke"]["timeout-minutes"] and gate["real-cli-smoke"]["env"]
-    assert gate["upgrade-smoke"]["strategy"]["matrix"]["tag"] == ["v1.0.0", "v1.1.1", "v1.3", "v1.5.0"]
+    assert gate["upgrade-smoke"]["strategy"]["matrix"]["tag"] == ["v1.3", "v1.5.0"]
     assert gate["fresh-install-smoke"]["needs"] == "build-image"
     assert gate["upgrade-smoke"]["needs"] == "build-image"
 

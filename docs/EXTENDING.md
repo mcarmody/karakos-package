@@ -202,7 +202,7 @@ and stop the session past `KARAKOS_REALCLI_BUDGET_USD` (default `0.50`); they ru
 with a temporary `HOME` and `CLAUDE_CONFIG_DIR`. `Harness(..., claude="real")`
 runs the server against the real CLI on `PATH` and passes the credential through
 each agent's `env:`. The smoke scripts run on their own: `tests/smoke/fresh_install.sh`
-and `tests/smoke/upgrade.sh <tag>` (`v1.0.0`, `v1.1.1`, `v1.3`, `v1.5.0`) need a
+and `tests/smoke/upgrade.sh <tag>` (`v1.3`, `v1.5.0`; `v1.0.0`, `v1.1.1` and `v1.4.1` are opt-in, see `tests/test_upgrade_smoke.py`) need a
 Docker daemon, work in a temp directory with a temp `HOME`, and refuse to run
 unless the compose project is named `karakos-smoke-*` or `karakos-up-*`. Set
 `KARAKOS_SMOKE_IMAGE_TAR` to a `docker save` file to skip the image build, and

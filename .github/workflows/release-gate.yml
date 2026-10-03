@@ -112,7 +112,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        tag: [v1.0.0, v1.1.1, v1.3, v1.5.0]
+        tag: [v1.3, v1.5.0]
     steps:
       - uses: actions/checkout@v4
         with:

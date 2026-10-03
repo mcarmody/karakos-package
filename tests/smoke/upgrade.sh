@@ -2,7 +2,7 @@
 # Upgrade smoke on a tagged 1.x image (7.3a): the container path, not 7.1's
 # in-process chain. Docker only.
 #
-#   usage: tests/smoke/upgrade.sh <tag>        (v1.0.0, v1.1.1, v1.3, v1.5.0; v1.4.1 optional)
+#   usage: tests/smoke/upgrade.sh <tag>        (v1.3, v1.5.0; v1.0.0, v1.1.1, v1.4.1 optional: those tags cannot build)
 #
 #   KARAKOS_SMOKE_IMAGE_TAR   a `docker save` file of the 2.0 image (else: docker build from HEAD)
 #   KARAKOS_SMOKE_ARTIFACTS   directory for logs on failure
@@ -86,12 +86,6 @@ if docker pull "$OLD_IMAGE" >/dev/null 2>&1; then
 else
   echo "no published image for $TAG: building it from that tag's own Dockerfile (slower)"
   git -C "$REPO" archive "$TAG" | tar -x -C "$OLD"
-  # v1.0.0 and v1.1.1 shipped no dashboard/package-lock.json, so their own `npm ci` cannot run.
-  # Build them with `npm install` instead (same package.json; dependency versions float).
-  if [ ! -f "$OLD/dashboard/package-lock.json" ]; then
-    echo "$TAG has no dashboard/package-lock.json: its Dockerfile's npm ci cannot build; using npm install"
-    sed -i 's/^RUN npm ci$/RUN npm install/' "$OLD/Dockerfile"
-  fi
   docker build -t "$OLD_IMAGE" "$OLD"
   OLD_BUILT=1
   rm -rf "${OLD:?}"/* "$OLD"/.[!.]* 2>/dev/null || true

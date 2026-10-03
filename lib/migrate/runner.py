@@ -256,11 +256,13 @@ def run(data_dir, config_dir, backup_root=None, steps=None, dry_run=False,
 
 
 def _write_report(ctx: Context, path: Optional[Path] = None) -> None:
-    if not ctx.report:
+    if not ctx.report and path is None:
         return
     out = ["# Migration report", ""]
     for section, lines in ctx.report.items():
         out += [f"## {section}", ""] + list(lines) + [""]
+    if not ctx.report:   # an explicitly requested report is written even when there is nothing to flag
+        out += ["Nothing unrecognised: no data is left behind.", ""]
     if path is None:
         path = Path(ctx.data_dir) / "migration-reports" / "migration-report.md"
     path.parent.mkdir(parents=True, exist_ok=True)
