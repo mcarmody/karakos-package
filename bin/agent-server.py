@@ -52,6 +52,9 @@ import spawn_env as spawn_env_lib  # noqa: E402
 import tengwar  # noqa: E402
 import turn_loop  # noqa: E402
 import usage_gate  # noqa: E402
+import operator_pause  # noqa: E402
+import runtime_overrides  # noqa: E402
+import redact  # noqa: E402
 from lib.migrate.guard import require_stamp  # noqa: E402
 
 # =============================================================================
@@ -838,6 +841,11 @@ async def start_agent_subprocess(shard: str):
     if persona_content:
         cmd.extend(["--append-system-prompt", persona_content])
 
+    # Effort (6.4): runtime override, else the registry key, else the CLI default.
+    effort, _src = runtime_overrides.effective_effort(WORKSPACE_ROOT, agent, config)
+    if effort and await asyncio.to_thread(runtime_overrides.cli_supports_effort):
+        cmd.extend(["--effort", effort])
+
     # Steering (2.5): the CLI replays each user line it consumes, which is the
     # server's only signal of which steered lines the model has seen.
     if turn_loop.steering_on(STATE, shard):
@@ -876,6 +884,7 @@ async def start_agent_subprocess(shard: str):
         spawn_env = {**os.environ, **spawn_env_lib.resolve_agent_env(env_overrides, os.environ, agent), **extra}
     else:
         spawn_env = spawn_env_lib.build_subprocess_env(os.environ, env_overrides, extra)
+    redact.register_literals(spawn_env)     # secret values, masked wherever they appear
     if env_overrides:
         log.info(f"{label} env overrides: {sorted(env_overrides.keys())}")
 
@@ -2214,7 +2223,9 @@ def describe_tool_call(tool_name: str, tool_input: Optional[Dict]) -> str:
     unknown tool degrades to the bare name rather than dumping its input —
     tool inputs carry file contents, patch bodies and credentials, and this
     reaches both a Discord channel (#91) and the dashboard chat page. Both
-    surfaces go through here so neither can be redacted less than the other.
+    surfaces go through here so neither can be redacted less than the other:
+    the chosen detail is masked (lib/redact.py) before it is truncated, so a
+    token is not cut in half and left unmatched.
     """
     name = str(tool_name or "unknown")
     detail = ""
@@ -2230,7 +2241,7 @@ def describe_tool_call(tool_name: str, tool_input: Optional[Dict]) -> str:
                 break
 
     if detail:
-        detail = " ".join(detail.split())
+        detail = redact.redact_text(" ".join(detail.split()))
         if len(detail) > TOOL_EVENT_DETAIL_CHARS:
             detail = detail[:TOOL_EVENT_DETAIL_CHARS - 1].rstrip() + "…"
         # Backticks and newlines would break out of the subtext line.
@@ -2262,6 +2273,7 @@ async def write_turn_event(message_ids: List[str], seq: int, kind: str, content:
     """
     if not message_ids or db is None:
         return
+    content = redact.redact_text(content)
     try:
         def job(conn):
             try:
@@ -2383,24 +2395,14 @@ def _open_stream_log(agent: str):
     return open(path, "ab", buffering=0), now.strftime("%Y-%m-%d"), path
 
 
-_REDACT_PATTERNS = (
-    re.compile(r"(?:sk|pk|xox[a-z]|gh[pousr]|glpat)[-_][A-Za-z0-9_\-]{10,}"),
-    re.compile(r"(?i)\b(bearer|token|api[_-]?key|secret|password)([\"'\s:=]+)[^\s\"',}]{6,}"),
-    re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]*"),
-)
-
-
 def redact_for_log(text, limit: int = 200) -> str:
-    """Truncate and mask credential-shaped strings before text reaches the log.
+    """Mask credential-shaped strings, then truncate (a token must not be cut
+    in half and escape the patterns). lib/redact.py owns the pattern list.
 
     Raw CLI output (a garbled stream line, an auth failure body) can carry
     tokens. This is a best-effort mask, not a guarantee.
     """
-    out = str(text if text is not None else "")[:limit]
-    out = _REDACT_PATTERNS[0].sub("[redacted]", out)
-    out = _REDACT_PATTERNS[1].sub(lambda m: f"{m.group(1)}{m.group(2)}[redacted]", out)
-    out = _REDACT_PATTERNS[2].sub("[redacted]", out)
-    return out
+    return redact.redact_text(str(text if text is not None else ""))[:limit]
 
 
 def write_stream_log(agent: str, line: bytes) -> None:
@@ -2411,6 +2413,13 @@ def write_stream_log(agent: str, line: bytes) -> None:
     never the agent's reply. Nothing here raises.
     """
     if not line:
+        return
+    # The tee is masked; the event the loop parses and acts on is the original.
+    # A redaction failure costs the line, never the reply.
+    try:
+        line = redact.redact_line(line)
+    except Exception as e:
+        log.debug(f"stream log redaction failed: {e}")
         return
     if not line.endswith(b"\n"):
         line = line + b"\n"
@@ -3058,11 +3067,15 @@ async def handle_health(request):
         "outbox": outbox_health(),
     })
 
+def effort_info(agent):
+    """(effective level or None, source) for an agent; every shard shares it."""
+    return runtime_overrides.effective_effort(WORKSPACE_ROOT, agent, agent_config.get(agent, {}))
+
+
 def _paused_entry(shard):
-    """null, or {reason, until} while the usage gate is deferring this shard."""
-    gate = getattr(STATE, "usage_gate", None)
-    p = gate.paused.get(shard) if gate else None
-    return {"reason": p[0], "until": p[1]} if p else None
+    """null, or {reason, until} while this shard is held: an operator pause
+    ("manual") first, then the usage gate. The one read of the paused view."""
+    return operator_pause.paused_view(STATE, shard)
 
 
 async def handle_agents(request):
@@ -3098,6 +3111,8 @@ async def handle_agents(request):
                 "channels": list(sp.channels),
                 "last_channel": agent_last_channel.get(sp.id),
                 "paused": _paused_entry(sp.id),
+                "effort": effort_info(sp.agent)[0],
+                "effort_source": effort_info(sp.agent)[1],
                 "stolen_total": STATE.stolen_total.get(sp.id, 0),
                 "steer_pending": len(STATE.steer[sp.id].entries) if sp.id in STATE.steer else 0,
                 "steered_total": STATE.steered_total.get(sp.id, 0),
@@ -3321,6 +3336,116 @@ async def handle_agent_interrupt(request):
     if len(targets) > 1:
         body["shards"] = hit
     return web.json_response(body)
+
+
+# Shards whose effort change waits for the turn in flight (spec 6.4).
+effort_pending: set = set()
+effort_respawning: set = set()
+
+
+def effort_on_turn_end(shard, result):
+    """A PROCESSING shard's effort change lands after its turn: the reply has
+    posted, new claims are held, then the subprocess respawns (session kept)."""
+    if shard not in effort_pending:
+        return
+    effort_pending.discard(shard)
+    effort_respawning.add(shard)
+
+    async def respawn():
+        try:
+            await reload_agent(shard)
+        finally:
+            effort_respawning.discard(shard)
+        await turn_loop.drain_shard(STATE, shard)
+
+    result.followups.append(respawn)
+
+
+def effort_before_claim(shard):
+    return "effort-respawn" if shard in effort_respawning else None
+
+
+async def handle_agent_effort(request):
+    """POST /agents/{name}/effort {"level": low|medium|high|xhigh|max|default}.
+    Agent-level: the owning agent of {name} (every shard) takes the level."""
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer ") or auth_header[7:] != AGENT_SERVER_TOKEN:
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    targets = _resolve_request_targets(request)
+    if not targets:
+        return web.json_response({"error": "Unknown agent"}, status=404)
+    body_in = {}
+    if request.can_read_body:
+        try:
+            parsed = await request.json()
+            body_in = parsed if isinstance(parsed, dict) else {}
+        except ValueError:
+            body_in = {}
+    level = body_in.get("level")
+    valid = agent_registry.EFFORTS + (runtime_overrides.DEFAULT,)
+    if level not in valid:
+        return web.json_response(
+            {"error": f"level must be one of {', '.join(valid)}"}, status=400)
+    if level != runtime_overrides.DEFAULT and not await asyncio.to_thread(
+            runtime_overrides.cli_supports_effort):
+        return web.json_response(
+            {"error": "effort is not supported by this CLI version"}, status=400)
+    agent = STATE.agent_of(targets[0])
+    runtime_overrides.set_effort(WORKSPACE_ROOT, agent, level)
+    shards = [sp.id for sp in effective_specs() if sp.agent == agent]
+    applied, deferred = [], []
+    for sh in shards:
+        if sh in agent_processes and agent_states.get(sh) == "PROCESSING":
+            effort_pending.add(sh)
+            deferred.append(sh)
+        elif sh in agent_processes:
+            await reload_agent(sh)
+            applied.append(sh)
+        else:
+            applied.append(sh)      # nothing running: the next spawn reads it
+    return web.json_response({"effort": effort_info(agent)[0],
+                              "applied": applied, "deferred": deferred})
+
+
+async def handle_agent_pause(request):
+    """POST /agents/{name}/pause - hold the queue; the turn in progress finishes.
+    Body {"minutes": 1..1440|null, "by": str|null}."""
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer ") or auth_header[7:] != AGENT_SERVER_TOKEN:
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    targets = _resolve_request_targets(request)
+    if not targets:
+        return web.json_response({"error": "Unknown agent"}, status=404)
+    body_in = {}
+    if request.can_read_body:
+        try:
+            parsed = await request.json()
+            body_in = parsed if isinstance(parsed, dict) else {}
+        except ValueError:
+            body_in = {}
+    minutes = body_in.get("minutes")
+    if minutes is not None and (isinstance(minutes, bool) or not isinstance(minutes, int)
+                                or not (operator_pause.MIN_MINUTES <= minutes
+                                        <= operator_pause.MAX_MINUTES)):
+        return web.json_response(
+            {"error": f"minutes must be {operator_pause.MIN_MINUTES} to "
+                      f"{operator_pause.MAX_MINUTES} or null"}, status=400)
+    by = body_in.get("by")
+    until = await operator_pause.pause(
+        STATE, targets, minutes, by if isinstance(by, str) else None)
+    return web.json_response({"paused": targets, "until": until})
+
+
+async def handle_agent_resume(request):
+    """POST /agents/{name}/resume - release an operator pause and drain."""
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer ") or auth_header[7:] != AGENT_SERVER_TOKEN:
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    targets = _resolve_request_targets(request)
+    if not targets:
+        return web.json_response({"error": "Unknown agent"}, status=404)
+    gone = await operator_pause.resume(STATE, targets)
+    return web.json_response({"resumed": gone})
 
 
 async def handle_agent_kill(request):
@@ -3900,9 +4025,12 @@ def _hive_pick(to, caller, kind, counts):
     # Spec 2.7: a breaker- or budget-paused shard is unavailable to a call (a
     # governor deferral only holds machine rows, so it does not count). A buzz
     # to a paused shard is accepted and waits.
-    gate = getattr(STATE, "usage_gate", None)
-    paused = ({s for s, (why, _) in gate.paused.items() if why in ("breaker", "budget")}
-              if gate and kind == "call" else set())
+    paused = set()
+    if kind == "call":
+        for sp in specs:
+            view = operator_pause.paused_view(STATE, sp.id)
+            if view and view["reason"] in ("manual", "breaker", "budget"):
+                paused.add(sp.id)
     return hive_lib.pick_callee(specs, to, caller, states, counts,
                                 STATE.hive.waits_for(), kind=kind, paused=paused)
 
@@ -4641,6 +4769,8 @@ async def graceful_shutdown(sig):
     # No summarizer and no handoff turn here: the stop timeout cannot hold a
     # model turn. Sessions persist and the next boot resumes them.
     await turn_loop.cancel_background(STATE)
+    for t in list(getattr(getattr(STATE, "operator_pause", None), "timers", {}).values()):
+        t.cancel()
     # Kill subprocesses
     log.info("Terminating agent subprocesses...")
     for agent in list(agent_processes.keys()):
@@ -4678,6 +4808,8 @@ async def startup(app):
 
     log.info("Starting Karakos Agent Server")
 
+    redact.register_literals(os.environ)
+
     # Hive first, so its on_turn_end precedes every other turn hook.
     register_hive_hooks()
     register_beacon_hooks()
@@ -4694,6 +4826,15 @@ async def startup(app):
     # Account breaker, token budget and weekly governor (spec 2.7).
     usage_gate.install(STATE)
 
+    # Effort change after a turn (spec 6.4): hold claims, respawn, drain.
+    STATE.hooks.register("before_claim", effort_before_claim)
+    STATE.hooks.register("on_turn_end", effort_on_turn_end)
+
+    # Operator pause (spec 6.4): /pause holds the queue, /resume releases it.
+    operator_pause.install(
+        STATE, on_change=lambda sh: write_agent_beacon(
+            sh, agent_states.get(sh, "IDLE"), force=True))
+
     # Session policy last: it only schedules work, after hive and the gate.
     register_session_policy(STATE)
 
@@ -4708,6 +4849,8 @@ async def startup(app):
         # so without this every restart-after-crash pages forever about an
         # agent that is now fine.
         write_agent_beacon(sid, "IDLE", force=True)
+    # Timers for pauses that survived the restart (locks exist now).
+    operator_pause.rearm_all(STATE)
 
     # Rows keyed by an agent's own id that no shard of that agent carries are
     # unreachable history; say so, never fail over it.
@@ -4794,6 +4937,9 @@ def create_app(with_lifecycle: bool = True) -> web.Application:
     app.router.add_post("/agents/{name}/session/finalize", handle_session_finalize)
     app.router.add_post("/agents/{name}/register", handle_agent_register)
     app.router.add_post("/agents/{name}/interrupt", handle_agent_interrupt)
+    app.router.add_post("/agents/{name}/effort", handle_agent_effort)
+    app.router.add_post("/agents/{name}/pause", handle_agent_pause)
+    app.router.add_post("/agents/{name}/resume", handle_agent_resume)
     app.router.add_post("/agents/{name}/kill", handle_agent_kill)
     app.router.add_post("/agents/{name}/flush", handle_agent_flush)
     app.router.add_get("/agents/{name}/queue", handle_agent_queue)

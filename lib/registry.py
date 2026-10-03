@@ -66,7 +66,7 @@ _LEGACY_PASSTHROUGH = (
     "system_prompt", "prompt", "model", "max_turns", "timeout", "tool_streaming",
     "stream_to_channel", "dashboard_chat", "allowed_tools", "disallowed_tools", "env",
     "label", "token_budget_4h", "token_budget_min_pause_s", "work_stealing",
-    "context_budget_tokens", "reset_mode", "steering",
+    "context_budget_tokens", "reset_mode", "steering", "effort",
 )
 
 

@@ -67,9 +67,22 @@ COMMANDS = [
     _cmd("cost", "Today's and this month's spend for an agent", [AGENT_OPTION]),
     _cmd("clear", "Clear an agent's session and restart it (destructive)", [AGENT_OPTION]),
     _cmd("reload", "Bounce an agent's subprocess, preserve session", [AGENT_OPTION]),
-    _cmd("interrupt", "Stop an agent's current generation, keep the session", [AGENT_OPTION]),
+    _cmd("interrupt", "Stop an agent's current generation, keep the session", [
+        AGENT_OPTION,
+        {"name": "message", "description": "Send this right after the stop; it runs first",
+         "type": STRING, "required": False, "max_length": 1900}]),
     _cmd("kill", "Kill an agent's subprocess without respawning it", [AGENT_OPTION]),
     _cmd("flush", "Drop an agent's pending message queue", [AGENT_OPTION]),
+    _cmd("pause", "Hold an agent's queue; the turn in progress finishes", [
+        {"name": "minutes", "description": "How long, 1 to 1440 (default: until resumed)",
+         "type": INTEGER, "required": False, "min_value": 1, "max_value": 1440},
+        AGENT_OPTION]),
+    _cmd("resume", "Release a paused agent's queue", [AGENT_OPTION]),
+    _cmd("effort", "Set an agent's effort level (default removes the override)", [
+        {"name": "level", "description": "Effort level", "type": STRING, "required": True,
+         "choices": [{"name": v, "value": v} for v in
+                     ("low", "medium", "high", "xhigh", "max", "default")]},
+        AGENT_OPTION]),
 
     # --- shaped arguments ---
     _cmd("logs", "Tail a service log", [

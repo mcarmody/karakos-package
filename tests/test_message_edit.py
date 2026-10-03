@@ -204,3 +204,40 @@ def test_repeated_reaction_notice_is_the_servers_duplicate(harness):
             assert r2.status == 202 and (await r2.json())["status"] == "duplicate"
             await h.wait_idle("a")
     run(scenario())
+
+
+def test_edit_of_a_steered_message_is_a_followup_that_runs_next(harness):
+    """Steering ON (the default). A same-channel message that arrives mid-turn is
+    steered into the running turn, so by edit time the CLI has already read it.
+    The edit must not rewrite that row (the CLI would never see it) and must not
+    be lost: it becomes an `edit:<id>:<n>` follow-up row that runs as its own,
+    next turn (steerable() and claim_steerable refuse `edit:` rows)."""
+    h = harness(agents=["a", "b"], shards=SHARDS, steering={"coalesce_ms": 0})
+
+    async def scenario():
+        async with h:
+            h.module.channels_config = UX
+            h.script(rules=[
+                {"match": "first", "step": {"text": "r-first", "tools": [
+                    {"name": "Bash", "input": {"command": "sleep"}, "ms": 900}]}},
+                {"match": "edited", "step": {"text": "r-edit"}}])
+            await put(h, "m1", "first")
+            await h.wait_for(lambda: row(h, "m1")["processed"] == 1)
+            await asyncio.sleep(0.2)
+            await put(h, "m2", "second")
+            await h.wait_for(lambda: h.module.STATE.steered_total.get("a") == 1)
+            assert row(h, "m2")["processed"] == 1                # steered: already read
+            res = await edit(h, "m2", "second, edited")
+            assert res == {"status": "followup", "message_id": "m2",
+                           "followup_id": "edit:m2:1"}
+            assert row(h, "m2")["content"] == "second"           # never rewritten
+            (f,) = followups(h, "m2")
+            assert f["agent"] == "a" and "second, edited" in f["content"]
+            await h.wait_idle("a", timeout=10)
+            assert row(h, "edit:m2:1")["processed"] == 2          # not lost
+            assert row(h, "edit:m2:1")["response"] == "r-edit"
+    run(scenario())
+    assert len(h.results("a")) == 2                               # its own turn
+    assert h.module.STATE.steered_total.get("a") == 1             # only m2 was steered
+    assert "second, edited" in h.sent_to("a")[-1]                 # the model saw it
+    assert row(h, "m2")["processed"] == 2 and row(h, "m1")["processed"] == 2

@@ -34,7 +34,6 @@ exclude:
   - bin/
   - config/
   - docs/
-  - installer/
   - mcp/
   - skills/
   - system/

@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Deque, List, Optional
 
+EDIT_PREFIX = "edit:"     # message_id prefix of 6.2 edit follow-up rows
 DEFAULTS = {"enabled": True, "coalesce_ms": 300, "max_lines_per_turn": 8}
 KEYS = tuple(DEFAULTS)
 
@@ -157,6 +158,10 @@ def steerable(state, shard, row) -> bool:
             or _get(row, "channel") == HANDOFF_CHANNEL:
         return False
     if (_get(row, "priority", 0) or 0) != 0:
+        return False
+    # An edit follow-up (6.2) describes a change to a message this turn already
+    # read; it runs as the next turn, not as another line into this one.
+    if str(_get(row, "message_id", "") or "").startswith(EDIT_PREFIX):
         return False
     # A steered line is answered in the turn's channel.
     if str(_get(row, "channel_id", "")) != str(batch.channel_id):

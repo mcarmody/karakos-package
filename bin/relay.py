@@ -20,7 +20,7 @@ import sys
 import textwrap
 import time
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional, Dict, List
@@ -94,8 +94,11 @@ SYS_COMMANDS = frozenset({"clear", "reload", "status", "usage"})
 SLASH_COMMANDS = frozenset({
     "status", "health", "usage", "help",
     "cost", "clear", "reload", "interrupt", "kill", "flush",
-    "logs",
+    "logs", "pause", "resume", "effort",
 })
+
+INTERRUPT_MESSAGE_MAX = 1900
+EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max", "default")
 
 # Commands that report on the whole install rather than one agent, so they
 # neither need nor accept a target and must not be blocked by "which agent?".
@@ -127,6 +130,12 @@ def slash_args(cmd: str, options: Dict) -> str:
 
     if cmd == "logs":
         return " ".join(p for p in (s("service"), s("lines")) if p)
+    if cmd == "pause":
+        return s("minutes")
+    if cmd == "effort":
+        return s("level")
+    if cmd == "interrupt":
+        return s("message")
     # Everything else is either untargeted or agent-targeted, and the target
     # travels as `mentioned` (the same slot a text-path @mention fills), not
     # as args — so there is nothing left to rebuild.
@@ -1192,6 +1201,8 @@ class DiscordAdapter(discord.Client):
             await self.sys_reply(
                 message,
                 f"`{agent}` reloaded, session preserved." if ok else f"reload failed for `{agent}` — {detail}")
+        elif cmd == "interrupt" and args:
+            await self.sys_interrupt_with_message(message, agent, args)
         elif cmd == "interrupt":
             ok, detail, body = await self.agent_server_post_json(f"/agents/{agent}/interrupt")
             if not ok:
@@ -1218,8 +1229,97 @@ class DiscordAdapter(discord.Client):
                 message,
                 f"`{agent}` queue flushed — {body.get('flushed', 0)} message(s) dropped."
                 if ok else f"flush failed for `{agent}` — {detail}")
+        elif cmd == "pause":
+            await self.sys_pause(message, agent, args)
+        elif cmd == "resume":
+            ok, detail, body = await self.agent_server_post_json(f"/agents/{agent}/resume")
+            await self.sys_reply(
+                message,
+                f"`{agent}` resumed." if ok else f"resume failed for `{agent}` — {detail}")
+        elif cmd == "effort":
+            await self.sys_effort(message, agent, args)
         elif cmd == "cost":
             await self.sys_cost(message, agent)
+
+    def interrupt_shard(self, message, agent: str) -> str:
+        """The shard an interrupt message is addressed to: the one that owns the
+        channel and belongs to the agent, else the agent's first shard. Works in
+        channels that are not in channels.json (route_message answers None)."""
+        route = None
+        if registry_obj is not None:
+            channel_name = self.get_channel_name(str(message.channel.id))
+            route = routing.route_message(registry_obj, channel_name, agent, False)
+        if route is not None and route.agent == agent:
+            return route.shard
+        try:
+            shards = registry_obj.shards_of(agent) if registry_obj is not None else []
+        except Exception:
+            shards = []
+        return shards[0].id if shards else agent
+
+    async def sys_interrupt_with_message(self, message, agent: str, text: str):
+        """/interrupt with a message: stop the turn, run the message first (2.5)."""
+        if len(text) > INTERRUPT_MESSAGE_MAX:
+            await self.sys_reply(
+                message, f"interrupt message is too long ({len(text)} of "
+                         f"{INTERRUPT_MESSAGE_MAX} characters).")
+            return
+        shard = self.interrupt_shard(message, agent)
+        ok, detail, body = await self.agent_server_post_json(
+            f"/agents/{agent}/interrupt?shard={shard}",
+            {"message": text, "channel_id": str(message.channel.id),
+             "author": message.author.display_name})
+        if not ok:
+            await self.sys_reply(message, f"interrupt failed for `{agent}` — {detail}")
+        elif body.get("interrupted"):
+            await self.sys_reply(message, f"`{agent}` interrupted; your message runs next.")
+        else:
+            await self.sys_reply(
+                message, f"`{agent}` was not generating; your message is queued.")
+
+    async def sys_effort(self, message, agent: str, args: str):
+        """Set the agent-level effort override (owner only, via handle_sys_command)."""
+        level = args.strip().lower()
+        if level not in EFFORT_LEVELS:
+            await self.sys_reply(message, "effort level must be one of "
+                                 + ", ".join(EFFORT_LEVELS) + ".")
+            return
+        ok, detail, body = await self.agent_server_post_json(
+            f"/agents/{agent}/effort", {"level": level})
+        if not ok:
+            await self.sys_reply(message, f"effort failed for `{agent}` — {detail}")
+            return
+        applied, deferred = body.get("applied") or [], body.get("deferred") or []
+        now = body.get("effort") or "the CLI default"
+        parts = [f"`{agent}` effort is now {now}."]
+        if applied:
+            parts.append("Applied now: " + ", ".join(f"`{x}`" for x in applied) + ".")
+        if deferred:
+            parts.append("After the current turn: " + ", ".join(f"`{x}`" for x in deferred) + ".")
+        await self.sys_reply(message, " ".join(parts))
+
+    async def sys_pause(self, message, agent: str, args: str):
+        """Hold the agent's queue (owner only, via handle_sys_command)."""
+        minutes = None
+        if args:
+            try:
+                minutes = int(args)
+            except ValueError:
+                minutes = -1
+            if not 1 <= minutes <= 1440:
+                await self.sys_reply(message, "pause minutes must be 1 to 1440.")
+                return
+        ok, detail, body = await self.agent_server_post_json(
+            f"/agents/{agent}/pause",
+            {"minutes": minutes, "by": message.author.display_name})
+        if not ok:
+            await self.sys_reply(message, f"pause failed for `{agent}` — {detail}")
+            return
+        until = body.get("until")
+        when = (f"until {datetime.fromtimestamp(until, tz=timezone.utc).strftime('%H:%M UTC')}"
+                if until else "until resumed")
+        await self.sys_reply(
+            message, f"`{agent}` paused {when}; the turn in progress will finish.")
 
     async def sys_status(self, message: discord.Message):
         """Report each agent's state, liveness and queue depth."""

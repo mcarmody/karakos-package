@@ -14,6 +14,11 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- Operator switches (ANDURIL 6.4): `/pause [minutes]` holds an agent's queue (the turn in progress finishes; `data/operator-pause.json`, survives restarts; `POST /agents/{name}/pause|resume`), `/resume`, `/effort <level>` (agent-level `--effort` override in `data/runtime-overrides.json`, applied after the turn when busy; `POST /agents/{name}/effort`), and `/interrupt` with an optional `message`. `GET /agents` shards gain `effort`/`effort_source`. A registry `effort:` key, previously inert, is now passed to the CLI as `--effort`.
+- Turn logs are redacted: the stream-log tee, `turn_events` rows and tool lines mask credential-shaped strings and the values of secret-named environment variables (`lib/redact.py`). Existing logs are not rewritten (ANDURIL 6.4).
+
+- Removed the unused Go installer source (`installer/`); `install.sh` and `install.ps1` are the install paths.
+
 - The package image builds `karakos-dashboard` at the commit pinned in `dashboard.ref` (`KARAKOS_PROFILE=package`) instead of shipping its own `dashboard/` tree, which is deleted. Node is one pinned major (`NODE_MAJOR`) for both stages. Releases attach a pruned dashboard build bundle (no source). `bin/fetch-dashboard.sh`, `bin/build-dashboard-bundle.sh`, `bin/dashboard-stage.sh` (ANDURIL 5.3).
 
 - Rate-limit breaker (account-wide, `rate_limit_state` re-keyed by window type via migrator step `35_rate_limit`), per-agent `token_budget_4h` with a 30-minute minimum pause, and a weekly-usage governor for machine-started work (`config/governor.yaml`). `GET /usage` and `GET /agents` gain additive fields (ANDURIL 2.7).
