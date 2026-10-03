@@ -57,6 +57,7 @@ _DEFAULTS = {
     "env": {},
     "label": None,
     "work_stealing": {"enabled": False, "after_s": 5, "max_rows": 5},
+    "steering": {"enabled": True, "coalesce_ms": 300, "max_lines_per_turn": 8},
 }
 _KNOWN_KEYS = {"name", "role", "shards", "discord"} | set(_DEFAULTS)
 
@@ -65,7 +66,7 @@ _LEGACY_PASSTHROUGH = (
     "system_prompt", "prompt", "model", "max_turns", "timeout", "tool_streaming",
     "stream_to_channel", "dashboard_chat", "allowed_tools", "disallowed_tools", "env",
     "label", "token_budget_4h", "token_budget_min_pause_s", "work_stealing",
-    "context_budget_tokens", "reset_mode",
+    "context_budget_tokens", "reset_mode", "steering",
 )
 
 
@@ -168,6 +169,22 @@ def _check_type(aid, key, val, errors, warnings=None):
                 elif k not in ("enabled", "after_s", "max_rows"):
                     if warnings is not None:
                         warnings.append(f"agent '{aid}': unknown key 'work_stealing.{k}'")
+    elif key == "steering":
+        if not isinstance(val, dict):
+            errors.append(f"{p} must be a mapping (enabled, coalesce_ms, max_lines_per_turn)")
+        else:
+            for k, v in val.items():
+                if k == "enabled" and not isinstance(v, bool):
+                    errors.append(f"{p}.enabled must be true or false")
+                elif k == "coalesce_ms" and not (isinstance(v, (int, float))
+                                                 and not isinstance(v, bool)
+                                                 and 0 <= v <= 5000):
+                    errors.append(f"{p}.coalesce_ms must be a number from 0 to 5000")
+                elif k == "max_lines_per_turn" and not (_is_int(v) and 1 <= v <= 50):
+                    errors.append(f"{p}.max_lines_per_turn must be an integer from 1 to 50")
+                elif k not in ("enabled", "coalesce_ms", "max_lines_per_turn"):
+                    if warnings is not None:
+                        warnings.append(f"agent '{aid}': unknown key 'steering.{k}'")
     elif key in ("allowed_tools", "disallowed_tools") and not _is_str_list(val):
         errors.append(f"{p} must be a list of strings")
     elif key == "env" and not (isinstance(val, dict)

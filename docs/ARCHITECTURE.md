@@ -216,6 +216,27 @@ message is **queued**, not when it completes, and `COST_WARNING_THRESHOLD`
 from the owner bypass the limits. A separate check warns when the Anthropic
 rate-limit headroom runs low.
 
+### Steering (mid-turn messages)
+
+A message for a shard that is mid-turn is written to the CLI's stdin at once
+instead of waiting for the turn to end. The CLI queues the line: at a tool
+boundary it joins the running turn (one `result`), otherwise it starts the next
+turn by itself. The server spawns `claude` with `--replay-user-messages`, keeps a
+per-shard ledger of lines written but not yet replayed (`lib/steering.py`), and
+marks a row COMPLETE only when the turn that consumed it ends. Call and reply
+rows, priority rows, other channels and paused shards are never steered; they
+wait for their own turn. Rows still unreplayed when the process exits go back to
+the queue. Messages arriving together at idle are held for `coalesce_ms` and run
+as one batch. `POST /agents/{name}/interrupt` accepts `{"message": ...}` to end
+the turn with a control request (the process stays alive) and run the message
+next. Per-agent config, all optional:
+
+```yaml
+steering: {enabled: true, coalesce_ms: 300, max_lines_per_turn: 8}
+```
+
+`enabled: false` restores hold-until-idle exactly.
+
 ## Relay (`bin/relay.py`)
 
 The Discord gateway client and the work dispatcher. Two adapters and two

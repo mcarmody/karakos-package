@@ -23,8 +23,11 @@ def run(coro):
     return asyncio.run(coro)
 
 
-def fixture(harness, steal=STEAL):
-    return harness(agents=["a", "b"], shards=SHARDS, work_stealing=steal)
+def fixture(harness, steal=STEAL, steering=None):
+    # Steering off by default here: a same-channel row would otherwise be steered
+    # into the busy turn instead of waiting to be (not) stolen.
+    return harness(agents=["a", "b"], shards=SHARDS, work_stealing=steal,
+                   steering=steering if steering is not None else {"enabled": False})
 
 
 def slow_x1(extra=()):
@@ -420,6 +423,27 @@ def test_remove_victim_skips_queued_leaves_stolen(harness):
 # -- needs 2.5 --------------------------------------------------------------------
 
 def test_coalescing_floor(harness):
+    """With steering on, a row younger than the coalescing window is not stolen
+    even when after_s would allow it (2.4's floor, 2.5's key)."""
     from lib import registry
-    if "steering" not in registry._DEFAULTS:
-        pytest.skip("needs spec 2.5 (the `steering` registry key and coalesce_ms)")
+    assert "steering" in registry._DEFAULTS
+    h = fixture(harness, steal={"enabled": True, "after_s": 0, "max_rows": 5},
+                steering={"enabled": True, "coalesce_ms": 1500})
+    busy = [{"match": "X1", "shard": "^a$", "step": {"text": "r-X1", "delay_ms": 6000}}]
+
+    async def scenario():
+        async with h:
+            h.script(default={"text": "ok"}, rules=busy)
+            await h.send("a", "X1", channel_id="1")
+            await h.wait_for(lambda: h.module.agent_states.get("a") == "PROCESSING", timeout=4)
+            t0 = time.monotonic()
+            await h.send("a", "X2", channel_id="2")     # another channel: not steerable either
+            await asyncio.sleep(1.0)
+            assert row(h, "a", "X2")["claimed_by"] is None      # inside the window
+            await h.wait_for(lambda: row(h, "a", "X2")["claimed_by"] == "a-2", timeout=5)
+            assert time.monotonic() - t0 >= 1.5
+            await h.wait_idle("a", timeout=10)
+
+    run(scenario())
+
+
