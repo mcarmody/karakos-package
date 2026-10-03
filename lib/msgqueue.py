@@ -143,7 +143,7 @@ async def claim_batch(db, shard, limit, now=None) -> list:
 async def claim_steerable(db, shard, channel_id, limit, now=None) -> list:
     """Claim up to `limit` queued rows of `shard` that may be written into the
     turn already in flight (step 2.5): the claim_batch shape, plus no call or
-    reply row, priority 0, and the in-flight turn's channel. Never claims an
+    reply row, no edit follow-up (it runs next), priority 0, and the in-flight turn's channel. Never claims an
     expired row. Returns exactly the rows this caller now owns, in dispatch
     order."""
     await expire(db, shard, now)
@@ -153,6 +153,7 @@ async def claim_steerable(db, shard, channel_id, limit, now=None) -> list:
         " processing_started_at = CURRENT_TIMESTAMP"
         " WHERE id IN (SELECT id FROM message_queue WHERE agent = ? AND processed = ?"
         "  AND call_id IS NULL AND reply_to_agent IS NULL AND priority = 0"
+        "  AND message_id NOT LIKE 'edit:%'"
         f" AND channel != '{INTERNAL_CHANNEL}'"
         f" AND channel_id = ? ORDER BY {_ORDER} LIMIT ?)"
         " AND processed = ? RETURNING *",

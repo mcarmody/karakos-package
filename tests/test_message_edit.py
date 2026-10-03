@@ -206,7 +206,14 @@ def test_repeated_reaction_notice_is_the_servers_duplicate(harness):
     run(scenario())
 
 
-def _steered_edit_scenario(h, check):
+def test_edit_of_a_steered_message_is_a_followup_that_runs_next(harness):
+    """Steering ON (the default). A same-channel message that arrives mid-turn is
+    steered into the running turn, so by edit time the CLI has already read it.
+    The edit must not rewrite that row (the CLI would never see it) and must not
+    be lost: it becomes an `edit:<id>:<n>` follow-up row that runs as its own,
+    next turn (steerable() and claim_steerable refuse `edit:` rows)."""
+    h = harness(agents=["a", "b"], shards=SHARDS, steering={"coalesce_ms": 0})
+
     async def scenario():
         async with h:
             h.module.channels_config = UX
@@ -226,42 +233,11 @@ def _steered_edit_scenario(h, check):
             assert row(h, "m2")["content"] == "second"           # never rewritten
             (f,) = followups(h, "m2")
             assert f["agent"] == "a" and "second, edited" in f["content"]
-            await check()
             await h.wait_idle("a", timeout=10)
             assert row(h, "edit:m2:1")["processed"] == 2          # not lost
-            assert "second, edited" in " ".join(h.sent_to("a"))   # the model saw it
-            return h
-    return run(scenario())
-
-
-def test_edit_of_a_steered_message_is_a_followup_that_runs_next(harness):
-    """Steering ON (the default). A same-channel message that arrives mid-turn is
-    steered into the running turn, so by edit time the CLI has already read it.
-    The edit must not rewrite that row (the CLI would never see it) and must not
-    be lost: it becomes an `edit:<id>:<n>` follow-up row. With the steering
-    allowance used up the follow-up cannot join the turn, so it runs as its own,
-    next turn."""
-    h = harness(agents=["a", "b"], shards=SHARDS,
-                steering={"coalesce_ms": 0, "max_lines_per_turn": 1})
-
-    async def check():
-        pass
-
-    _steered_edit_scenario(h, check)
+            assert row(h, "edit:m2:1")["response"] == "r-edit"
+    run(scenario())
     assert len(h.results("a")) == 2                               # its own turn
     assert h.module.STATE.steered_total.get("a") == 1             # only m2 was steered
+    assert "second, edited" in h.sent_to("a")[-1]                 # the model saw it
     assert row(h, "m2")["processed"] == 2 and row(h, "m1")["processed"] == 2
-
-
-def test_edit_of_a_steered_message_joins_the_running_turn_when_it_can(harness):
-    """Same setup with steering allowance to spare: the follow-up row is itself
-    steered into the running turn (same channel, same shard). Still a follow-up
-    row, never an in-place rewrite, never lost."""
-    h = harness(agents=["a", "b"], shards=SHARDS, steering={"coalesce_ms": 0})
-
-    async def check():
-        await h.wait_for(lambda: h.module.STATE.steered_total.get("a") == 2)
-
-    _steered_edit_scenario(h, check)
-    assert len(h.results("a")) == 1
-    assert row(h, "m2")["content"] == "second"
