@@ -1,0 +1,3 @@
+#!/bin/bash
+# Stub host probe (spec 3.3): prints one JSON object from the environment.
+echo "{\"free_ram_mb\": ${KARAKOS_FAKE_PROBE_RAM:-8000}, \"load1\": ${KARAKOS_FAKE_PROBE_LOAD:-0.5}}"

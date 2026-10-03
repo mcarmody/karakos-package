@@ -1,0 +1,149 @@
+class DispatchAdapter:
+    """Watch inbox directories and invoke builder/reviewer scripts"""
+
+    def __init__(self):
+        self.running = False
+        self.task = None
+
+        # Initialize semaphores
+        dispatch_semaphores["builder"] = asyncio.Semaphore(MAX_CONCURRENT_BUILDERS)
+        dispatch_semaphores["reviewer"] = asyncio.Semaphore(MAX_CONCURRENT_REVIEWERS)
+
+    async def start(self):
+        """Start dispatch polling loop"""
+        self.running = True
+        self.task = asyncio.create_task(self.poll_loop())
+        log.info("Dispatch adapter started")
+
+    async def stop(self):
+        """Stop dispatch adapter"""
+        self.running = False
+        if self.task:
+            self.task.cancel()
+            try:
+                await self.task
+            except asyncio.CancelledError:
+                pass
+
+        # Wait for active dispatches
+        if active_dispatches:
+            log.info(f"Waiting for {len(active_dispatches)} active dispatches to complete")
+            await asyncio.gather(*active_dispatches.values(), return_exceptions=True)
+
+    async def poll_loop(self):
+        """Poll inbox directories for new briefs"""
+        while self.running:
+            try:
+                await self.check_inboxes()
+                await asyncio.sleep(DISPATCH_POLL_INTERVAL)
+            except Exception as e:
+                log.error(f"Dispatch poll error: {e}")
+                await asyncio.sleep(DISPATCH_POLL_INTERVAL)
+
+    async def check_inboxes(self):
+        """Check inbox directories for new briefs"""
+        for agent_type in ["builder", "reviewer"]:
+            inbox_dir = DISPATCH_INBOX_DIR / agent_type
+            if not inbox_dir.exists():
+                continue
+
+            # Find brief files
+            briefs = sorted(inbox_dir.glob("*.md"), key=lambda p: p.stat().st_mtime)
+
+            for brief_file in briefs:
+                # Check if already dispatched
+                if brief_file.stem in active_dispatches:
+                    continue
+
+                # Try to acquire semaphore (non-blocking)
+                semaphore = dispatch_semaphores.get(agent_type)
+                if semaphore and semaphore._value > 0:
+                    # Dispatch
+                    task = asyncio.create_task(self.dispatch(agent_type, brief_file))
+                    active_dispatches[brief_file.stem] = task
+                    log.info(f"Dispatched {agent_type}: {brief_file.name}")
+
+    async def dispatch(self, agent_type: str, brief_file: Path):
+        """Dispatch brief to agent"""
+        semaphore = dispatch_semaphores.get(agent_type)
+        if not semaphore:
+            return
+
+        async with semaphore:
+            try:
+                # Read brief
+                with open(brief_file) as f:
+                    brief_content = f.read()
+
+                # Parse frontmatter
+                metadata = self.parse_frontmatter(brief_content)
+                requester = metadata.get("requester", "unknown")
+                callback_channel = metadata.get("callback_channel", "general")
+
+                # Determine invoke script
+                invoke_script = WORKSPACE_ROOT / "bin" / f"invoke-{agent_type}.sh"
+                if not invoke_script.exists():
+                    log.error(f"Invoke script not found: {invoke_script}")
+                    return
+
+                # Invoke script
+                timeout = DISPATCH_TIMEOUTS.get(agent_type, 21600)
+                log.info(f"Invoking {agent_type} for {brief_file.name} (timeout: {timeout}s)")
+
+                proc = await asyncio.create_subprocess_exec(
+                    str(invoke_script),
+                    str(brief_file),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+
+                try:
+                    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+                    returncode = proc.returncode
+
+                    if returncode == 0:
+                        log.info(f"{agent_type} completed: {brief_file.name}")
+                    else:
+                        log.error(f"{agent_type} failed with code {returncode}: {brief_file.name}")
+                        log.error(f"stderr: {stderr.decode()}")
+
+                except asyncio.TimeoutError:
+                    log.error(f"{agent_type} timed out: {brief_file.name}")
+                    proc.kill()
+                    await proc.wait()
+
+                # Archive brief
+                archive_dir = brief_file.parent / "archive"
+                archive_dir.mkdir(exist_ok=True)
+                brief_file.rename(archive_dir / brief_file.name)
+
+            finally:
+                # Remove from active dispatches
+                active_dispatches.pop(brief_file.stem, None)
+
+    def parse_frontmatter(self, content: str) -> Dict:
+        """Parse YAML frontmatter from brief"""
+        if not content.startswith("---"):
+            return {}
+
+        lines = content.split("\n")
+        frontmatter_lines = []
+        in_frontmatter = False
+
+        for i, line in enumerate(lines):
+            if i == 0 and line.strip() == "---":
+                in_frontmatter = True
+                continue
+            if in_frontmatter:
+                if line.strip() == "---":
+                    break
+                frontmatter_lines.append(line)
+
+        # Simple key: value parser (not full YAML)
+        metadata = {}
+        for line in frontmatter_lines:
+            if ":" in line:
+                key, _, value = line.partition(":")
+                metadata[key.strip()] = value.strip()
+
+        return metadata
