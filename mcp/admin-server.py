@@ -27,6 +27,8 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _handshake import initialize_result  # noqa: E402
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
@@ -209,11 +211,7 @@ def handle_request(req: dict) -> dict | None:
     params = req.get("params", {}) or {}
 
     if method == "initialize":
-        return _ok(req_id, {
-            "protocolVersion": PROTOCOL_VERSION,
-            "capabilities": {"tools": {}},
-            "serverInfo": {"name": "karakos-admin", "version": "1.0.0"},
-        })
+        return _ok(req_id, initialize_result(params, "karakos-admin"))
 
     if method == "notifications/initialized":
         return None  # no response for notifications
