@@ -48,10 +48,10 @@ def _no_prompt(agents):
     return {a: {k: v for k, v in e.items() if k != "prompt"} for a, e in agents.items()}
 
 
-def migrate(ws):
+def migrate(ws, **kw):
     lines = []
     rc = runner.run(ws / "data", ws / "config", ws / "backups",
-                    steps=[STEP], out=lines.append)
+                    steps=[STEP], out=lines.append, **kw)
     return rc, lines
 
 
@@ -168,7 +168,8 @@ def test_verify_fails_when_a_field_is_dropped(tmp_path):
 def test_unknown_legacy_key_is_carried_not_dropped(tmp_path):
     legacy = {"agents": {"solo": {"model": "opus", "future_key": 7}}}
     ws = make(tmp_path, legacy=legacy, channels=None)
-    assert migrate(ws)[0] == 0
+    assert migrate(ws)[0] == 3                      # fork policy refuses unknown keys
+    assert migrate(ws, force=True)[0] == 0
     assert yaml.safe_load((ws / "config" / "agents.yaml").read_text())[
         "agents"]["solo"]["future_key"] == 7
 

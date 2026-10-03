@@ -147,8 +147,8 @@ def make_install(root: Path):
     db.parent.mkdir(parents=True)
     con = sqlite3.connect(db)
     con.execute("PRAGMA journal_mode=WAL")
-    con.execute("CREATE TABLE t(v)")
-    con.executemany("INSERT INTO t VALUES(?)", [(i,) for i in range(100)])
+    con.execute("CREATE TABLE cost_events(id)")
+    con.executemany("INSERT INTO cost_events VALUES(?)", [(i,) for i in range(100)])
     con.commit()
     return con  # open writer, WAL not checkpointed
 
@@ -156,7 +156,7 @@ def make_install(root: Path):
 def test_backup_restore_round_trip_with_open_wal_writer(tmp_path):
     root = tmp_path / "ws"
     writer = make_install(root)
-    writer.execute("INSERT INTO t VALUES(999)")
+    writer.execute("INSERT INTO cost_events VALUES(999)")
     writer.commit()
     out = bk.backup(root / "data", root / "config", root / "backups")
     assert out.name.startswith("pre-2.0-")
@@ -166,13 +166,13 @@ def test_backup_restore_round_trip_with_open_wal_writer(tmp_path):
             "data/memory/agent-server.db"} <= paths
     assert all(len(e["sha256"]) == 64 and e["size"] >= 0 for e in m["files"])
     bk.verify(out)
-    writer.execute("DELETE FROM t")
+    writer.execute("DELETE FROM cost_events")
     writer.commit()
     writer.close()
     (root / ".env").write_text("changed")
     bk.restore(out)
     con = sqlite3.connect(root / "data" / "memory" / "agent-server.db")
-    assert con.execute("SELECT count(*) FROM t").fetchone()[0] == 101
+    assert con.execute("SELECT count(*) FROM cost_events").fetchone()[0] == 101
     con.close()
     assert (root / ".env").read_text() == "TOKEN=abc\n"
 

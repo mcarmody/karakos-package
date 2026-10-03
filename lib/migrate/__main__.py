@@ -1,4 +1,4 @@
-"""python3 -m lib.migrate [--dry-run|--auto|--force|--to-backup DIR]"""
+"""python3 -m lib.migrate [--dry-run|--auto|--force|--to-backup DIR|--backup-to DIR]"""
 import argparse
 import os
 import sys
@@ -20,6 +20,15 @@ def main(argv=None) -> int:
     p.add_argument("--force", action="store_true", help="proceed on unknown schema")
     p.add_argument("--parity-queries", type=int, default=50, metavar="N",
                    help="memory recall-parity queries (default 50; 0 disables)")
+    p.add_argument("--backup-to", metavar="DIR",
+                   help="where to write the pre-migration backup (default <root>/backups)")
+    p.add_argument("--import-from", metavar="DIR",
+                   help="old checkout mounted read-only; copy its logs/inbox/data in (1.0 layout)")
+    p.add_argument("--keep-bind", metavar="HOST_DIR",
+                   help="keep the old host checkout bind-mounted for data/logs/inbox "
+                        "(writes docker-compose.override.yml)")
+    p.add_argument("--report-to", metavar="FILE",
+                   help="with --dry-run: write the report here (outside the install)")
     p.add_argument("--to-backup", metavar="DIR", help="restore a backup directory")
     p.add_argument("--root", default=os.environ.get("WORKSPACE_ROOT", "/workspace"),
                    help=argparse.SUPPRESS)
@@ -38,9 +47,10 @@ def main(argv=None) -> int:
         return EXIT_OK
 
     from lib.migrate import runner
-    return runner.run(data, config, backup_root=root / "backups",
+    return runner.run(data, config, backup_root=a.backup_to or root / "backups",
                       dry_run=a.dry_run, force=a.force,
-                      parity_queries=a.parity_queries)
+                      parity_queries=a.parity_queries, import_from=a.import_from,
+                      keep_bind=a.keep_bind, report_to=a.report_to)
 
 
 if __name__ == "__main__":
