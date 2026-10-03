@@ -31,6 +31,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 # lib/ holds modules shared by more than one script; it sits beside bin/.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import ask_handler  # noqa: E402
+import build_dispatcher  # noqa: E402
+import build_hosts  # noqa: E402
 import registry as agent_registry  # noqa: E402
 import reply_classifier  # noqa: E402
 import reply_gate_config  # noqa: E402
@@ -1861,9 +1863,22 @@ async def main():
     # Load config
     load_config()
 
-    # Start dispatch adapter
-    dispatch = DispatchAdapter()
-    await dispatch.start()
+    # Start the build queue dispatcher when enabled, else the inbox dispatch adapter
+    # (never both: they would consume the same directories).
+    build_queue_config = build_hosts.load_config(WORKSPACE_ROOT / "config" / "build-queue.yaml")
+    dispatch = None
+    if build_queue_config.invalid and build_queue_config.requested:
+        log.error("build queue config invalid (%s); no dispatcher started", build_queue_config.invalid)
+    elif build_queue_config.enabled:
+        dispatch = build_dispatcher.build_dispatcher(WORKSPACE_ROOT, build_queue_config)
+        dispatch.open()
+        await dispatch.start()
+    else:
+        if build_queue_config.invalid:
+            log.warning("build queue config invalid (%s); using the inbox dispatch adapter",
+                        build_queue_config.invalid)
+        dispatch = DispatchAdapter()
+        await dispatch.start()
 
     # Get primary agent's Discord token
     primary_agent = None
@@ -1882,7 +1897,8 @@ async def main():
         except KeyboardInterrupt:
             pass
         finally:
-            await dispatch.stop()
+            if dispatch:
+                await dispatch.stop()
         return
 
     # Start Discord bot
@@ -1896,7 +1912,8 @@ async def main():
         log.info("Shutdown signal received")
     finally:
         await discord_client.close()
-        await dispatch.stop()
+        if dispatch:
+            await dispatch.stop()
         log.info("Relay shutdown complete")
 
 if __name__ == "__main__":

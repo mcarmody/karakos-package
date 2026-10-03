@@ -1,0 +1,32 @@
+#!/bin/bash
+# Fake ssh for the build-queue tests (spec 3.3).
+#   fake-ssh [options] <target> <command...>
+# Runs the command with `bash -c` locally, as a remote shell would: stdin is
+# passed through, HOME is KARAKOS_FAKE_REMOTE_HOME, and the environment is
+# scrubbed like a real ssh session (only PATH, FAKE_CLAUDE_*, KARAKOS_FAKE_* and
+# GIT_CONFIG_* survive -- no tokens, no workspace variables).
+#   KARAKOS_FAKE_SSH_FAIL=255   exit with that status without running anything
+#   KARAKOS_FAKE_SSH_LOG=FILE   append one line per call: <target> <command>
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -o|-i|-p|-l|-F|-J) shift 2 ;;
+        -*) shift ;;
+        *) break ;;
+    esac
+done
+TARGET="${1:-}"; shift
+CMD="$*"
+if [[ -n "${KARAKOS_FAKE_SSH_LOG:-}" ]]; then
+    printf '%s %s\n' "$TARGET" "$CMD" >> "$KARAKOS_FAKE_SSH_LOG"
+fi
+if [[ -n "${KARAKOS_FAKE_SSH_FAIL:-}" ]]; then
+    exit "$KARAKOS_FAKE_SSH_FAIL"
+fi
+KEEP=()
+while IFS='=' read -r k v; do
+    case "$k" in
+        FAKE_CLAUDE_*|KARAKOS_FAKE_*|GIT_CONFIG_*|GIT_TERMINAL_PROMPT) KEEP+=("$k=${!k}") ;;
+    esac
+done < <(env)
+exec env -i PATH="$PATH" HOME="${KARAKOS_FAKE_REMOTE_HOME:?KARAKOS_FAKE_REMOTE_HOME}" \
+    "${KEEP[@]}" bash -c "$CMD"
