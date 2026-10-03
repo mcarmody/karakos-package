@@ -55,3 +55,10 @@ def test_shard_keyed_readers_are_sync():
 
 def test_discord_recorder_attribute(tmp_workspace):
     assert Harness(tmp_workspace).discord == []
+
+
+def test_poke(tmp_workspace):
+    # additive in 2.7: machine rows, as bin/poke.sh posts them
+    assert params("poke") == [("shard", EMPTY), ("source", EMPTY), ("text", EMPTY),
+                              ("channel_id", "0")]
+    assert inspect.iscoroutinefunction(Harness.poke)

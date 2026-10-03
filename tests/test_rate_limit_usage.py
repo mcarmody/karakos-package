@@ -435,3 +435,28 @@ def test_the_relay_exposes_usage_as_a_sys_command():
                         node.value.args[0] if isinstance(node.value, ast.Call) else node.value
                     )
     assert "usage" in namespace["SYS_COMMANDS"]
+
+
+# -- 2.7: the table is account-level, keyed by rate_limit_type ---------------
+
+def test_two_agents_reporting_different_windows_do_not_overwrite_each_other(ags):
+    """The regression the re-key exists for (review D3, H1): one shard's
+    `allowed_warning` for the five-hour window must not erase another's
+    `rejected` for the seven-day window."""
+    async def scenario():
+        await ags.record_rate_limit_event(
+            "amos", _info(status="rejected", rateLimitType="seven_day",
+                          resetsAt=int(time.time()) + 3600))
+        await ags.record_rate_limit_event(
+            "other", _info(status="allowed_warning", rateLimitType="five_hour"))
+        async with ags.db.execute("SELECT * FROM rate_limit_state") as cursor:
+            rows = {r["rate_limit_type"]: r for r in await cursor.fetchall()}
+        assert rows["seven_day"]["status"] == "rejected"
+        assert rows["five_hour"]["status"] == "allowed_warning"
+        return await ags.handle_usage(FakeRequest(ags.AGENT_SERVER_TOKEN))
+    resp = _with_db(ags, scenario)
+    body = json.loads(resp.text)
+    assert set(body["windows"]) == {"seven_day", "five_hour"}
+    assert body["breaker"]["paused"] is True
+    # the account's worst window is what each agent shows
+    assert body["agents"]["amos"]["status"] == "rejected"

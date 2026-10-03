@@ -36,6 +36,7 @@ _DEFAULTS = {
     "max_turns": 200,
     "timeout": 10800,
     "token_budget_4h": None,
+    "token_budget_min_pause_s": 1800,
     "context_budget_tokens": None,
     "handoff_on_reset": False,
     "system_prompt": None,
@@ -54,7 +55,7 @@ _KNOWN_KEYS = {"name", "role", "shards", "discord"} | set(_DEFAULTS)
 _LEGACY_PASSTHROUGH = (
     "system_prompt", "prompt", "model", "max_turns", "timeout", "tool_streaming",
     "stream_to_channel", "dashboard_chat", "allowed_tools", "disallowed_tools", "env",
-    "label",
+    "label", "token_budget_4h", "token_budget_min_pause_s",
 )
 
 
@@ -114,7 +115,13 @@ def _check_type(aid, key, val, errors):
         errors.append(f"{p} must be one of {', '.join(EFFORTS)} or null")
     elif key in ("max_turns", "timeout") and not (_is_int(val) and val > 0):
         errors.append(f"{p} must be a positive integer")
-    elif key in ("token_budget_4h", "context_budget_tokens") and val is not None \
+    elif key == "token_budget_4h" and val is not None \
+            and not (_is_int(val) and val >= 1000):
+        errors.append(f"{p} must be an integer of at least 1000, or null")
+    elif key == "token_budget_min_pause_s" \
+            and not (_is_int(val) and 60 <= val <= 21600):
+        errors.append(f"{p} must be an integer from 60 to 21600")
+    elif key == "context_budget_tokens" and val is not None \
             and not (_is_int(val) and val > 0):
         errors.append(f"{p} must be a positive integer or null")
     elif key in ("handoff_on_reset", "tool_streaming", "stream_to_channel",
@@ -258,6 +265,9 @@ def parse_registry(data, channel_names=None):
             else:
                 settings[key] = type(default)(default) if isinstance(default, (list, dict)) \
                     else default
+        if role == "monitor" and body.get("token_budget_4h") is not None:
+            errors.append(f"agent '{aid}': a monitor cannot have a token budget "
+                          f"(a paused monitor could not report the pause)")
         disc = body.get("discord") or {}
         if not isinstance(disc, dict):
             errors.append(f"agent '{aid}': 'discord' must be a mapping")

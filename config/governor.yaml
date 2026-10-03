@@ -1,0 +1,16 @@
+# Weekly-usage governor (spec 2.7). Machine-started work (heartbeats, scheduled
+# pokes, queued builds) yields when the account's seven-day usage reaches its
+# threshold (percent). Human messages never do. Re-read on every evaluation; a
+# missing file means these defaults, an unreadable one fails fully open.
+enabled: true
+default: 80
+jobs:            # job name (the poke --source label) glob -> threshold
+  heartbeat: 60
+never:           # globs that are never gated
+  - scheduler
+  - health-monitor
+  - wedge-check
+  - monitor
+  - build-queue-human
+resume_margin: 5       # a deferred job resumes below threshold - margin
+max_defer_hours: 12    # deferred rows older than this are skipped

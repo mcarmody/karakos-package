@@ -14,6 +14,8 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- Rate-limit breaker (account-wide, `rate_limit_state` re-keyed by window type via migrator step `35_rate_limit`), per-agent `token_budget_4h` with a 30-minute minimum pause, and a weekly-usage governor for machine-started work (`config/governor.yaml`). `GET /usage` and `GET /agents` gain additive fields (ANDURIL 2.7).
+
 ### Added
 
 - Safety hooks (`bash-safety-rails.py`, `block-bare-ssh.py`, opt-in `block-heavy-build.py`) wired by `bin/hooks-sync.py` from `config/hooks.json`, and a secrets pre-commit (`system/check-secrets.py`). Removed the `rewrite-sleep-poll.py` hook (`bin/wait-for.sh` stays).
