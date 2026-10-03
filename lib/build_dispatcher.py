@@ -134,6 +134,7 @@ class QueueDispatcher:
         self.tasks: dict = {}          # id -> asyncio.Task (the run)
         self.killing: dict = {}        # id -> asyncio.Task (a cancel in flight)
         self._cancelling: set = set()
+        self._kill_issued: set = set()   # cancelled rows whose kill already ran (once each)
         self.refs: dict = {}
         self._recovered = False
         self._last_beat = 0.0
@@ -338,10 +339,11 @@ class QueueDispatcher:
 
     def _poll_cancels(self):
         for qid in list(self.tasks):
-            if qid in self.killing:
+            if qid in self.killing or qid in self._cancelling or qid in self._kill_issued:
                 continue
             row = buildq.get(self.conn, qid)
             if row is not None and row["status"] == "cancelled":
+                self._kill_issued.add(qid)
                 self.killing[qid] = asyncio.ensure_future(self._kill_cancelled(row))
 
     # -- running -------------------------------------------------------------
@@ -363,6 +365,7 @@ class QueueDispatcher:
         buildq.add_event(self.conn, row["id"], "remote-kill" if ssh else "local-kill",
                          f"remote-kill: {word}" if ssh else f"kill: {word}", self.clock())
         if word == "failed":
+            self._kill_issued.discard(row["id"])      # a later cancel may try again
             self.conn.execute("UPDATE build_queue SET status='running', reason='cancel-failed', "
                               "finished_at=NULL WHERE id=?", (row["id"],))
             self.conn.commit()
@@ -390,6 +393,7 @@ class QueueDispatcher:
             word = await self._kill_run(row)
             self._record_kill(row, word)
             if word != "failed":
+                self._kill_issued.add(qid)
                 buildq.cancel(self.conn, qid, self.clock())
         finally:
             self._cancelling.discard(qid)
@@ -442,6 +446,7 @@ class QueueDispatcher:
 
         while qid in self.killing or qid in self._cancelling:
             await asyncio.sleep(0.05)     # a cancel is stopping this run: it owns the row
+        self._kill_issued.discard(qid)
         cur = buildq.get(conn, qid)
         if cur is None or cur["status"] != "running":
             return                       # cancelled while running: the kill path owns it

@@ -378,6 +378,8 @@ def test_cli_style_cancel_is_noticed_by_the_poll(e):
     pg = run(go())
     assert row(e, qid)["status"] == "cancelled" and not alive(pg)
     assert ("remote-kill", "remote-kill: termed") in evs(e, qid)
+    # one kill per cancel, not one per tick (a re-kill loop kept the run task from finishing)
+    assert len([x for x in evs(e, qid) if x[0] == "remote-kill"]) == 1
 
 
 def test_cancel_queued_row_is_immediate(e):
