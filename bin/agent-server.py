@@ -1910,6 +1910,26 @@ def _open_stream_log(agent: str):
     return open(path, "ab", buffering=0), now.strftime("%Y-%m-%d"), path
 
 
+_REDACT_PATTERNS = (
+    re.compile(r"(?:sk|pk|xox[a-z]|gh[pousr]|glpat)[-_][A-Za-z0-9_\-]{10,}"),
+    re.compile(r"(?i)\b(bearer|token|api[_-]?key|secret|password)([\"'\s:=]+)[^\s\"',}]{6,}"),
+    re.compile(r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]*"),
+)
+
+
+def redact_for_log(text, limit: int = 200) -> str:
+    """Truncate and mask credential-shaped strings before text reaches the log.
+
+    Raw CLI output (a garbled stream line, an auth failure body) can carry
+    tokens. This is a best-effort mask, not a guarantee.
+    """
+    out = str(text if text is not None else "")[:limit]
+    out = _REDACT_PATTERNS[0].sub("[redacted]", out)
+    out = _REDACT_PATTERNS[1].sub(lambda m: f"{m.group(1)}{m.group(2)}[redacted]", out)
+    out = _REDACT_PATTERNS[2].sub("[redacted]", out)
+    return out
+
+
 def write_stream_log(agent: str, line: bytes) -> None:
     """Tee one raw stream-json event to the agent's stream log.
 
@@ -2001,6 +2021,7 @@ async def read_agent_response(
     # pulsing "thinking" label instead of a flood of identical empty rows.
     event_seq = 0
     in_empty_think_burst = False
+    decode_errors = 0
 
     try:
         while True:
@@ -2013,7 +2034,12 @@ async def read_agent_response(
 
             try:
                 event = json.loads(line.decode())
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                decode_errors += 1
+                log.warning(
+                    f"{agent} stream-json decode error ({type(e).__name__}): "
+                    f"{redact_for_log(line.decode(errors='replace').strip())!r}"
+                )
                 continue
 
             event_type = event.get("type")
@@ -2157,8 +2183,15 @@ async def read_agent_response(
                     )
                 break
 
+    except SystemExit as e:
+        # Not a crash: something in the reader asked to exit. Say so, and end
+        # the turn with whatever has been read.
+        log.warning(f"Reader for {agent} ended by SystemExit (code={e.code!r})")
     except Exception as e:
         log.error(f"Error reading response from {agent}: {e}")
+
+    if decode_errors and metadata:
+        metadata["decode_errors"] = decode_errors
 
     # Strip any inline thinking blocks (defense in depth)
     final_text = THINKING_BLOCK_RE.sub("", final_text).strip()
