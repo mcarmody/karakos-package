@@ -313,7 +313,7 @@ its own children:
 |---|---|
 | `workspace` | System config, agent registry |
 | `session` | Finalize / load session summaries |
-| `memory` | Query episodes and facts |
+| `memory`, `graph` | Write and recall durable graph memory; link entities |
 | `schedule` | Schedule, list, cancel future work (see `bin/oneshot.py`) |
 | `discord` | Read-only Discord access — channels, history |
 | `taskboard` | Task tracking, in `data/taskboard.json` |

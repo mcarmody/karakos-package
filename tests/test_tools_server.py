@@ -97,3 +97,24 @@ def test_skill_dir_with_neither_file_is_silently_ignored(tools_server, tmp_path,
 
     assert tools == []
     assert capsys.readouterr().err == ""
+
+
+# --- memory / graph tool definitions (ANDURIL 4.2) ---------------------------
+
+def _core(tools_server, name):
+    return next(t for t in tools_server.CORE_TOOLS if t["name"] == name)
+
+
+def test_core_tools_list_memory_and_graph_with_new_enums(tools_server):
+    mem = _core(tools_server, "memory")["inputSchema"]["properties"]["action"]["enum"]
+    assert mem == ["write", "recall", "status", "remember", "facts", "recent"]
+    assert _core(tools_server, "graph")["inputSchema"]["properties"]["action"]["enum"] == \
+        ["add_entity", "add_edge"]
+
+
+def test_validate_args_rejects_unknown_action_and_non_string_content(tools_server):
+    schema = _core(tools_server, "memory")["inputSchema"]
+    assert "action" in tools_server.validate_args({"action": "bogus"}, schema)
+    assert "content" in tools_server.validate_args({"action": "write", "content": 5}, schema)
+    gschema = _core(tools_server, "graph")["inputSchema"]
+    assert tools_server.validate_args({"action": "bogus"}, gschema)
