@@ -18,11 +18,20 @@ def params(name):
             if p.name != "self"]
 
 
+def prefix(name, original):
+    """The original parameters and defaults, in order, as a prefix; later
+    parameters are allowed if they have defaults (additive growth, 2.1)."""
+    got = params(name)
+    assert got[:len(original)] == original, got
+    assert all(d is not EMPTY for _, d in got[len(original):]), got
+
+
 EMPTY = inspect.Parameter.empty
 
 
 def test_constructor():
-    assert params("__init__") == [("tmp_workspace", EMPTY), ("agents", ["a", "b"])]
+    prefix("__init__", [("tmp_workspace", EMPTY), ("agents", ["a", "b"])])
+    assert dict(params("__init__"))["shards"] is None
 
 
 def test_send():
@@ -39,7 +48,8 @@ def test_shard_keyed_readers_are_sync():
     for name in ("sent_to", "argv", "queue_rows"):
         assert params(name) == [("shard", EMPTY)], name
         assert not inspect.iscoroutinefunction(getattr(Harness, name)), name
-    assert params("cost_rows") == []
+    prefix("cost_rows", [])
+    assert dict(params("cost_rows"))["shard"] is None
     assert not inspect.iscoroutinefunction(Harness.cost_rows)
 
 

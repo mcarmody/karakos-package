@@ -40,6 +40,7 @@ import ask_handler  # noqa: E402
 import msgqueue  # noqa: E402
 import registry as agent_registry  # noqa: E402
 import prompt_compose  # noqa: E402
+import shards as shards_lib  # noqa: E402
 import spawn_env as spawn_env_lib  # noqa: E402
 import tengwar  # noqa: E402
 import turn_loop  # noqa: E402
@@ -180,6 +181,11 @@ AUTOMATED_TRAFFIC_SENTINEL = "[KARAKOS_AUTOMATED]"
 db: Optional[aiosqlite.Connection] = None
 http_session: Optional[aiohttp.ClientSession] = None
 agent_config: Dict[str, Dict[str, Any]] = {}
+# Shards (step 2.1): one `claude` subprocess each. Every runtime dict below is
+# keyed by shard id; an agent's default shard has the agent's id. Empty means
+# "no registry loaded": each key of agent_config is its own default shard.
+shard_specs: List[shards_lib.ShardSpec] = []
+shard_owner: Dict[str, str] = {}
 channels_config: Dict[str, Any] = {}
 agent_processes: Dict[str, asyncio.subprocess.Process] = {}
 agent_locks: Dict[str, asyncio.Lock] = {}
@@ -248,6 +254,9 @@ DISCORD_ID_TO_AGENT: Dict[int, str] = {}
 
 # Graceful shutdown flag
 shutting_down = False
+
+# The per-shard session summarizer; a module constant so tests can substitute it.
+SUMMARIZE_CMD = ["python3", str(Path(__file__).parent / "summarize-session.py")]
 
 # =============================================================================
 # Database Schema
@@ -419,7 +428,9 @@ async def load_config():
         for w in reg.warnings:
             log.warning(f"registry: {w}")
         agent_config = reg.legacy_view()["agents"]
-        log.info(f"Loaded configuration for {len(agent_config)} agents")
+        _set_shard_specs(shards_lib.plan_shards(reg))
+        log.info(f"Loaded configuration for {len(agent_config)} agents "
+                 f"({len(shard_specs)} shards)")
 
     # Load channels config
     if CHANNELS_CONFIG_PATH.exists():
@@ -433,8 +444,33 @@ async def load_config():
     _rebuild_token_maps()
 
 
+def _set_shard_specs(specs):
+    global shard_specs, shard_owner
+    shard_specs = list(specs)
+    shard_owner = {s.id: s.agent for s in shard_specs}
+
+
+def effective_specs() -> List[shards_lib.ShardSpec]:
+    """shard_specs, or one default shard per agent_config key when no registry
+    was loaded (tests that set agent_config directly)."""
+    return shard_specs or [shards_lib.ShardSpec(a, a, (), True) for a in agent_config]
+
+
+def spec_of(shard: str) -> shards_lib.ShardSpec:
+    for sp in effective_specs():
+        if sp.id == shard:
+            return sp
+    return shards_lib.ShardSpec(shard, shard, (), True)
+
+
+def label_of(shard: str) -> str:
+    return shards_lib.shard_label(spec_of(shard))
+
+
 def _rebuild_token_maps():
-    """Rebuild AGENT_TOKENS / DISCORD_ID_TO_AGENT from agent_config."""
+    """Rebuild AGENT_TOKENS / DISCORD_ID_TO_AGENT from agent_config. The agent's
+    token is also registered under each of its shard ids, so post_to_discord
+    and start_typing take a shard id unchanged."""
     AGENT_TOKENS.clear()
     DISCORD_ID_TO_AGENT.clear()
     for agent_name, config in agent_config.items():
@@ -443,6 +479,9 @@ def _rebuild_token_maps():
             token = os.environ.get(token_env_var, "")
             if token:
                 AGENT_TOKENS[agent_name] = token
+                for sp in effective_specs():
+                    if sp.agent == agent_name:
+                        AGENT_TOKENS[sp.id] = token
                 bot_id_env = config.get("discord_bot_id_env")
                 if bot_id_env:
                     bot_id = os.environ.get(bot_id_env)
@@ -692,19 +731,25 @@ def load_stored_facts(agent: str = "", limit: int = 50) -> str:
     return header + "\n\n" + "\n".join(facts_lines[:limit])
 
 
-async def start_agent_subprocess(agent: str):
-    """Start persistent Claude subprocess for agent"""
-    config = agent_config.get(agent, {})
+async def start_agent_subprocess(shard: str):
+    """Start the persistent Claude subprocess for a shard (an agent's default
+    shard has the agent's id). Shards of one agent share persona and memory;
+    each has its own session, prompt shard text and runtime state."""
+    agent = STATE.agent_of(shard)
+    config = STATE.cfg(shard)
     if not config:
         log.error(f"No config found for agent: {agent}")
         return
+    label = label_of(shard)
+    is_default_shard = shard == agent
 
-    session_id = await get_or_create_session(agent)
+    session_id = await get_or_create_session(shard)
     # Core + agent section + shard text + house style, composed at spawn so a
     # fleet-wide rule is one edit. Never fails the spawn over a prompt file.
     system_prompt_text = prompt_compose.compose_system_prompt(
-        WORKSPACE_ROOT, agent, config=config)
-    prompt_compose.write_generated(WORKSPACE_ROOT, agent, system_prompt_text)
+        WORKSPACE_ROOT, agent, None if is_default_shard else shard, config=config)
+    prompt_compose.write_generated(WORKSPACE_ROOT, agent, system_prompt_text,
+                                   None if is_default_shard else shard)
 
     # Load persona
     persona_content = load_persona_files(agent)
@@ -727,15 +772,18 @@ async def start_agent_subprocess(agent: str):
     # First-boot gate: if no persona has been written yet, prepend the
     # onboarding prompt so the agent asks the user for guidance instead
     # of arriving fully-formed.
-    onboarding = load_onboarding_prompt(agent)
+    # Only the agent's first shard: a second shard of an unonboarded agent must
+    # not start a second onboarding.
+    onboarding = (load_onboarding_prompt(agent)
+                  if shards_lib.first_shard(effective_specs(), agent) == shard else "")
     if onboarding:
-        log.info(f"Injecting onboarding prompt for {agent} (persona is empty)")
+        log.info(f"Injecting onboarding prompt for {label} (persona is empty)")
         persona_content = onboarding + ("\n\n" + persona_content if persona_content else "")
 
     # Load last session summary if available
-    last_session = await load_last_session(agent)
+    last_session = await load_last_session(shard)
     if last_session["status"] == "success":
-        log.info(f"Injecting session summary for {agent} (age: {last_session['age_hours']:.1f}h)")
+        log.info(f"Injecting session summary for {label} (age: {last_session['age_hours']:.1f}h)")
         persona_content = f"[SESSION RESET]\n\n{last_session['summary']}\n\n{persona_content}"
 
     # Build command
@@ -766,9 +814,9 @@ async def start_agent_subprocess(agent: str):
         cmd.extend(["--settings", str(CLAUDE_SETTINGS_PATH)])
         allow_list, deny_list = load_permission_policy()
         if allow_list or deny_list:
-            log.info(f"{agent} permission policy: allow={allow_list} deny={deny_list}")
+            log.info(f"{label} permission policy: allow={allow_list} deny={deny_list}")
     else:
-        log.warning(f"No settings file at {CLAUDE_SETTINGS_PATH}; starting {agent} with hooks unwired")
+        log.warning(f"No settings file at {CLAUDE_SETTINGS_PATH}; starting {label} with hooks unwired")
 
     if persona_content:
         cmd.extend(["--append-system-prompt", persona_content])
@@ -794,7 +842,7 @@ async def start_agent_subprocess(agent: str):
     # (#101). WORKSPACE_ROOT and the agent-server address/token are for the
     # package's own hooks and MCP servers (tools-server/admin-server call back
     # into this server); they are not in the inert allowlist, so set them here.
-    extra = {"KARAKOS_AGENT": agent, "WORKSPACE_ROOT": str(WORKSPACE_ROOT),
+    extra = {"KARAKOS_AGENT": agent, "KARAKOS_SHARD": shard, "WORKSPACE_ROOT": str(WORKSPACE_ROOT),
              "AGENT_SERVER_PORT": str(PORT)}
     if AGENT_SERVER_TOKEN:
         extra["AGENT_SERVER_TOKEN"] = AGENT_SERVER_TOKEN
@@ -805,13 +853,15 @@ async def start_agent_subprocess(agent: str):
     else:
         spawn_env = spawn_env_lib.build_subprocess_env(os.environ, env_overrides, extra)
     if env_overrides:
-        log.info(f"{agent} env overrides: {sorted(env_overrides.keys())}")
+        log.info(f"{label} env overrides: {sorted(env_overrides.keys())}")
 
-    log.info(f"Starting {agent} subprocess (model={config.get('model')}, session={session_id[:8]})")
+    shard_note = "" if is_default_shard else f", shard={shard}"
+    log.info(f"Starting {label} subprocess (model={config.get('model')}, "
+             f"session={session_id[:8]}{shard_note})")
 
     # Cancel any stderr reader left over from a prior subprocess for this
     # agent before spawning a new one — otherwise it leaks on every respawn.
-    stale_reader = stderr_reader_tasks.pop(agent, None)
+    stale_reader = stderr_reader_tasks.pop(shard, None)
     if stale_reader and not stale_reader.done():
         stale_reader.cancel()
 
@@ -822,7 +872,7 @@ async def start_agent_subprocess(agent: str):
     # its own process died, and cancelling the current task would abort the
     # spawn at its first real await (found by the fake-claude harness; fakes
     # that never suspend in create_subprocess_exec hid it).
-    stale_watcher = respawn_watcher_tasks.pop(agent, None)
+    stale_watcher = respawn_watcher_tasks.pop(shard, None)
     if (stale_watcher and not stale_watcher.done()
             and stale_watcher is not asyncio.current_task()):
         stale_watcher.cancel()
@@ -835,25 +885,25 @@ async def start_agent_subprocess(agent: str):
             stderr=asyncio.subprocess.PIPE,
             env=spawn_env,
         )
-        agent_processes[agent] = proc
-        agent_states[agent] = "IDLE"
-        agent_sessions[agent] = session_id
+        agent_processes[shard] = proc
+        agent_states[shard] = "IDLE"
+        agent_sessions[shard] = session_id
         # A live process is by definition no longer deliberately dead. Clearing
         # here rather than in the kill paths keeps the flag correct for the one
         # kill that is *not* followed by a spawn — POST /kill, which is meant
         # to leave the agent down.
-        deliberate_kills.discard(agent)
+        deliberate_kills.discard(shard)
 
         # Start stderr reader, tracked so it can be cancelled on kill/respawn.
-        stderr_reader_tasks[agent] = asyncio.create_task(stderr_reader(agent, proc))
-        respawn_watcher_tasks[agent] = asyncio.create_task(respawn_watcher(agent, proc))
+        stderr_reader_tasks[shard] = asyncio.create_task(stderr_reader(shard, proc))
+        respawn_watcher_tasks[shard] = asyncio.create_task(respawn_watcher(shard, proc))
 
-        log.info(f"{agent} subprocess started (PID {proc.pid})")
+        log.info(f"{label} subprocess started (PID {proc.pid})")
     except Exception as e:
-        log.error(f"Failed to start {agent}: {e}")
-        agent_states[agent] = "ERROR_RECOVERY"
+        log.error(f"Failed to start {label}: {e}")
+        agent_states[shard] = "ERROR_RECOVERY"
 
-async def stderr_reader(agent: str, proc: asyncio.subprocess.Process):
+async def stderr_reader(shard: str, proc: asyncio.subprocess.Process):
     """Read and log stderr from agent subprocess"""
     try:
         while True:
@@ -862,13 +912,13 @@ async def stderr_reader(agent: str, proc: asyncio.subprocess.Process):
                 break
             msg = line.decode().strip()
             if msg:
-                log.warning(f"{agent} stderr: {msg}")
+                log.warning(f"{label_of(shard)} stderr: {msg}")
     except Exception as e:
-        log.error(f"stderr reader error for {agent}: {e}")
+        log.error(f"stderr reader error for {label_of(shard)}: {e}")
 
-async def kill_agent_subprocess(agent: str):
+async def kill_agent_subprocess(shard: str):
     """Terminate agent subprocess"""
-    proc = agent_processes.get(agent)
+    proc = agent_processes.get(shard)
     if not proc:
         return
 
@@ -880,9 +930,9 @@ async def kill_agent_subprocess(agent: str):
     # its checks into start_agent_subprocess, where a cancel would abort a
     # spawn half-done rather than prevent it. Set before terminating, since a
     # flag set afterwards would lose that window by definition.
-    deliberate_kills.add(agent)
+    deliberate_kills.add(shard)
 
-    log.info(f"Killing {agent} subprocess (PID {proc.pid})")
+    log.info(f"Killing {label_of(shard)} subprocess (PID {proc.pid})")
     def _already_dead(exc: BaseException) -> bool:
         # The process exited between the lookup and the signal (or the
         # respawn watcher reaped it): nothing left to kill.
@@ -893,7 +943,7 @@ async def kill_agent_subprocess(agent: str):
         proc.terminate()
         await asyncio.wait_for(proc.wait(), timeout=5)
     except asyncio.TimeoutError:
-        log.warning(f"{agent} didn't terminate, sending SIGKILL")
+        log.warning(f"{label_of(shard)} didn't terminate, sending SIGKILL")
         try:
             proc.kill()
             await proc.wait()
@@ -903,22 +953,22 @@ async def kill_agent_subprocess(agent: str):
     except OSError as e:
         if not _already_dead(e):
             raise
-        log.info(f"{agent} subprocess already gone at kill time")
+        log.info(f"{label_of(shard)} subprocess already gone at kill time")
 
-    agent_processes.pop(agent, None)
+    agent_processes.pop(shard, None)
 
-    reader_task = stderr_reader_tasks.pop(agent, None)
+    reader_task = stderr_reader_tasks.pop(shard, None)
     if reader_task and not reader_task.done():
         reader_task.cancel()
 
-    watcher_task = respawn_watcher_tasks.pop(agent, None)
+    watcher_task = respawn_watcher_tasks.pop(shard, None)
     if watcher_task and not watcher_task.done():
         watcher_task.cancel()
 
-    log.info(f"{agent} subprocess terminated")
+    log.info(f"{label_of(shard)} subprocess terminated")
 
 
-async def notify_respawn(agent: str, reason: str, restarted: bool = True) -> None:
+async def notify_respawn(shard: str, reason: str, restarted: bool = True) -> None:
     """Post a one-line notice that the subprocess restarted, so a context
     reset is visible rather than reading as amnesia (#90).
 
@@ -928,28 +978,28 @@ async def notify_respawn(agent: str, reason: str, restarted: bool = True) -> Non
     `restarted=False` is the crashloop case — the agent is down and staying
     down, so the notice must not promise it is back.
     """
-    channel_id = agent_last_channel.get(agent)
+    channel_id = agent_last_channel.get(shard)
     if not channel_id or channel_id == "0":
-        log.info(f"{agent} respawn event ({reason}); no known channel to notify")
+        log.info(f"{label_of(shard)} respawn event ({reason}); no known channel to notify")
         return
 
     if restarted:
         notice = (
-            f"🔄 {agent} restarted — {reason}. Context was cleared; "
+            f"🔄 {label_of(shard)} restarted — {reason}. Context was cleared; "
             f"recent conversation may need a recap."
         )
     else:
-        notice = f"🛑 {agent} is down — {reason}."
+        notice = f"🛑 {label_of(shard)} is down — {reason}."
     try:
         # Deliberately not dead_letter=True. This is an incidental notice, not
         # a reply anyone is waiting on, and replaying it on a later boot would
         # announce a restart that had already been announced.
-        await post_to_discord(agent, channel_id, notice)
+        await post_to_discord(shard, channel_id, notice)
     except Exception as e:
-        log.warning(f"respawn notice for {agent} failed: {e}")
+        log.warning(f"respawn notice for {label_of(shard)} failed: {e}")
 
 
-async def respawn_watcher(agent: str, proc: asyncio.subprocess.Process):
+async def respawn_watcher(shard: str, proc: asyncio.subprocess.Process):
     """Await this subprocess's exit and, if nobody asked for it, bring the
     agent back and say so (#90).
 
@@ -968,13 +1018,13 @@ async def respawn_watcher(agent: str, proc: asyncio.subprocess.Process):
     except asyncio.CancelledError:
         raise
     except Exception as e:
-        log.error(f"respawn watcher for {agent} failed to await exit: {e}")
+        log.error(f"respawn watcher for {label_of(shard)} failed to await exit: {e}")
         return
 
-    if shutting_down or agent in deliberate_kills:
+    if shutting_down or shard in deliberate_kills:
         return
 
-    lock = agent_locks.get(agent)
+    lock = agent_locks.get(shard)
     if lock is None:
         return
 
@@ -982,10 +1032,10 @@ async def respawn_watcher(agent: str, proc: asyncio.subprocess.Process):
         # Re-check under the lock. Both conditions can become true while we
         # waited for a turn to finish, and respawning after a deliberate kill
         # would resurrect an agent an operator just took down.
-        if shutting_down or agent in deliberate_kills:
+        if shutting_down or shard in deliberate_kills:
             return
         # Someone else already replaced this process; its lifecycle is theirs.
-        if agent_processes.get(agent) is not proc:
+        if agent_processes.get(shard) is not proc:
             return
 
         # Crashloop brake. A subprocess that dies immediately on spawn — bad
@@ -993,17 +1043,17 @@ async def respawn_watcher(agent: str, proc: asyncio.subprocess.Process):
         # otherwise respawn and announce itself forever, turning one broken
         # config into an unbounded stream of Discord messages. Recovery is
         # worth automating; an infinite loop is not.
-        recent = respawn_history.setdefault(agent, [])
+        recent = respawn_history.setdefault(shard, [])
         now = time.monotonic()
         recent[:] = [t for t in recent if now - t < RESPAWN_WINDOW_SECONDS]
         recent.append(now)
         if len(recent) > RESPAWN_MAX_IN_WINDOW:
             log.error(
-                f"{agent} exited {len(recent)} times in {RESPAWN_WINDOW_SECONDS}s "
+                f"{label_of(shard)} exited {len(recent)} times in {RESPAWN_WINDOW_SECONDS}s "
                 f"(code {returncode}) — not respawning again"
             )
             await notify_respawn(
-                agent,
+                shard,
                 f"it crashed {len(recent)} times in under "
                 f"{RESPAWN_WINDOW_SECONDS // 60} minutes and has been left down; "
                 f"this needs a look at the server logs",
@@ -1011,34 +1061,34 @@ async def respawn_watcher(agent: str, proc: asyncio.subprocess.Process):
             )
             return
 
-        log.warning(f"{agent} subprocess exited unexpectedly (code {returncode}), respawning")
-        await start_agent_subprocess(agent)
+        log.warning(f"{label_of(shard)} subprocess exited unexpectedly (code {returncode}), respawning")
+        await start_agent_subprocess(shard)
 
-    await notify_respawn(agent, f"the subprocess exited unexpectedly (code {returncode})")
+    await notify_respawn(shard, f"the subprocess exited unexpectedly (code {returncode})")
 
-async def restart_agent(agent: str):
+async def restart_agent(shard: str):
     """Restart agent subprocess"""
-    log.info(f"Restarting {agent}")
-    await kill_agent_subprocess(agent)
-    await clear_session(agent)
-    agent_last_cost.pop(agent, None)
-    response_buffers[agent] = ""
-    await start_agent_subprocess(agent)
+    log.info(f"Restarting {label_of(shard)}")
+    await kill_agent_subprocess(shard)
+    await clear_session(shard)
+    agent_last_cost.pop(shard, None)
+    response_buffers[shard] = ""
+    await start_agent_subprocess(shard)
 
 
-async def reload_agent(agent: str):
+async def reload_agent(shard: str):
     """Bounce the subprocess but keep the session — used to pick up new
     SYSTEM_PROMPT / persona / MCP config without dropping conversation
     context. The respawn calls --resume on the existing session_id.
     """
-    log.info(f"Reloading {agent} (preserving session)")
-    await kill_agent_subprocess(agent)
-    agent_last_cost.pop(agent, None)
-    response_buffers[agent] = ""
-    await start_agent_subprocess(agent)
+    log.info(f"Reloading {label_of(shard)} (preserving session)")
+    await kill_agent_subprocess(shard)
+    agent_last_cost.pop(shard, None)
+    response_buffers[shard] = ""
+    await start_agent_subprocess(shard)
 
 
-async def interrupt_agent(agent: str) -> bool:
+async def interrupt_agent(shard: str) -> bool:
     """Stop an in-flight generation, keeping the session. Returns whether
     there was anything to stop.
 
@@ -1054,19 +1104,19 @@ async def interrupt_agent(agent: str) -> bool:
     text that had accumulated before the kill would be posted to Discord as
     if it were the answer, which is the opposite of what "interrupt" means.
     """
-    if agent_states.get(agent) != "PROCESSING":
+    if agent_states.get(shard) != "PROCESSING":
         return False
 
-    log.info(f"Interrupting {agent} (session preserved)")
-    interrupted_agents.add(agent)
-    await kill_agent_subprocess(agent)
-    agent_last_cost.pop(agent, None)
-    response_buffers[agent] = ""
-    await start_agent_subprocess(agent)
+    log.info(f"Interrupting {label_of(shard)} (session preserved)")
+    interrupted_agents.add(shard)
+    await kill_agent_subprocess(shard)
+    agent_last_cost.pop(shard, None)
+    response_buffers[shard] = ""
+    await start_agent_subprocess(shard)
     return True
 
 
-async def flush_agent_queue(agent: str) -> int:
+async def flush_agent_queue(shard: str) -> int:
     """Drop every message still waiting for `agent`. Returns how many.
 
     In-progress messages are left alone: they are already inside the
@@ -1074,7 +1124,7 @@ async def flush_agent_queue(agent: str) -> int:
     """
     async with db.execute(
         "SELECT COUNT(*) as count FROM message_queue WHERE agent = ? AND processed = ?",
-        (agent, STATUS_QUEUED),
+        (shard, STATUS_QUEUED),
     ) as cursor:
         row = await cursor.fetchone()
         pending = row["count"]
@@ -1082,11 +1132,11 @@ async def flush_agent_queue(agent: str) -> int:
     if pending:
         await db.execute(
             "UPDATE message_queue SET processed = ? WHERE agent = ? AND processed = ?",
-            (STATUS_SKIPPED, agent, STATUS_QUEUED),
+            (STATUS_SKIPPED, shard, STATUS_QUEUED),
         )
         await db.commit()
 
-    log.info(f"Flushed {pending} queued message(s) for {agent}")
+    log.info(f"Flushed {pending} queued message(s) for {label_of(shard)}")
     return pending
 
 # =============================================================================
@@ -2212,6 +2262,7 @@ async def handle_message(request):
     data = await request.json()
 
     agent = data.get("agent")
+    shard_hint = data.get("shard")
     channel = data.get("channel", "general")
     channel_id = data.get("channel_id", "0")
     server = data.get("server", "discord")
@@ -2225,7 +2276,19 @@ async def handle_message(request):
     if not isinstance(attachments, list):
         return web.json_response({"error": "attachments must be a list"}, status=400)
 
-    if not agent or agent not in agent_config:
+    # A shard id selects that shard; an agent id selects the agent's first shard
+    # (2.2 replaces that with channel routing). An unknown shard hint with a
+    # valid agent falls back to the agent's first shard rather than failing.
+    specs = effective_specs()
+    known_shards = {sp.id for sp in specs}
+    if shard_hint and shard_hint in known_shards:
+        agent = shard_hint
+    else:
+        if shard_hint:
+            log.warning(f"/message: unknown shard {shard_hint!r}; "
+                        f"falling back to the first shard of agent {agent!r}")
+        agent = shards_lib.first_shard(specs, agent) if agent else None
+    if not agent:
         return web.json_response({"error": "Invalid agent"}, status=400)
 
     # An image posted with no caption is a real message with empty text. It
@@ -2292,26 +2355,36 @@ async def handle_health(request):
         return web.json_response({"error": "Unauthorized"}, status=401)
 
     agent_status = {}
+    shard_status = {}
     ctx_by_shard = await get_context_tokens()
-    for agent in agent_config:
-        proc = agent_processes.get(agent)
-        queue_depth = 0
+    specs = effective_specs()
+    for sp in specs:
+        proc = agent_processes.get(sp.id)
         async with db.execute(
             "SELECT COUNT(*) as count FROM message_queue WHERE agent = ? AND processed = ?",
-            (agent, STATUS_QUEUED)
+            (sp.id, STATUS_QUEUED)
         ) as cursor:
             row = await cursor.fetchone()
             queue_depth = row["count"]
-
-        agent_status[agent] = {
-            "state": agent_states.get(agent, "UNKNOWN"),
+        shard_status[sp.id] = {
+            "state": agent_states.get(sp.id, "UNKNOWN"),
             "alive": proc is not None and proc.returncode is None,
             "queue_depth": queue_depth,
-            "session_id": agent_sessions.get(agent, "")[:8],
-            # Shards of an agent are keyed by shard id; until the registry
-            # has shards the only shard is the agent itself. 0 = unknown.
-            "context_tokens": ctx_by_shard.get(agent, 0),
-            "shards": {agent: {"context_tokens": ctx_by_shard.get(agent, 0)}},
+            "session_id": agent_sessions.get(sp.id, "")[:8],
+            # 0 = unknown.
+            "context_tokens": ctx_by_shard.get(sp.id, 0),
+        }
+
+    for agent in dict.fromkeys(sp.agent for sp in specs):
+        mine = [sp.id for sp in specs if sp.agent == agent]
+        agent_status[agent] = {
+            "state": shards_lib.aggregate_state(shard_status[i]["state"] for i in mine),
+            "alive": any(shard_status[i]["alive"] for i in mine),
+            "queue_depth": sum(shard_status[i]["queue_depth"] for i in mine),
+            "session_id": shard_status[mine[0]]["session_id"],
+            "context_tokens": max(shard_status[i]["context_tokens"] for i in mine),
+            # Per-shard values; keyed by shard id.
+            "shards": {i: shard_status[i] for i in mine},
         }
 
     # A non-zero count means replies were generated and never delivered. It is
@@ -2327,6 +2400,7 @@ async def handle_health(request):
         "uptime_seconds": int(time.time() - SERVER_START_TS),
         "queue_depth": sum(a["queue_depth"] for a in agent_status.values()),
         "agents": agent_status,
+        "shards": shard_status,
         "dead_letters": undelivered,
         "dead_letter_path": str(DEAD_LETTER_PATH),
     })
@@ -2340,12 +2414,35 @@ async def handle_agents(request):
 
     agents_list = []
     ctx_by_shard = await get_context_tokens()
-    for agent, config in agent_config.items():
+    specs = effective_specs()
+    async with db.execute(
+        "SELECT agent, COUNT(*) AS count FROM message_queue WHERE processed = ? GROUP BY agent",
+        (STATUS_QUEUED,)
+    ) as cursor:
+        depth_by_shard = {r["agent"]: r["count"] for r in await cursor.fetchall()}
+    for agent in dict.fromkeys(sp.agent for sp in specs):
+        config = agent_config.get(agent, {})
+        mine = [sp for sp in specs if sp.agent == agent]
+        shard_rows = []
+        for sp in mine:
+            proc = agent_processes.get(sp.id)
+            shard_rows.append({
+                "id": sp.id,
+                "is_default": sp.is_default,
+                "state": agent_states.get(sp.id, "UNKNOWN"),
+                "alive": proc is not None and proc.returncode is None,
+                "pid": proc.pid if proc is not None else None,
+                "session_id": agent_sessions.get(sp.id, "")[:8],
+                "queue_depth": depth_by_shard.get(sp.id, 0),
+                "context_tokens": ctx_by_shard.get(sp.id, 0),
+                "channels": list(sp.channels),
+                "last_channel": agent_last_channel.get(sp.id),
+            })
         agents_list.append({
             "name": agent,
-            # Max over the agent's shards; 0 = unknown. Per-shard values below.
-            "context_tokens": ctx_by_shard.get(agent, 0),
-            "shards": {agent: {"context_tokens": ctx_by_shard.get(agent, 0)}},
+            # Max over the agent's shards; 0 = unknown. Per-shard values in `shards`.
+            "context_tokens": max(r["context_tokens"] for r in shard_rows),
+            "shards": shard_rows,
             "model": config.get("model"),
             # The same defaults the subprocess is actually launched with (see
             # start_agent). Reporting the raw config.get() would show a blank
@@ -2353,7 +2450,7 @@ async def handle_agents(request):
             # configured" rather than "configured by omission".
             "max_turns": config.get("max_turns", 200),
             "timeout": config.get("timeout"),
-            "state": agent_states.get(agent, "UNKNOWN"),
+            "state": shards_lib.aggregate_state(r["state"] for r in shard_rows),
             "has_discord_token": agent in AGENT_TOKENS,
             # Chat-picker hygiene: not every configured agent is meant to be
             # talked to directly from the dashboard (a low-capability relay
@@ -2366,6 +2463,69 @@ async def handle_agents(request):
 
     return web.json_response({"agents": agents_list})
 
+def _resolve_request_targets(request) -> List[str]:
+    """Shard ids the `/agents/{name}/...` path (and optional ?shard=) means."""
+    return shards_lib.resolve_targets(
+        effective_specs(), request.match_info.get("name"),
+        request.rel_url.query.get("shard"))
+
+
+def _with_shards(body: Dict[str, Any], targets: List[str]) -> Dict[str, Any]:
+    if len(targets) > 1:
+        body["shards"] = list(targets)
+    return body
+
+
+async def sync_shards(new_specs, old_specs=None) -> Dict[str, List[str]]:
+    """Make the running shards match `new_specs` (after a registry reload).
+
+    Added shards get lock/state/buffer/beacon and a subprocess; removed shards
+    are killed, forgotten, and their still-QUEUED rows marked SKIPPED
+    ('shard removed'); their sessions and cost_events rows are left alone. Kept
+    shards are not touched, so their PIDs do not change.
+    """
+    old = list(old_specs) if old_specs is not None else list(effective_specs())
+    _set_shard_specs(new_specs)
+    _rebuild_token_maps()
+    diff = shards_lib.diff_shards(old, new_specs)
+
+    for sp in diff.removed:
+        sid = sp.id
+        await kill_agent_subprocess(sid)
+        for d in (agent_locks, agent_states, response_buffers, agent_last_cost,
+                  agent_sessions, agent_last_channel, agent_turn_context,
+                  agent_wall_strikes, respawn_history, _last_beacon_write):
+            d.pop(sid, None)
+        task = agent_hold_tasks.pop(sid, None)
+        if task is not None and not task.done():
+            task.cancel()
+        agent_hold_notice_until.pop(sid, None)
+        deliberate_kills.discard(sid)
+        interrupted_agents.discard(sid)
+        await db.execute(
+            "UPDATE message_queue SET processed = ?, response = ? "
+            "WHERE agent = ? AND processed = ?",
+            (STATUS_SKIPPED, "shard removed", sid, STATUS_QUEUED))
+        await db.commit()
+        try:
+            (AGENT_BEACON_DIR / f"{sid}.json").unlink()
+        except OSError:
+            pass
+        log.info(f"Shard {sid} removed")
+
+    for sp in diff.added:
+        agent_locks[sp.id] = asyncio.Lock()
+        agent_states[sp.id] = "IDLE"
+        response_buffers[sp.id] = ""
+        write_agent_beacon(sp.id, "IDLE", force=True)
+    for sp in diff.added:
+        log.info(f"Shard {shards_lib.shard_label(sp)} added")
+        await start_agent_subprocess(sp.id)
+
+    return {"added": [s.id for s in diff.added],
+            "removed": [s.id for s in diff.removed]}
+
+
 async def handle_agent_reset(request):
     """POST /agents/{name}/reset - Reset agent session"""
     # Check bearer token
@@ -2373,12 +2533,13 @@ async def handle_agent_reset(request):
     if not auth_header.startswith("Bearer ") or auth_header[7:] != AGENT_SERVER_TOKEN:
         return web.json_response({"error": "Unauthorized"}, status=401)
 
-    agent = request.match_info.get("name")
-    if agent not in agent_config:
+    targets = _resolve_request_targets(request)
+    if not targets:
         return web.json_response({"error": "Unknown agent"}, status=404)
 
-    await restart_agent(agent)
-    return web.json_response({"status": "reset"})
+    for t in targets:
+        await restart_agent(t)
+    return web.json_response(_with_shards({"status": "reset"}, targets))
 
 
 async def handle_agent_reload(request):
@@ -2388,8 +2549,8 @@ async def handle_agent_reload(request):
     if not auth_header.startswith("Bearer ") or auth_header[7:] != AGENT_SERVER_TOKEN:
         return web.json_response({"error": "Unauthorized"}, status=401)
 
-    agent = request.match_info.get("name")
-    if agent not in agent_config:
+    targets = _resolve_request_targets(request)
+    if not targets:
         return web.json_response({"error": "Unknown agent"}, status=404)
 
     # B19: re-read the registry so edits to agents.yaml take effect. An invalid
@@ -2403,10 +2564,16 @@ async def handle_agent_reload(request):
             status=400,
         )
     agent_config = reg.legacy_view()["agents"]
-    _rebuild_token_maps()
+    changes = await sync_shards(shards_lib.plan_shards(reg))
+    if changes["added"] or changes["removed"]:
+        # A shard-topology change is applied on its own: kept shards are not
+        # bounced (their PIDs stay), and the response says what changed.
+        return web.json_response({"status": "reloaded", **changes})
 
-    await reload_agent(agent)
-    return web.json_response({"status": "reloaded"})
+    targets = [t for t in targets if t in agent_processes or t in agent_states]
+    for t in targets:
+        await reload_agent(t)
+    return web.json_response(_with_shards({"status": "reloaded"}, targets))
 
 
 async def handle_agent_interrupt(request):
@@ -2415,17 +2582,23 @@ async def handle_agent_interrupt(request):
     if not auth_header.startswith("Bearer ") or auth_header[7:] != AGENT_SERVER_TOKEN:
         return web.json_response({"error": "Unauthorized"}, status=401)
 
-    agent = request.match_info.get("name")
-    if agent not in agent_config:
+    targets = _resolve_request_targets(request)
+    if not targets:
         return web.json_response({"error": "Unknown agent"}, status=404)
 
-    interrupted = await interrupt_agent(agent)
+    # interrupt_agent is a no-op for a shard that is not PROCESSING, so an
+    # agent id interrupts only the busy ones.
+    hit = [t for t in targets if await interrupt_agent(t)]
+    interrupted = bool(hit)
     # 200 either way: "it was already idle" is a successful answer to
     # "stop what you are doing", and the relay says which one happened.
-    return web.json_response({
+    body = {
         "status": "interrupted" if interrupted else "idle",
         "interrupted": interrupted,
-    })
+    }
+    if len(targets) > 1:
+        body["shards"] = hit
+    return web.json_response(body)
 
 
 async def handle_agent_kill(request):
@@ -2434,13 +2607,15 @@ async def handle_agent_kill(request):
     if not auth_header.startswith("Bearer ") or auth_header[7:] != AGENT_SERVER_TOKEN:
         return web.json_response({"error": "Unauthorized"}, status=401)
 
-    agent = request.match_info.get("name")
-    if agent not in agent_config:
+    targets = _resolve_request_targets(request)
+    if not targets:
         return web.json_response({"error": "Unknown agent"}, status=404)
 
-    was_running = agent in agent_processes
-    await kill_agent_subprocess(agent)
-    return web.json_response({"status": "killed", "was_running": was_running})
+    was_running = any(t in agent_processes for t in targets)
+    for t in targets:
+        await kill_agent_subprocess(t)
+    return web.json_response(
+        _with_shards({"status": "killed", "was_running": was_running}, targets))
 
 
 async def handle_agent_flush(request):
@@ -2449,12 +2624,15 @@ async def handle_agent_flush(request):
     if not auth_header.startswith("Bearer ") or auth_header[7:] != AGENT_SERVER_TOKEN:
         return web.json_response({"error": "Unauthorized"}, status=401)
 
-    agent = request.match_info.get("name")
-    if agent not in agent_config:
+    targets = _resolve_request_targets(request)
+    if not targets:
         return web.json_response({"error": "Unknown agent"}, status=404)
 
-    flushed = await flush_agent_queue(agent)
-    return web.json_response({"status": "flushed", "flushed": flushed})
+    flushed = 0
+    for t in targets:
+        flushed += await flush_agent_queue(t)
+    return web.json_response(
+        _with_shards({"status": "flushed", "flushed": flushed}, targets))
 
 
 # How much of a queued message body /agents/{name}/queue returns. The
@@ -2479,16 +2657,22 @@ async def handle_agent_queue(request):
         return web.json_response({"error": "Unauthorized"}, status=401)
 
     agent = request.match_info.get("name")
-    if agent not in agent_config:
+    targets = _resolve_request_targets(request)
+    if not targets:
         return web.json_response({"error": "Unknown agent"}, status=404)
 
+    # One shard keeps the dispatch order (priority first); several shards are
+    # merged by arrival.
+    order = ("priority DESC, created_at ASC, id ASC" if len(targets) == 1
+             else "created_at ASC, id ASC")
+    marks = ",".join("?" * len(targets))
     async with db.execute(
-        "SELECT id, channel, author, content, created_at, processed,"
+        "SELECT id, agent, channel, author, content, created_at, processed,"
         " call_id, reply_to_agent, priority, expires_at, depth,"
         " partial_response, restart_count, claimed_by, owner_agent"
-        " FROM message_queue WHERE agent = ? AND processed IN (?, ?)"
-        " ORDER BY priority DESC, created_at ASC, id ASC",
-        (agent, STATUS_QUEUED, STATUS_IN_PROGRESS),
+        f" FROM message_queue WHERE agent IN ({marks}) AND processed IN (?, ?)"
+        f" ORDER BY {order}",
+        (*targets, STATUS_QUEUED, STATUS_IN_PROGRESS),
     ) as cursor:
         rows = await cursor.fetchall()
 
@@ -2499,6 +2683,7 @@ async def handle_agent_queue(request):
             # The row's primary key, which is what DELETE below takes. Not
             # the `message_id` column — that is the upstream (Discord) id.
             "id": row["id"],
+            "agent": row["agent"],
             "channel": row["channel"],
             "author": row["author"],
             "content": content[:QUEUE_PREVIEW_CHARS],
@@ -2533,7 +2718,8 @@ async def handle_agent_queue_delete(request):
         return web.json_response({"error": "Unauthorized"}, status=401)
 
     agent = request.match_info.get("name")
-    if agent not in agent_config:
+    targets = _resolve_request_targets(request)
+    if not targets:
         return web.json_response({"error": "Unknown agent"}, status=404)
 
     try:
@@ -2543,8 +2729,8 @@ async def handle_agent_queue_delete(request):
 
     cursor = await db.execute(
         "UPDATE message_queue SET processed = ?"
-        " WHERE id = ? AND agent = ? AND processed = ?",
-        (STATUS_SKIPPED, queue_id, agent, STATUS_QUEUED),
+        f" WHERE id = ? AND agent IN ({','.join('?' * len(targets))}) AND processed = ?",
+        (STATUS_SKIPPED, queue_id, *targets, STATUS_QUEUED),
     )
     await db.commit()
 
@@ -2588,7 +2774,9 @@ async def handle_agent_register(request):
     if not agent or not _AGENT_NAME_RE.match(agent):
         return web.json_response({"error": "Invalid agent name"}, status=400)
 
-    if agent in agent_processes:
+    old_specs = list(effective_specs())
+    if agent in agent_processes or any(
+            sp.id in agent_processes for sp in old_specs if sp.agent == agent):
         return web.json_response(
             {"error": "Agent already running", "agent": agent},
             status=409,
@@ -2599,7 +2787,8 @@ async def handle_agent_register(request):
     # the running server.
     await load_config()
 
-    if agent not in agent_config:
+    if agent not in agent_config or not shards_lib.resolve_targets(
+            effective_specs(), agent):
         return web.json_response(
             {
                 "error": (
@@ -2611,7 +2800,16 @@ async def handle_agent_register(request):
         )
 
     log.info(f"Hot-registering new agent: {agent}")
-    await start_agent_subprocess(agent)
+    changes = await sync_shards(effective_specs(), old_specs=old_specs)
+    # A shard that exists but has no process (its spawn failed earlier) is
+    # started here too, as the single-process path always did.
+    for t in shards_lib.resolve_targets(effective_specs(), agent):
+        if t not in agent_processes and t not in changes["added"]:
+            if t not in agent_locks:
+                agent_locks[t] = asyncio.Lock()
+                response_buffers[t] = ""
+            agent_states.setdefault(t, "IDLE")
+            await start_agent_subprocess(t)
 
     discord_bound = agent in AGENT_TOKENS
     return web.json_response(
@@ -2631,10 +2829,11 @@ async def handle_cost(request):
         return web.json_response({"error": "Unauthorized"}, status=401)
 
     data = await request.json()
-    agent = data.get("agent")
     cost_delta = data.get("cost_delta", 0.0)
 
-    if agent not in agent_config:
+    # A shard id, or an agent id (its first shard).
+    agent = shards_lib.first_shard(effective_specs(), data.get("agent") or "")
+    if not agent:
         return web.json_response({"error": "Unknown agent"}, status=400)
 
     # Record cost
@@ -2722,9 +2921,19 @@ async def handle_cost_get_all(request):
         async for row in cursor:
             monthly[row["agent"]] = row["total"] or 0.0
 
+    # Roll shard rows up to their agent through the registry. A row whose shard
+    # is no longer in the registry stays under its own key.
+    def _by_agent(per_shard):
+        out: Dict[str, float] = {}
+        for key, total in per_shard.items():
+            owner = shard_owner.get(key, key)
+            out[owner] = out.get(owner, 0.0) + total
+        return out
+
     return web.json_response({
         "daily": daily,
         "monthly": monthly,
+        "by_agent": {"daily": _by_agent(daily), "monthly": _by_agent(monthly)},
         "limits": {
             "daily_limit": COST_DAILY_LIMIT,
             "monthly_limit": COST_MONTHLY_LIMIT,
@@ -2740,37 +2949,33 @@ async def handle_cost_get(request):
         return web.json_response({"error": "Unauthorized"}, status=401)
 
     agent = request.match_info.get("agent")
+    specs = effective_specs()
+    is_agent_id = any(sp.agent == agent for sp in specs)
+    # An agent id sums its shards; anything else (a shard id, or a name the
+    # registry does not know, which reads as zeros as it always has) is itself.
+    keys = [sp.id for sp in specs if sp.agent == agent] if is_agent_id else [agent]
 
-    # Daily cost
-    async with db.execute(
-        """
-        SELECT SUM(cost_delta) as total
-        FROM cost_events
-        WHERE agent = ? AND timestamp > datetime('now', '-1 day')
-        """,
-        (agent,)
-    ) as cursor:
-        row = await cursor.fetchone()
-        daily = row["total"] or 0.0
+    async def _total(key, window):
+        async with db.execute(
+            f"SELECT SUM(cost_delta) as total FROM cost_events "
+            f"WHERE agent = ? AND timestamp > datetime('now', '{window}')",
+            (key,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            return row["total"] or 0.0
 
-    # Monthly cost
-    async with db.execute(
-        """
-        SELECT SUM(cost_delta) as total
-        FROM cost_events
-        WHERE agent = ? AND timestamp > datetime('now', '-30 days')
-        """,
-        (agent,)
-    ) as cursor:
-        row = await cursor.fetchone()
-        monthly = row["total"] or 0.0
-
-    return web.json_response({
+    per_shard = {k: {"daily": await _total(k, "-1 day"),
+                     "monthly": await _total(k, "-30 days"),
+                     "session": agent_last_cost.get(k, 0.0)} for k in keys}
+    body = {
         "agent": agent,
-        "daily": daily,
-        "monthly": monthly,
-        "session": agent_last_cost.get(agent, 0.0)
-    })
+        "daily": sum(v["daily"] for v in per_shard.values()),
+        "monthly": sum(v["monthly"] for v in per_shard.values()),
+        "session": sum(v["session"] for v in per_shard.values()),
+    }
+    if is_agent_id:
+        body["shards"] = per_shard
+    return web.json_response(body)
 
 
 async def handle_cost_conversations(request):
@@ -2857,8 +3062,10 @@ async def handle_ask_create(request):
     except Exception:
         return web.json_response({"error": "Invalid JSON"}, status=400)
 
-    agent = data.get("agent")
-    if not agent or agent not in agent_config:
+    # `agent` is a shard id here (the tools server sends KARAKOS_SHARD); an
+    # agent id resolves to its first shard.
+    agent = shards_lib.first_shard(effective_specs(), data.get("agent") or "")
+    if not agent:
         return web.json_response({"error": "Invalid agent"}, status=400)
 
     context = agent_turn_context.get(agent) or {}
@@ -2973,32 +3180,39 @@ async def graceful_shutdown(sig):
 
     # Stop accepting new messages (set flag checked by handlers)
 
-    # Wait for agents to finish (max 30s)
+    # Wait for every shard to finish (max 30s)
     log.info("Waiting for agents to finish current messages...")
     for i in range(30):
-        all_idle = all(agent_states.get(a) == "IDLE" for a in agent_config)
+        all_idle = all(agent_states.get(sid) == "IDLE" for sid in STATE.shard_ids())
         if all_idle:
             break
         await asyncio.sleep(1)
 
-    # Generate summaries for active agents
+    # Generate summaries, one per shard, at most four at a time. Each writes
+    # data/last-session-summary-<shard>.md from that shard's stream logs.
     log.info("Finalizing sessions...")
-    for agent in agent_config:
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "python3", str(Path(__file__).parent / "summarize-session.py"), agent,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=25)
-            if proc.returncode == 0:
-                log.info(f"Session summary generated for {agent}")
-            else:
-                log.warning(f"Session summary failed for {agent}: {stderr.decode()[:200]}")
-        except asyncio.TimeoutError:
-            log.warning(f"Session summary timed out for {agent}")
-        except Exception as e:
-            log.warning(f"Session summary error for {agent}: {e}")
+    gate = asyncio.Semaphore(4)
+
+    async def _summarize(sid: str):
+        async with gate:
+            label = label_of(sid)
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *SUMMARIZE_CMD, sid,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=25)
+                if proc.returncode == 0:
+                    log.info(f"Session summary generated for {label}")
+                else:
+                    log.warning(f"Session summary failed for {label}: {stderr.decode()[:200]}")
+            except asyncio.TimeoutError:
+                log.warning(f"Session summary timed out for {label}")
+            except Exception as e:
+                log.warning(f"Session summary error for {label}: {e}")
+
+    await asyncio.gather(*(_summarize(sid) for sid in STATE.shard_ids()))
 
     # Kill subprocesses
     log.info("Terminating agent subprocesses...")
@@ -3039,30 +3253,42 @@ async def startup(app):
     # Load configuration
     await load_config()
 
-    # Initialize locks and state
-    for agent in agent_config:
-        agent_locks[agent] = asyncio.Lock()
-        agent_states[agent] = "IDLE"
-        response_buffers[agent] = ""
+    # Initialize locks and state for every shard before any spawn.
+    for sid in STATE.shard_ids():
+        agent_locks[sid] = asyncio.Lock()
+        agent_states[sid] = "IDLE"
+        response_buffers[sid] = ""
         # Overwrite any beacon left behind by a previous process. A crash
         # mid-turn leaves one reading PROCESSING with a timestamp that will
         # never advance again — which is indistinguishable from a live wedge,
         # so without this every restart-after-crash pages forever about an
         # agent that is now fine.
-        write_agent_beacon(agent, "IDLE", force=True)
+        write_agent_beacon(sid, "IDLE", force=True)
+
+    # Rows keyed by an agent's own id that no shard of that agent carries are
+    # unreachable history; say so, never fail over it.
+    try:
+        async with db.execute("SELECT agent FROM sessions") as cur:
+            session_keys = [r["agent"] for r in await cur.fetchall()]
+        async with db.execute("SELECT DISTINCT agent FROM message_queue") as cur:
+            queue_keys = [r["agent"] for r in await cur.fetchall()]
+        for line in shards_lib.orphan_key_warnings(effective_specs(), session_keys, queue_keys):
+            log.warning(line)
+    except Exception as e:
+        log.warning(f"orphan-key check skipped: {e}")
 
     # Crash recovery
     await crash_recovery()
 
-    # Start agent subprocesses
-    for agent in agent_config:
-        await start_agent_subprocess(agent)
+    # Start shard subprocesses, one at a time in plan order.
+    for sid in STATE.shard_ids():
+        await start_agent_subprocess(sid)
 
     # Re-arm replay timers for batches held behind a usage wall before restart.
-    for agent in agent_config:
-        held_until = await agent_hold_until(agent)
+    for sid in STATE.shard_ids():
+        held_until = await agent_hold_until(sid)
         if held_until:
-            schedule_hold_wake(agent, held_until)
+            schedule_hold_wake(sid, held_until)
 
     # Register signal handlers in event loop context
     loop = asyncio.get_running_loop()

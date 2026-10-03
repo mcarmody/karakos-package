@@ -121,14 +121,27 @@ class ServerState:
 
     # -- shard seam (2.1 changes only these bodies) ------------------------
 
+    # With no shard_specs loaded (a test that sets agent_config directly, or a
+    # server that has not read a registry) every key of agent_config is its own
+    # default shard, exactly as in 2.0.
+
+    def _specs(self):
+        return getattr(self.__dict__["_server"], "shard_specs", None) or []
+
     def shard_ids(self) -> List[str]:
-        return list(self.agent_config)
+        specs = self._specs()
+        if not specs:
+            return list(self.agent_config)
+        return [s.id for s in specs]
 
     def agent_of(self, shard: str) -> str:
+        for s in self._specs():
+            if s.id == shard:
+                return s.agent
         return shard
 
     def cfg(self, shard: str) -> dict:
-        return self.agent_config.get(shard, {})
+        return self.agent_config.get(self.agent_of(shard), {})
 
 
 def make_state(server_module) -> ServerState:
@@ -469,21 +482,21 @@ async def run_turn(state: ServerState, shard: str, batch: TurnBatch) -> TurnResu
 
     try:
         # Start typing indicator
-        await state.start_typing(state.agent_of(shard), channel_id)
+        await state.start_typing(shard, channel_id)
 
         # Send to agent. Through the server's wrapper, not write_user_line
         # directly: tests (and a future steering hook) patch it there.
-        await state.send_to_agent(state.agent_of(shard), batch.content, message_ids)
+        await state.send_to_agent(shard, batch.content, message_ids)
 
         # Read response
         try:
             response_text, metadata = await state.read_agent_response(
-                state.agent_of(shard), channel_id, message_ids)
+                shard, channel_id, message_ids)
         finally:
             # The turn is over: any question still on screen belongs to a
             # subprocess that has stopped waiting for it, and answering it
             # would feed a reply into a turn that no longer exists.
-            state.ask_registry.discard_agent(state.agent_of(shard))
+            state.ask_registry.discard_agent(shard)
             state.agent_turn_context.pop(shard, None)
             state.active_turns.pop(shard, None)
 
@@ -511,7 +524,10 @@ async def finish_turn(state: ServerState, shard: str, result: TurnResult):
     """Cost, wall check, hooks, Discord post, mark complete, redrain.
 
     Called with the shard lock held; followups run after it is released."""
-    agent = state.agent_of(shard)
+    # Every wrapper below (cost, session, Discord token, hold) is keyed by the
+    # shard id: rows are per shard, and AGENT_TOKENS holds the owning agent's
+    # token under each shard id. For a default shard this is the agent id.
+    agent = shard
     batch = result.batch
     channel_id = batch.channel_id
     message_ids = batch.message_ids
@@ -660,4 +676,4 @@ def notify_enqueued(state: ServerState, shard: str, channel_id: str) -> None:
         # — or for an agent with no state at all, i.e. one that never
         # started — no turn is running, nothing will call stop_typing(), and
         # the indicator would spin until the process restarts.
-        asyncio.create_task(state.start_typing(state.agent_of(shard), channel_id))
+        asyncio.create_task(state.start_typing(shard, channel_id))
