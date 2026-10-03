@@ -364,6 +364,7 @@ def test_a_store_error_during_the_inline_send_never_reaches_the_turn(ags, monkey
     def boom(*a, **k):
         raise ob.sqlite3.OperationalError("database is locked")
     monkeypatch.setattr(ob, "record_chunk", boom)
+    monkeypatch.setattr(ob, "record_failure", boom)
     result, fake = post(ags, [200], content="reply")
     assert result is None and fake.calls == 1                 # no exception into finish_turn
     assert rows(ags)[0]["status"] == "sending"               # recovered at the next boot
