@@ -367,7 +367,11 @@ async def read_events(
     # the code for a channel without it is unchanged.
     long_turn: Optional[discord_ux.LongTurn] = None
     if tool_streaming and channel_id != "0":
-        thread_cfg = state.ux_thread_cfg(channel_id)
+        try:
+            thread_cfg = state.ux_thread_cfg(channel_id)
+        except Exception as e:   # a UX lookup must never cost the turn
+            state.log.warning(f"ux thread lookup failed, threads off for this turn: {e}")
+            thread_cfg = None
         if thread_cfg is not None:
             batch = state.active_turns.get(shard)
             first_text = ""

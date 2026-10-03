@@ -182,3 +182,19 @@ def test_no_schema_change(harness):
                     "processing_started_at", "processed_at", "not_before", "call_id",
                     "reply_to_agent", "priority", "expires_at", "depth", "partial_response",
                     "restart_count", "claimed_by", "owner_agent"]
+
+
+def test_repeated_reaction_notice_is_the_servers_duplicate(harness):
+    h = harness(agents=["a", "b"], shards=SHARDS)
+
+    async def scenario():
+        async with h:
+            h.script(default={"text": "PASS"})
+            body = {"agent": "a", "shard": "a", "content": "[reaction] ...", "channel_id": "1",
+                    "server": "local", "author": "sam", "message_id": "reaction:9:7:abcd1234"}
+            r1 = await h.client.post("/message", headers=h._headers(), json=body)
+            r2 = await h.client.post("/message", headers=h._headers(), json=body)
+            assert r1.status == 202 and (await r1.json())["status"] == "queued"
+            assert r2.status == 202 and (await r2.json())["status"] == "duplicate"
+            await h.wait_idle("a")
+    run(scenario())
