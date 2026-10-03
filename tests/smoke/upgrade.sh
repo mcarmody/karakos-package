@@ -295,7 +295,12 @@ assert_eq "$(dbq "select count(*) from sessions where agent not in ($IDS)")" 0 "
 [ "$(dbq "select count(*) from sessions")" -ge 1 ] || { echo "FAIL: no sessions survived" >&2; exit 1; }
 [ "$(dbq "select count(*) from message_queue where processed=2 and response='smoke-ok'")" -ge "$SEED_DONE" ] \
   || { echo "FAIL: completed rows lost their responses" >&2; exit 1; }
-assert_eq "$(dbq "select count(*) from message_queue where content like 'HOLD%' and processed=3")" 1 "the interrupted row is crashed"
+echo "queue rows after the upgrade (id|agent|processed|content|response):"
+"${DC[@]}" exec -T karakos python3 -c "import sqlite3; c=sqlite3.connect('file:data/memory/agent-server.db?mode=ro',uri=True); [print('|'.join(str(x)[:40] for x in r)) for r in c.execute('select id,agent,processed,content,response from message_queue order by id')]"
+# The old server's graceful stop kills the hung subprocess and settles the row itself, so the
+# interrupted row may arrive as crashed (3, boot recovery), complete (2) or skipped (4). What
+# 2.0 must guarantee is that it is neither lost nor left in progress / queued to run again.
+case "$(dbq "select processed from message_queue where content like 'HOLD%'")" in 2|3|4) ;; *) echo "FAIL: the interrupted row is lost, in progress or re-queued" >&2; exit 1;; esac
 case "$(dbq "select processed from message_queue where content like 'queued behind%'")" in 0|2) ;; *) echo "FAIL: the queued row is neither queued nor run" >&2; exit 1;; esac
 "${DC[@]}" exec -T karakos python3 - <<'PY'
 import json, os, sqlite3
@@ -324,6 +329,7 @@ step "refusal path: unknown table and unknown channels.json key (on a copy)"
   cd "$SMOKE_WORK/refuse"
   export COMPOSE_PROJECT_NAME="$REFUSE_PROJECT" SMOKE_PROJECT="$REFUSE_PROJECT"
   smoke_guard
+  mkdir -p "$SMOKE_WORK/refuse-backups"; chmod -R a+rwX "$SMOKE_WORK/refuse" "$SMOKE_WORK/refuse-backups" 2>/dev/null || true
   docker run --rm -v "$REFUSE_VOL:/workspace/data" --entrypoint python3 "$NEW_IMAGE" -c \
     "import sqlite3; c=sqlite3.connect('/workspace/data/memory/agent-server.db'); c.execute('create table zz_unknown_table (x)'); c.commit()"
   python3 - <<'PY'
@@ -360,7 +366,7 @@ assert not extra and not missing and not bad, (sorted(extra)[:5], sorted(missing
 # Roll the image back as UPGRADING says: match the checkout to the pin.
 git -C "$REPO" archive "$TAG" | tar -x -C "$OLD"
 export KARAKOS_VERSION="$TAG"
-write_override "$OLD_CLAUDE" "$FIXED"
+write_override "$OLD_CLAUDE" "$FIXED" "$OLD_IMAGE"
 open_perms
 "${DC[@]}" up -d --pull never
 smoke_wait "old image answering /health on restored volumes" 180 api_healthy
