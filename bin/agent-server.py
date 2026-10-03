@@ -42,6 +42,7 @@ import registry as agent_registry  # noqa: E402
 import prompt_compose  # noqa: E402
 import spawn_env as spawn_env_lib  # noqa: E402
 import tengwar  # noqa: E402
+import turn_loop  # noqa: E402
 from lib.migrate.guard import require_stamp  # noqa: E402
 
 # =============================================================================
@@ -217,6 +218,24 @@ active_todo_messages: Dict[str, Dict] = {}
 # POST /ask on behalf of the MCP `ask_user` tool, resolved by the relay when
 # somebody clicks a button.
 ask_registry = ask_handler.AskRegistry()
+
+
+class _ServerView:
+    """Live read-through to this module's globals. Tests load the server under
+    a synthetic name that is not in sys.modules, so the turn loop's state view
+    cannot be given the module object itself."""
+
+    def __getattr__(self, name):
+        try:
+            return globals()[name]
+        except KeyError:
+            raise AttributeError(name) from None
+
+
+# The turn loop (lib/turn_loop.py) reads everything above through this view at
+# access time, so rebinding a global here (a test patching db or
+# post_to_discord) is seen by the loop on its next call.
+STATE = turn_loop.make_state(_ServerView())
 
 # Who and where the agent's current turn came from. `/ask` has no channel of
 # its own — the question belongs in the conversation that prompted it — and
@@ -1820,30 +1839,7 @@ async def stop_typing(channel_id: str):
 
 async def send_to_agent(agent: str, content: str, message_ids: List[str]):
     """Send message to agent subprocess"""
-    proc = agent_processes.get(agent)
-    if not proc or not proc.stdin:
-        log.error(f"No subprocess for {agent}")
-        return
-
-    agent_states[agent] = "PROCESSING"
-    write_agent_beacon(agent, "PROCESSING", force=True)
-    response_buffers[agent] = ""
-
-    # Send message — Claude Code stream-json input envelope.
-    # Format: {"type": "user", "message": {"role": "user", "content": <str>}}
-    # The bare {"type":"user","content":...} form is rejected by the SDK.
-    msg = json.dumps({
-        "type": "user",
-        "message": {"role": "user", "content": content},
-    }) + "\n"
-    try:
-        proc.stdin.write(msg.encode())
-        await proc.stdin.drain()
-        log.info(f"Sent message to {agent} ({len(message_ids)} queued messages)")
-    except Exception as e:
-        log.error(f"Error sending to {agent}: {e}")
-        agent_states[agent] = "ERROR_RECOVERY"
-        write_agent_beacon(agent, "ERROR_RECOVERY", force=True)
+    await turn_loop.write_user_line(STATE, agent, content, message_ids)
 
 async def write_streaming_response(message_ids: List[str], text: str) -> None:
     """Push partial response text into message_queue so SSE polling sees it.
@@ -1984,230 +1980,7 @@ async def read_agent_response(
     agent: str, channel_id: str, message_ids: Optional[List[str]] = None
 ) -> tuple[str, Dict]:
     """Read and process agent response stream"""
-    proc = agent_processes.get(agent)
-    if not proc or not proc.stdout:
-        return "", {}
-
-    config = agent_config.get(agent, {})
-    # Default ON as of #91. It was False and, more to the point, dead: no
-    # config file, template, doc or test in this repo ever set it, so the
-    # tool_use branch below could not fire on any install. The issue's
-    # acceptance test requires the lines to appear, and an opt-in nobody
-    # knows about does not answer "is it broken?" for the people asking.
-    # Set "tool_streaming": false in agents.yaml to go back to silence.
-    tool_streaming = config.get("tool_streaming", True)
-    stream_to_channel = config.get("stream_to_channel", False)
-    msg_ids = message_ids or []
-
-    # Throttle state is per-turn, not global: each turn starts with its
-    # first tool line free so a long turn says something quickly. None, not
-    # 0.0 — see should_post_tool_line().
-    tool_lines_posted = 0
-    last_tool_line_at: Optional[float] = None
-
-    final_text = ""
-    metadata = {}
-    last_posted_chunk = ""
-    rejected_rl_info = None  # last rate_limit_event with status=rejected this turn
-    # usage block of the last main-thread assistant event; its sum is the
-    # session's context size (the result's usage is summed across the turn).
-    last_usage = None
-
-    # turn_events sequence number for this turn, and burst-collapse state
-    # for content-less thinking blocks. Some builds strip thinking TEXT from
-    # the transcript (signature only, empty body) — that still means "the
-    # agent is thinking," so it's surfaced as presence: one empty row per
-    # burst rather than one per block, which the chat page renders as a
-    # pulsing "thinking" label instead of a flood of identical empty rows.
-    event_seq = 0
-    in_empty_think_burst = False
-    decode_errors = 0
-
-    try:
-        while True:
-            line = await proc.stdout.readline()
-            if not line:
-                break
-
-            # Tee before parsing, so a malformed line is still on the record.
-            write_stream_log(agent, line)
-
-            try:
-                event = json.loads(line.decode())
-            except (json.JSONDecodeError, UnicodeDecodeError) as e:
-                decode_errors += 1
-                log.warning(
-                    f"{agent} stream-json decode error ({type(e).__name__}): "
-                    f"{redact_for_log(line.decode(errors='replace').strip())!r}"
-                )
-                continue
-
-            event_type = event.get("type")
-
-            # Every event is proof the turn is still moving. This is the whole
-            # beacon: a SIGSTOPped claude emits nothing, readline() blocks
-            # here, and the timestamp stops advancing while the state stays
-            # PROCESSING — which is precisely the pair wedge-check.py looks
-            # for. Throttled internally, so a chatty turn is cheap.
-            write_agent_beacon(agent, "PROCESSING", message_id=msg_ids[0] if msg_ids else None)
-
-            # One `system`/`init` event opens the stream, listing the tool
-            # set the CLI actually resolved for this session. A tool named
-            # in permissions.deny (#99) is dropped from this list entirely
-            # rather than surfacing as a runtime denial — logging it here is
-            # the only place a full-tool deny is ever visible after the
-            # fact.
-            if event_type == "system" and event.get("subtype") == "init":
-                tools = event.get("tools")
-                if tools is not None:
-                    log.info(f"{agent} session tools ({len(tools)}): {tools}")
-
-            # The CLI reports rate-limit headroom in-band, on the stream that
-            # is already open. Recorded rather than polled — see
-            # record_rate_limit_event. Wrapped because a bookkeeping failure
-            # must never cost the agent's actual reply, which is still
-            # arriving on this same loop.
-            if event_type == "rate_limit_event":
-                _rl = event.get("rate_limit_info")
-                if isinstance(_rl, dict) and _rl.get("status") == "rejected":
-                    rejected_rl_info = _rl
-                try:
-                    await record_rate_limit_event(agent, event.get("rate_limit_info"))
-                except Exception as e:
-                    log.error(f"Failed to record rate limit event for {agent}: {e}")
-
-            # Claude Code stream-json output: each turn emits one or more
-            # `assistant` events with content blocks (thinking/text/tool_use),
-            # then a single `result` event closes the turn.
-            if event_type == "assistant":
-                message = event.get("message", {}) or {}
-                # Subagent (Task) sidechains carry parent_tool_use_id; their
-                # smaller context must not replace the session's.
-                if (event.get("parent_tool_use_id") is None
-                        and isinstance(message.get("usage"), dict)):
-                    last_usage = message["usage"]
-                got_text = False
-                for block in message.get("content", []) or []:
-                    btype = block.get("type")
-                    if btype == "thinking":
-                        body = (block.get("thinking") or "").strip()
-                        if body:
-                            event_seq += 1
-                            await write_turn_event(msg_ids, event_seq, "thinking", body)
-                            in_empty_think_burst = False
-                        elif not in_empty_think_burst:
-                            event_seq += 1
-                            await write_turn_event(msg_ids, event_seq, "thinking", "")
-                            in_empty_think_burst = True
-                    elif btype == "text":
-                        text = block.get("text", "")
-                        if text:
-                            final_text += text
-                            response_buffers[agent] = final_text
-                            got_text = True
-                            in_empty_think_burst = False
-                            if stream_to_channel and channel_id != "0":
-                                # TODO: Implement chunked streaming
-                                pass
-                            # Recorded as a turn event too, even though this
-                            # may turn out to BE the final answer — a block
-                            # can't be known final until the turn ends. The
-                            # dashboard chat page dedupes an interstitial
-                            # against the final body it matches.
-                            stripped = text.strip()
-                            if stripped and stripped.upper() != "PASS":
-                                event_seq += 1
-                                await write_turn_event(msg_ids, event_seq, "interstitial", stripped)
-                    elif btype == "tool_use":
-                        tool_name = block.get("name", "unknown")
-                        log.info(f"{agent} called tool: {tool_name}")
-                        in_empty_think_burst = False
-                        event_seq += 1
-                        await write_turn_event(
-                            msg_ids, event_seq, "tool",
-                            describe_tool_call(tool_name, block.get("input")),
-                        )
-                        if tool_streaming and channel_id != "0":
-                            now = time.monotonic()
-                            if should_post_tool_line(tool_lines_posted,
-                                                     last_tool_line_at, now):
-                                tool_lines_posted += 1
-                                last_tool_line_at = now
-                                # dead_letter stays False: a tool line is a
-                                # liveness signal, worthless once the turn
-                                # has ended, and replaying it later would be
-                                # noise. post_to_discord's own docstring
-                                # already names these as an incidental.
-                                await post_to_discord(
-                                    agent, channel_id,
-                                    summarize_tool_call(tool_name, block.get("input")),
-                                )
-
-                if got_text:
-                    cleaned = THINKING_BLOCK_RE.sub("", final_text)
-                    await write_streaming_response(msg_ids, cleaned)
-                    if config.get("partial_response"):   # off by default; 2.3 turns it on
-                        await write_partial_response(msg_ids, cleaned)
-
-            elif event_type == "result":
-                # Extract metadata. Token counts live under `usage`,
-                # cost/duration are top-level. Final text is in `result`
-                # for success, or `error` field for failures.
-                usage = event.get("usage", {}) or {}
-                metadata = {
-                    "session_id": event.get("session_id"),
-                    "input_tokens": usage.get("input_tokens", 0),
-                    "output_tokens": usage.get("output_tokens", 0),
-                    "context_tokens": usage_context_tokens(last_usage),
-                    "total_cost_usd": event.get("total_cost_usd", 0.0),
-                    "duration_ms": event.get("duration_ms", 0),
-                    "is_error": event.get("is_error", False),
-                    "rate_limit_rejected": rejected_rl_info,
-                }
-                # If the assistant stream produced nothing, fall back to
-                # the result's flat `result` string (success) or `error`.
-                if not final_text:
-                    final_text = event.get("result", "") or event.get("error", "")
-
-                # A fine-grained deny rule (e.g. "Bash(curl:*)") lets the
-                # tool stay in the session's list but declines the specific
-                # call at request time — that shows up here, not in the
-                # init event's tool list. Each denial is the acceptance
-                # test's "logged" half; #99.
-                denials = extract_permission_denials(event)
-                metadata["permission_denials"] = denials
-                for denial in denials:
-                    log.warning(
-                        f"{agent} permission denied: tool={denial.get('tool_name')} "
-                        f"input={denial.get('tool_input')}"
-                    )
-                break
-
-    except SystemExit as e:
-        # Not a crash: something in the reader asked to exit. Say so, and end
-        # the turn with whatever has been read.
-        log.warning(f"Reader for {agent} ended by SystemExit (code={e.code!r})")
-    except Exception as e:
-        log.error(f"Error reading response from {agent}: {e}")
-
-    if decode_errors and metadata:
-        metadata["decode_errors"] = decode_errors
-
-    # Strip any inline thinking blocks (defense in depth)
-    final_text = THINKING_BLOCK_RE.sub("", final_text).strip()
-
-    # A turn that /interrupt ended has no answer, only a fragment of one.
-    # Returning it would post half a sentence to the channel and bill it as
-    # the reply — so it is dropped here, at the single point every caller of
-    # read_agent_response goes through.
-    if agent in interrupted_agents:
-        interrupted_agents.discard(agent)
-        log.info(f"{agent} turn discarded (interrupted)")
-        final_text, metadata = "", {}
-
-    agent_states[agent] = "IDLE"
-    write_agent_beacon(agent, "IDLE", force=True)
-    return final_text, metadata
+    return await turn_loop.read_events(STATE, agent, channel_id, message_ids)
 
 
 # =============================================================================
@@ -2355,175 +2128,7 @@ async def hold_batch(agent, channel_id, message_ids, kind, until):
 
 async def process_agent_queue(agent: str):
     """Process pending messages for agent"""
-    lock = agent_locks.get(agent)
-    if not lock:
-        return
-
-    async with lock:
-        if agent_states.get(agent) != "IDLE":
-            return
-
-        # Held behind a usage wall: do not dispatch (it would hit the wall
-        # again). New arrivals wait with the held batch; the wake timer
-        # replays all of it after the reset.
-        held_until = await agent_hold_until(agent)
-        if held_until:
-            schedule_hold_wake(agent, held_until)
-            return
-
-        # Claim the next batch: priority DESC, created_at, id; expired rows
-        # are skipped (and their callers told) inside claim_batch.
-        messages = await msgqueue.claim_batch(db, agent, 20)
-
-        if not messages:
-            return
-
-        message_ids = [msg["message_id"] for msg in messages]
-
-        # Format batch
-        channel_id = messages[0]["channel_id"]
-        formatted_parts = []
-        for msg in messages:
-            timestamp = msg["created_at"]
-            author = msg["author"]
-            content = msg["content"]
-            part = f"[{timestamp}] {author}: {content}"
-            attachment_lines = format_attachments(msg["attachments"])
-            if attachment_lines:
-                part = f"{part}\n{attachment_lines}"
-            formatted_parts.append(part)
-
-        formatted_content = "\n\n".join(formatted_parts)
-
-        # Stamp the automated-traffic sentinel when every message in the
-        # batch is bot-originated (poke.sh always sets is_bot=1 for system
-        # pokes, heartbeats, and task-complete notifications). A batch with
-        # even one human Discord message stays unmarked, so a human reply
-        # riding along in the same batch still gets a fresh recall block.
-        if all(msg["is_bot"] for msg in messages):
-            formatted_content = f"{AUTOMATED_TRAFFIC_SENTINEL}\n{formatted_content}"
-
-        # Record where this turn came from before the subprocess can act on
-        # it. POST /ask has no request context of its own — the MCP tool that
-        # calls it knows only the agent name — so the channel a question is
-        # posted into and the people entitled to answer it both come from
-        # here (#101).
-        agent_turn_context[agent] = {
-            "channel_id": channel_id,
-            "author_ids": [msg["author_id"] for msg in messages if not msg["is_bot"]],
-            "message_ids": message_ids,
-        }
-
-        # Remember where this agent is talking. A subprocess that dies between
-        # turns has no turn context to borrow a channel from, so this is what
-        # the respawn notice is addressed to (#90).
-        if channel_id != "0":
-            agent_last_channel[agent] = channel_id
-
-        # Start typing indicator
-        await start_typing(agent, channel_id)
-
-        # Send to agent
-        await send_to_agent(agent, formatted_content, message_ids)
-
-        # Read response
-        try:
-            response_text, metadata = await read_agent_response(agent, channel_id, message_ids)
-        finally:
-            # The turn is over: any question still on screen belongs to a
-            # subprocess that has stopped waiting for it, and answering it
-            # would feed a reply into a turn that no longer exists.
-            ask_registry.discard_agent(agent)
-            agent_turn_context.pop(agent, None)
-
-            # Stop typing. A batch can span multiple channels when messages
-            # queued up behind this turn in a channel other than channel_id
-            # (see the elif in handle_message, #121) — each of those got its
-            # own start_typing() call at arrival time, so each needs to be
-            # stopped here too, not just the reply channel, or that
-            # indicator spins forever with no reply landing to end it.
-            #
-            # In the finally, not after it: read_agent_response raising is
-            # the one case where nothing downstream will ever clear these,
-            # and #121 turned that from one stuck indicator into one per
-            # channel in the batch.
-            for cid in {msg["channel_id"] for msg in messages}:
-                await stop_typing(cid)
-
-        # Post cost update
-        if metadata:
-            await post_cost_update(agent, metadata)
-            await update_session_tokens(agent, metadata.get("input_tokens", 0))
-            await update_session_context(agent, metadata.get("context_tokens", 0))
-            log.info(f"{agent} ctx={metadata.get('context_tokens', 0)} "
-                     f"turn_in={metadata.get('input_tokens', 0)} "
-                     f"out={metadata.get('output_tokens', 0)}")
-
-        # Usage / model wall: hold the batch instead of consuming it.
-        wall = classify_wall(response_text, metadata.get("is_error", False),
-                             metadata.get("rate_limit_rejected")) if metadata else None
-        if wall:
-            until = wall_not_before(wall, response_text,
-                                    metadata.get("rate_limit_rejected"),
-                                    agent_wall_strikes.get(agent, 0))
-            agent_wall_strikes[agent] = agent_wall_strikes.get(agent, 0) + 1
-            await hold_batch(agent, channel_id, message_ids, wall, until)
-            return
-        agent_wall_strikes.pop(agent, None)
-
-        # Any other errored turn: the `result` text is raw CLI output (an
-        # OAuth failure body, a stack trace), not a reply. It never goes to
-        # the channel; the server log keeps a redacted copy and the row is
-        # marked failed rather than complete.
-        final_status = STATUS_COMPLETE
-        if metadata and metadata.get("is_error"):
-            log.error(f"{agent} turn ended with is_error; raw result (redacted): "
-                      f"{redact_for_log(response_text, 500)!r}")
-            response_text = GENERIC_TURN_ERROR
-            final_status = STATUS_CRASHED
-
-        # Post response to Discord
-        discord_msg_id = None
-        if response_text and channel_id != "0":
-            discord_msg_id = await post_to_discord(agent, channel_id, response_text,
-                                                   dead_letter=True)
-
-        # Mark complete
-        await db.execute(
-            f"""
-            UPDATE message_queue
-            SET processed = ?, response = ?, discord_response_id = ?, processed_at = CURRENT_TIMESTAMP
-            WHERE message_id IN ({','.join('?' * len(message_ids))})
-            """,
-            (final_status, response_text, discord_msg_id, *message_ids)
-        )
-        await db.commit()
-
-        log.info(f"{agent} processed {len(message_ids)} messages")
-
-        # Anything that arrived while this turn was running is still QUEUED,
-        # and handle_message is the ONLY caller of this function — it fires
-        # solely on the IDLE branch. So without this, a message that landed
-        # mid-turn waits not for the turn to end but for the *next* inbound
-        # message to arrive and happen to sweep it up. That is the second
-        # half of #121: the first half puts a typing indicator in the
-        # waiting channel, and this is what makes it a promise the server
-        # can keep rather than an indicator that spins until someone else
-        # speaks.
-        #
-        # create_task, not a direct call: the lock is still held here and it
-        # is not reentrant. The new task blocks on it until this `async
-        # with` exits. It cannot spin — every drain moves its batch out of
-        # STATUS_QUEUED, so the count strictly decreases, and the `if not
-        # messages: return` above is the floor.
-        async with db.execute(
-            "SELECT COUNT(*) AS count FROM message_queue WHERE agent = ? AND processed = ?",
-            (agent, STATUS_QUEUED)
-        ) as cursor:
-            row = await cursor.fetchone()
-        if row and row["count"]:
-            log.info(f"{agent} has {row['count']} messages still queued — draining again")
-            asyncio.create_task(process_agent_queue(agent))
+    await turn_loop.drain_shard(STATE, agent)
 
 # =============================================================================
 # Crash Recovery
@@ -2674,24 +2279,8 @@ async def handle_message(request):
         log.error(f"Error inserting message: {e}")
         return web.json_response({"error": "Database error"}, status=500)
 
-    # Trigger processing if agent is idle
-    if agent_states.get(agent) == "IDLE":
-        asyncio.create_task(process_agent_queue(agent))
-    elif agent_states.get(agent) == "PROCESSING":
-        # Agent is mid-turn in another channel. Without this, a message
-        # landing behind a busy turn shows no typing indicator and no ack
-        # until the drain happens to reach it — indistinguishable from being
-        # ignored (#121). start_typing() is a no-op for channel_id "0" and
-        # for a channel that already has a task running, so it composes
-        # safely with the drain's own start_typing() once this channel is
-        # picked up.
-        #
-        # PROCESSING specifically, not "anything but IDLE": the indicator is
-        # a promise that a turn is in flight and will end. In ERROR_RECOVERY
-        # — or for an agent with no state at all, i.e. one that never
-        # started — no turn is running, nothing will call stop_typing(), and
-        # the indicator would spin until the process restarts.
-        asyncio.create_task(start_typing(agent, channel_id))
+    # Trigger processing if agent is idle, or show typing if it is mid-turn.
+    turn_loop.notify_enqueued(STATE, agent, channel_id)
 
     return web.json_response({"status": "queued", "message_id": message_id}, status=202)
 

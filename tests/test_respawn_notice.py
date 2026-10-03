@@ -26,6 +26,7 @@ import pytest
 from conftest import import_script
 
 AGENT_SERVER = Path(__file__).parent.parent / "bin" / "agent-server.py"
+TURN_LOOP = Path(__file__).parent.parent / "lib" / "turn_loop.py"
 
 
 @pytest.fixture
@@ -377,15 +378,17 @@ def test_process_agent_queue_records_the_last_channel():
     satisfy it. Same technique as
     test_attachments.py::test_the_batch_formatter_actually_calls_format_attachments.
     """
-    tree = ast.parse(AGENT_SERVER.read_text())
+    # The turn loop moved to lib/turn_loop.py in 2.0 (run_turn writes it).
+    tree = ast.parse(TURN_LOOP.read_text())
     target = next(
         node for node in ast.walk(tree)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name == "process_agent_queue"
+        and node.name == "run_turn"
     )
     assigns_last_channel = any(
         isinstance(t, ast.Subscript)
-        and getattr(t.value, "id", None) == "agent_last_channel"
+        and (getattr(t.value, "id", None) or getattr(t.value, "attr", None))
+        == "agent_last_channel"
         for n in ast.walk(target) if isinstance(n, ast.Assign)
         for t in n.targets
     )

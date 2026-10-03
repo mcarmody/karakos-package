@@ -32,6 +32,7 @@ import pytest
 PACKAGE_ROOT = Path(__file__).parent.parent
 RELAY_PATH = PACKAGE_ROOT / "bin" / "relay.py"
 AGENT_SERVER = PACKAGE_ROOT / "bin" / "agent-server.py"
+TURN_LOOP = PACKAGE_ROOT / "lib" / "turn_loop.py"
 
 discord = pytest.importorskip("discord", reason="relay.py imports discord.py")
 
@@ -430,11 +431,13 @@ def test_the_batch_formatter_actually_calls_format_attachments():
     """
     import ast
 
-    tree = ast.parse(AGENT_SERVER.read_text())
+    # The batch formatter moved to lib/turn_loop.py in 2.0 (format_batch, which
+    # claim_next calls with the server's format_attachments).
+    tree = ast.parse(TURN_LOOP.read_text())
     target = next(
         node for node in ast.walk(tree)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name == "process_agent_queue"
+        and node.name == "format_batch"
     )
     called = {
         getattr(n.func, "id", None) or getattr(n.func, "attr", None)
