@@ -13,7 +13,9 @@ Environment:
 
 Step keys (all optional): text, tools [{name, input, usage, message_id,
 parent_tool_use_id}], usage, cost, delay_ms, is_error, exit, hang,
-parent_tool_use_id (for the text event), result_usage (the closing
+parent_tool_use_id (for the text event), rate_limit {status, type,
+resets_at, windows: {type: {utilization, resets_at}}} (emits a recorded-shape
+`rate_limit_event` just before the result), result_usage (the closing
 result's usage; defaults to `usage`, as the real CLI sums across calls). Templates in `text`: {{text}} echoes
 the user's input, {{env:NAME}} reads an environment variable.
 
@@ -74,6 +76,22 @@ def parse_argv(argv):
             flags.setdefault(a, [])
         i += 1
     return flags
+
+
+def rate_limit_event(sid, spec):
+    """A `rate_limit_event` in the recorded real-CLI shape (spec 2.7). `spec` is
+    {"status", "type", "resets_at", "windows": {type: {utilization, resets_at}}}."""
+    t = spec.get("type", "five_hour")
+    resets = spec.get("resets_at")
+    info = {"status": spec.get("status", "allowed"), "resetsAt": resets,
+            "rateLimitType": t, "overageStatus": "rejected",
+            "overageDisabledReason": "org_level_disabled", "isUsingOverage": False}
+    if spec.get("windows"):
+        info["unifiedWindows"] = {
+            k: {"utilization": v.get("utilization"), "resetsAt": v.get("resets_at")}
+            for k, v in spec["windows"].items()}
+    return {"type": "rate_limit_event", "rate_limit_info": info,
+            "uuid": str(uuid.uuid4()), "session_id": sid}
 
 
 def emit(event):
@@ -405,6 +423,8 @@ class Queued:
     def finish(self, step, text, started, reply, tools_n, aborted=False):
         is_error = bool(step.get("is_error")) or aborted
         usage = step.get("usage") or DEFAULT_USAGE
+        if step.get("rate_limit"):
+            self.out(rate_limit_event(self.sid, step["rate_limit"]))
         res = self.base(
             type="result",
             subtype="error_during_execution" if aborted else ("error" if is_error else "success"),
@@ -587,6 +607,8 @@ def main():
             sys.exit(1)
 
         is_error = bool(step.get("is_error"))
+        if step.get("rate_limit"):
+            emit(rate_limit_event(sid, step["rate_limit"]))
         emit({"type": "result", "subtype": "error" if is_error else "success",
               "session_id": sid, "is_error": is_error, "result": reply,
               "usage": step.get("result_usage") or usage,

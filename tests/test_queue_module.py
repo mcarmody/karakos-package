@@ -216,3 +216,55 @@ def test_boot_refuses_unmigrated_queue(ags):
     with pytest.raises(SystemExit) as e:
         run(ags.init_db())
     assert "karakos migrate" in str(e.value)
+
+
+# -- 2.7: peek_claimable and fail_calls -------------------------------------------
+
+def test_peek_claimable_is_exactly_what_claim_batch_claims(ags, tmp_path):
+    async def go():
+        await ags.init_db()
+        db = ags.db
+        try:
+            await add(db, "s", 1, priority=0)
+            await add(db, "s", 2, priority=5)
+            await add(db, "s", 3, expires="2000-01-01T00:00:00Z")      # expired
+            await add(db, "s", 4, call_id="c", reply_to="o")           # call row, not head
+            await add(db, "s", 5, priority=0)
+            await add(db, "s", 7, priority=99, call_id="r")             # reply row: never claimed
+            peeked = await msgqueue.peek_claimable(db, "s", 2)
+            before = await db.execute_fetchall("SELECT id, processed FROM message_queue")
+            claimed = await msgqueue.claim_batch(db, "s", 2)
+            assert [r["id"] for r in peeked] == [r["id"] for r in claimed]
+            assert all(r["processed"] == 0 for r in before)           # peek claimed nothing
+            # a call row at the head is claimed alone
+            await add(db, "s", 6, priority=9, call_id="c2", reply_to="o")
+            peeked = await msgqueue.peek_claimable(db, "s", 20)
+            claimed = await msgqueue.claim_batch(db, "s", 20)
+            assert [r["id"] for r in peeked] == [r["id"] for r in claimed] and len(claimed) == 1
+            assert await msgqueue.peek_claimable(db, "empty", 20) == []
+        finally:
+            await db.close()
+    run(go())
+
+
+def test_fail_calls_replies_and_skips_only_call_rows(ags):
+    async def go():
+        await ags.init_db()
+        db = ags.db
+        try:
+            await add(db, "s", 1)
+            await add(db, "s", 2, call_id="c1", reply_to="o")
+            await add(db, "s", 3, call_id="c9")   # a reply row a waiting caller will read
+            assert await msgqueue.fail_calls(db, "s", "callee_paused", "token budget") == 1
+            assert await msgqueue.fail_calls(db, "s", "callee_paused", "token budget") == 0
+            rows = {r["message_id"]: r for r in await db.execute_fetchall(
+                "SELECT * FROM message_queue")}
+            assert rows["ms2"]["processed"] == msgqueue.STATUS_SKIPPED
+            assert rows["ms2"]["response"] == "callee_paused"
+            assert rows["ms1"]["processed"] == 0
+            assert rows["ms3"]["processed"] == 0   # replies are never failed
+            reply = json.loads(rows["callee_paused-c1-" + str(rows["ms2"]["id"])]["content"])
+            assert reply == {"call_id": "c1", "error": "callee_paused", "detail": "token budget"}
+        finally:
+            await db.close()
+    run(go())

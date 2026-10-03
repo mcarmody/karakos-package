@@ -117,5 +117,5 @@ def test_no_schema_change_and_buzzes_are_not_logged(harness):
         "restart_count", "claimed_by", "owner_agent"]
     from conftest import PACKAGE_ROOT
     steps = sorted(p.name for p in (PACKAGE_ROOT / "lib" / "migrate" / "steps").glob("*.py"))
-    assert steps == ["00_noop.py", "10_registry.py", "20_queue.py", "30_sessions.py",
-                     "__init__.py"]
+    # 2.3 adds no migrator step (other steps land independently: 35, 40, ...).
+    assert not [s for s in steps if "hive" in s or "call" in s]

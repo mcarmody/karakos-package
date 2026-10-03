@@ -231,3 +231,35 @@ def test_cli(tmp_path):
     write_ws(tmp_path, bad)
     r = run_cli(ws, "validate")
     assert r.returncode == 1 and "monitor" in r.stderr
+
+
+# -- 2.7: token budget keys ----------------------------------------------------
+
+def _with(agent, **kw):
+    d = copy.deepcopy(VALID)
+    d["agents"][agent].update(kw)
+    return d
+
+
+@pytest.mark.parametrize("key,val,ok", [
+    ("token_budget_4h", None, True), ("token_budget_4h", 1000, True),
+    ("token_budget_4h", 999, False), ("token_budget_4h", "5000", False),
+    ("token_budget_4h", True, False),
+    ("token_budget_min_pause_s", 60, True), ("token_budget_min_pause_s", 21600, True),
+    ("token_budget_min_pause_s", 59, False), ("token_budget_min_pause_s", 21601, False)])
+def test_token_budget_validation(key, val, ok):
+    data = _with("helper", **{key: val})
+    if ok:
+        parse_registry(data)
+    else:
+        with pytest.raises(RegistryError):
+            parse_registry(data)
+
+
+def test_monitor_cannot_have_a_budget_and_legacy_view_copies_both():
+    with pytest.raises(RegistryError):
+        parse_registry(_with("relay", token_budget_4h=5000))
+    reg = parse_registry(_with("helper", token_budget_4h=5000, token_budget_min_pause_s=600))
+    legacy = reg.legacy_view()["agents"]["helper"]
+    assert legacy["token_budget_4h"] == 5000 and legacy["token_budget_min_pause_s"] == 600
+    assert "token_budget_4h" not in reg.legacy_view()["agents"]["amos"]
