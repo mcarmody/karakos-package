@@ -25,7 +25,7 @@ def test_state_reads_server_globals_at_access_time(harness):
             first_db = mod.db
 
             async def other_post(agent, channel_id, content, reply_to=None,
-                                 dead_letter=False):
+                                 dead_letter=False, queue_message_id=None):
                 seen.append(content)
                 return "other-1"
 

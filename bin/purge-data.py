@@ -14,6 +14,7 @@ Called by scheduler daily at 4:30 AM.
 import logging
 import os
 import sqlite3
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -23,6 +24,7 @@ MESSAGES_DIR = WORKSPACE / "data" / "messages"
 # writer, and this purge is the only reader. tests/test_purge.py asserts the
 # two constants are equal rather than re-stating the literal.
 TOOL_AUDIT_DB = WORKSPACE / "data" / "mcp-tools-audit.db"
+OUTBOX_DB = WORKSPACE / "data" / "outbox" / "outbox.db"
 SESSION_SUMMARIES_DIR = WORKSPACE / "logs" / "session-summaries"
 
 MESSAGE_RETENTION_DAYS = int(os.environ.get("MESSAGE_RETENTION_DAYS", "90"))
@@ -165,6 +167,22 @@ def purge_old_stream_logs() -> int:
     return deleted
 
 
+def purge_outbox() -> int:
+    """Delivered outbox rows after 7 days, dead ones after 90 (events with them)."""
+    if not OUTBOX_DB.is_file():
+        return 0
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+    import outbox
+    conn = outbox.open_store(OUTBOX_DB)
+    try:
+        res = outbox.purge(conn)
+    finally:
+        conn.close()
+    if res["purged"]:
+        log.info(f"Purged {res['purged']} outbox row(s): {res}")
+    return res["purged"]
+
+
 def main():
     log.info("Data purge starting")
 
@@ -174,6 +192,7 @@ def main():
             "tool_audit": purge_tool_audit(),
             "session_summaries": purge_old_session_summaries(),
             "stream_logs": purge_old_stream_logs(),
+            "outbox": purge_outbox(),
         }
 
         log.info(f"Purge complete: {stats}")

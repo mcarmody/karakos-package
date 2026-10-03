@@ -384,7 +384,8 @@ want to edit:
 | `COST_WARNING_THRESHOLD` | Fraction of a cap that triggers a warning, default 0.75 |
 | `MAX_CONCURRENT_BUILDERS` / `MAX_CONCURRENT_REVIEWERS` | Parallel dispatches |
 | `GUEST_TURN_LIMIT` | Turns a bot author may consume, default 12 |
-| `DISCORD_POST_MAX_ATTEMPTS` | Retries before a reply is dead-lettered, default 3 |
+| `DISCORD_POST_MAX_ATTEMPTS` | Per-chunk tries for incidental posts (tool lines, notices), default 3 |
+| `DISCORD_OUTBOX_MAX_ATTEMPTS` / `DISCORD_OUTBOX_MAX_AGE_S` | Outbox retries (default 12) and age limit (default 86400 s) before a reply is marked dead |
 
 **Memory, retention and timing:**
 

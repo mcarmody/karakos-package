@@ -29,8 +29,12 @@ class Route:
 
 
 def route_message(registry, channel_name, mentioned_agent, is_bot,
-                  channel_opt_out=False) -> Optional[Route]:
-    # 1. Not in channels.json: never routed, mention or not (B24).
+                  channel_opt_out=False, parent_channel_name=None) -> Optional[Route]:
+    # 1. Not in channels.json: never routed, mention or not (B24). A thread has
+    # its own id, never listed: it resolves through its parent's name first, so
+    # a thread under an unlisted parent is still refused.
+    if channel_name is None:
+        channel_name = parent_channel_name
     if channel_name is None:
         return None
 

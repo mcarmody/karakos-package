@@ -177,6 +177,38 @@ Two rules apply to every bot regardless of that key:
 
 Set `GUEST_TURN_LIMIT` in `config/.env` to change the cap.
 
+## Optional behaviours
+
+Four small behaviours that make a busy channel and a long-running agent easier
+to live with. Every one is **off by default**, so an upgraded install behaves
+exactly as before. They are set in `config/channels.json`: a top-level `"ux"`
+object applies to every channel, and a channel's own `"ux"` object overrides it
+key by key. A key set in neither place is off. A wrong type or an unknown key is
+logged once and treated as off.
+
+```json
+{
+  "ux": {"suppress_embeds": true},
+  "channels": {
+    "general": {
+      "id": "...",
+      "ux": {"threads": {"after_s": 60}, "edit_reroute": true, "reaction_notices": "owner"}
+    }
+  }
+}
+```
+
+| Key | Values (default off) | What it does | Discord permissions |
+|---|---|---|---|
+| `threads` | `false`, `true`, or `{"after_s": 60, "max_lines": 40}` | Once a turn has run `after_s` seconds, its tool-activity lines move into a public thread opened on the first tool line. The final reply stays in the channel. The per-turn line cap rises from 12 to `max_lines`. If a thread cannot be created, the lines stay in the channel. Replies inside the thread route as the parent channel. | Create Public Threads, Send Messages in Threads |
+| `reaction_notices` | `false`, `"owner"` (or `true`), `"humans"` | Tells the agent when a person reacts to one of its messages. The agent normally answers `PASS`, which is not posted. One notice per user and message per minute, at most 10 per channel per minute. | Read Message History |
+| `edit_reroute` | `false`, `true`, or `{"window_s": 900, "max_followups": 3}` | When a person edits a message an agent already received: a still-queued message is rewritten in place, otherwise the agent gets a follow-up with the old and new text. An edit after a `PASS` or empty reply is ignored. | Read Message History |
+| `suppress_embeds` | `false`, `true` | Agent text replies and tool lines are posted with link previews suppressed. Ask prompts keep their embeds. Messages already posted are not changed. | none |
+
+Reaction notices and edits need the relay to be able to read the message, so the
+bot must be able to see the channel's history. Changes to `channels.json` are
+picked up by the relay within seconds and by the server on its next agent reload.
+
 ## Operational Commands
 
 These are real Discord application commands: type `/` in any channel the bot
@@ -231,25 +263,29 @@ picker itself is unavailable.
 
 **The agent answered but nothing appeared in the channel:**
 
-A reply that is generated and then fails to post is written to
-`data/discord-dead-letter.jsonl` rather than discarded — the agent ran and the
-tokens were spent, so the answer is worth keeping. `GET /health` reports the
-count:
+A reply that is generated goes into a durable outbox (`data/outbox/outbox.db`)
+before it is sent, so a Discord outage or restart does not lose it. Delivery is
+retried with backoff (5 s, 15 s, 45 s, ... capped at 1 h) until
+`DISCORD_OUTBOX_MAX_ATTEMPTS` (default 12) or `DISCORD_OUTBOX_MAX_AGE_S`
+(default 24 h); a 400, 401, 403 or 404 is not retried. A row that gives up is
+`dead` and keeps its text. `GET /health` reports it:
 
 ```json
-{ "status": "healthy", "dead_letters": 3, "dead_letter_path": "..." }
+{ "status": "healthy", "dead_letters": 3,
+  "outbox": { "pending": 0, "sending": 0, "dead": 3, "oldest_pending_age_s": null } }
 ```
 
-A non-zero count means the delivery path is broken, not that the agents are
-idle. Each record holds the agent, channel id, timestamp, failure reason and
-the full reply text, so it can be re-sent by hand once the cause is fixed.
+A non-zero `dead` count means the delivery path is broken, not that the agents
+are idle. Inspect and revive rows with `GET /outbox`, `GET /outbox/{id}`,
+`POST /outbox/{id}/retry` and `POST /outbox/{id}/discard`, or, with the server
+down, `python3 lib/outbox.py {stats,list,show,retry,discard}`. Every attempt is
+recorded in `outbox_events` (never the message text).
 
 The usual cause is a revoked **Send Messages** permission in that channel;
-Discord answers 403 and the relay does not retry, because a revoked permission
-does not heal on its own. Transient failures (5xx, network) are retried
-`DISCORD_POST_MAX_ATTEMPTS` times (default 3) before being queued.
-
-The file only ever grows — prune it once the entries have been recovered.
+Discord answers 403 and the outbox does not retry, because a revoked permission
+does not heal on its own. A reply that is empty or exactly `PASS` is never
+posted. Delivery is at-least-once, narrowed by a per-chunk nonce. A 1.x
+`data/discord-dead-letter.jsonl` is imported as `dead` rows by `karakos migrate`.
 
 **Slash commands don't show up when you type `/`:**
 - Registration runs automatically on container start
