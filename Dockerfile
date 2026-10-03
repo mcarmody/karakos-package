@@ -42,6 +42,18 @@ RUN groupadd --system --gid ${KARAKOS_GID} karakos \
     && useradd --system --uid ${KARAKOS_UID} --gid ${KARAKOS_GID} \
         --home-dir /home/karakos --create-home --shell /bin/bash karakos
 
+# Bake the embedding model weights (as the build user) so a container with no
+# network still has them. KARAKOS_BAKE_EMBED_MODEL=0 skips the download; recall
+# then falls back to keyword mode.
+ARG KARAKOS_BAKE_EMBED_MODEL=1
+ENV FASTEMBED_CACHE_PATH=/opt/fastembed
+RUN install -d -o karakos -g karakos /opt/fastembed
+USER karakos
+RUN if [ "$KARAKOS_BAKE_EMBED_MODEL" = "1" ]; then \
+        python3 -c "from fastembed import TextEmbedding; TextEmbedding('BAAI/bge-small-en-v1.5', cache_dir='/opt/fastembed')"; \
+    fi
+USER root
+
 WORKDIR /workspace
 # WORKDIR creates the directory as root. Hand it to karakos so the user can
 # write into it (entrypoint.sh runs `git init` there, agents log to it, etc.).
