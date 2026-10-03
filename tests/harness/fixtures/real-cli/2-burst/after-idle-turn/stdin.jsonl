@@ -1,0 +1,4 @@
+{"t":0.001,"dir":"in","event":{"type":"user","message":{"role":"user","content":"Reply with only the word WARMUP."}}}
+{"t":6.008,"dir":"in","event":{"type":"user","message":{"role":"user","content":"Reply with only the word ALPHA."}}}
+{"t":6.109,"dir":"in","event":{"type":"user","message":{"role":"user","content":"Reply with only the word BRAVO."}}}
+{"t":6.21,"dir":"in","event":{"type":"user","message":{"role":"user","content":"Reply with only the word CHARLIE."}}}

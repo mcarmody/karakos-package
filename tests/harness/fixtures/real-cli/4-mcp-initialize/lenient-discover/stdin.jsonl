@@ -1,0 +1,1 @@
+{"t":0.001,"dir":"in","event":{"type":"user","message":{"role":"user","content":"Call the mcp tool named mcp__stub__ping once, then reply with what it returned."}}}

@@ -1,0 +1,9 @@
+{"t":0.0,"dir":"in","event":{"jsonrpc":"2.0","id":"server-discover-probe-1","method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"claude-code","title":"Claude Code","version":"2.1.287","description":"Anthropic's agentic coding tool","websiteUrl":"https://claude.com/claude-code"},"io.modelcontextprotocol/clientCapabilities":{"roots":{"listChanged":true},"elicitation":{"form":{},"url":{}}}}}}}
+{"t":0.0,"dir":"out","event":{"jsonrpc":"2.0","id":"server-discover-probe-1","result":{}}}
+{"t":0.026,"dir":"in","event":{"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"roots":{"listChanged":true},"elicitation":{"form":{},"url":{}}},"clientInfo":{"name":"claude-code","title":"Claude Code","version":"2.1.287","description":"Anthropic's agentic coding tool","websiteUrl":"https://claude.com/claude-code"}},"jsonrpc":"2.0","id":0}}
+{"t":0.026,"dir":"out","event":{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"stub","version":"0"}}}}
+{"t":0.033,"dir":"in","event":{"jsonrpc":"2.0","method":"notifications/initialized"}}
+{"t":0.034,"dir":"in","event":{"method":"tools/list","jsonrpc":"2.0","id":1}}
+{"t":0.034,"dir":"out","event":{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"ping","description":"Returns pong","inputSchema":{"type":"object","properties":{}}}]}}}
+{"t":3.781,"dir":"in","event":{"method":"tools/call","params":{"name":"ping","arguments":{},"_meta":{"claudecode/toolUseId":"toolu_SCRUBBED007","progressToken":2}},"jsonrpc":"2.0","id":2}}
+{"t":3.782,"dir":"out","event":{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"pong"}]}}}

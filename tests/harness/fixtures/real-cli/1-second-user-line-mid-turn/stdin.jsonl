@@ -1,0 +1,2 @@
+{"t":0.001,"dir":"in","event":{"type":"user","message":{"role":"user","content":"Use the Bash tool to run exactly: sleep 20. Then reply with the word DONE1."}}}
+{"t":3.01,"dir":"in","event":{"type":"user","message":{"role":"user","content":"Also, after that, reply with the word SECOND2 on its own line."}}}
