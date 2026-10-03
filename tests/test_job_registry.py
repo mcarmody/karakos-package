@@ -21,13 +21,13 @@ def reset():
 
 def test_builtin_names_match_old_scheduler():
     names = {j.name for j in jr.load_jobs("/nonexistent")}
-    for n in ("heartbeat-primary", "heartbeat-monitor", "memory-maintenance", "health-sweep",
+    for n in ("heartbeat-primary", "heartbeat-monitor", "memory-consolidate", "health-sweep",
               "wedge-check", "cli-watchdog", "flush-deferred", "purge", "update-check",
               "scheduler", "mcp-tools", "relay", "monitor-tick"):
         assert n in names
     comps = {j.name for j in jr.BUILTIN if j.kind == "component"}
     assert comps == {"scheduler", "mcp-tools", "relay"}
-    assert {j.name: j.max_age_s for j in jr.BUILTIN}["memory-maintenance"] == 48 * 3600
+    assert {j.name: j.max_age_s for j in jr.BUILTIN}["memory-consolidate"] == 48 * 3600
 
 
 def test_hourly_marks():
@@ -94,8 +94,8 @@ def test_invalid_jobs_yaml_gives_builtin_and_finding(tmp_path):
 
 def test_register_unregister_and_optional_modules(tmp_path):
     jr.register(jr.Job("consolidate", "job", jr.Daily("02:00"), "x:y", 100))
-    jr.unregister("memory-maintenance")
+    jr.unregister("memory-consolidate")
     names = {j.name for j in jr.load_jobs(tmp_path)}
-    assert "consolidate" in names and "memory-maintenance" not in names
+    assert "consolidate" in names and "memory-consolidate" not in names
     jr.OPTIONAL_MODULES.append("definitely_not_a_module_xyz")
     assert "consolidate" in {j.name for j in jr.load_jobs(tmp_path)}

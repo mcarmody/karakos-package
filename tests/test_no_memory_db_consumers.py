@@ -11,9 +11,8 @@ NEEDLES = ("memory.db", "memory/memory.db", "FROM episodes", "FROM facts", "FROM
            "INTO episodes", "INTO facts")
 SUFFIXES = (".py", ".sh", ".ts")
 EXCLUDED_PREFIXES = ("tests/", "lib/migrate/", "docs/")
-# bin/memory-maintenance.py is the nightly 1.x writer; 4.3 retires it and this
-# entry with it. Nothing else may be listed here.
-ALLOWLIST = {"bin/memory-maintenance.py"}
+# Nothing is allowlisted: the migrator (lib/migrate) is the only 1.x memory.db reader.
+ALLOWLIST = set()
 # Dev tooling that BUILDS 1.x installs as migrator test fixtures (step 7.1). It
 # writes a 1.x memory.db on purpose and never runs inside an install.
 FIXTURE_TOOLS = {"tools/seed_fixture.py"}
