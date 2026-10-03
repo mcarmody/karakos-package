@@ -158,9 +158,13 @@ AUTH="Authorization: Bearer $AGENT_SERVER_TOKEN"
 5. **Running builders and reviewers.** `inbox/builder` and `inbox/reviewer`
    are empty and no `invoke-*` process is running.
 
+   The image has no `ps`, so the process check reads `/proc`; the bracket in
+   the pattern keeps the command from matching itself, and no output means no
+   builder or reviewer is running.
+
    ```bash
    docker compose -f config/docker-compose.yml --env-file config/.env \
-     exec karakos sh -c 'ls -A inbox/builder inbox/reviewer; ps -eo args | grep "[i]nvoke-"'
+     exec karakos sh -c 'ls -A inbox/builder inbox/reviewer; grep -la "invoke-[br]" /proc/[0-9]*/cmdline'
    ```
 
 Then stop the stack: `make down` (graceful, in-flight turns finish first, up to
@@ -194,15 +198,28 @@ you pull.
 ## Dry run
 
 Get the 2.0 code and image first. `git pull` does not change which image runs:
-the tag comes from `KARAKOS_VERSION` (the wrapper defaults it to the 2.0 image
-when it is not set in your shell), and releases are tagged `v<major>.<minor>`
-and `v<major>` only.
+the tag comes from `KARAKOS_VERSION`, and releases are tagged `v<major>.<minor>`
+and `v<major>` (and `latest`). Two places read it, and they do not read the same
+source:
+
+- `make pull` and `make up` read `config/.env`. **Set the pin there to the 2.0
+  tag (or remove it) before `make pull`**, or you will start the old image on
+  migrated data.
+- `bin/karakos` reads your **shell** environment, not `config/.env`. Export the
+  same value in the shell you run it from (`export KARAKOS_VERSION=v2.0`).
+  Unset, the wrapper falls back to a built-in default of `2.0.0`, which is not a
+  tag the release workflow publishes (see the PR's code follow-ups); do not rely
+  on it.
 
 ```bash
 git pull origin main
+export KARAKOS_VERSION=v2.0      # the 2.0 release tag; also set it in config/.env
 make pull
-bin/karakos migrate --dry-run --report-to /tmp/migration-plan.md
+bin/karakos migrate --dry-run --report-to /backups/migration-plan.md
 ```
+
+`--report-to` runs inside the migrator's container, where only `/backups` maps
+to the host: the report lands in `backups/migration-plan.md` in your checkout.
 
 `bin/karakos` is the host wrapper. It runs the in-container migrator
 (`bin/karakos-migrate`, which is `python3 -m lib.migrate`) against your
@@ -242,7 +259,7 @@ paths mounted instead).
 ## The real run
 
 ```bash
-bin/karakos migrate
+bin/karakos migrate          # with KARAKOS_VERSION exported, as in the dry run
 ```
 
 It stops the stack, takes the backup, runs the steps, verifies each, and writes
@@ -416,7 +433,7 @@ way back.
 bin/karakos migrate --restore backups/pre-2.0-20261003T120000000000Z
 ```
 
-The migrator prints this exact command (with the real path of your backup) after every run.
+Export `KARAKOS_VERSION` first, as for the dry run. The migrator prints this exact command (with the real path of your backup) after every run.
 The wrapper stops the stack, verifies the backup's manifest, and puts `data/`,
 `config/` and `agents/` back; inside the container the same step is
 `python3 -m lib.migrate --to-backup DIR`. Then roll the **image** back, which is

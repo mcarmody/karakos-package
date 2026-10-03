@@ -666,16 +666,16 @@ agents:
 
 **Memory per process.** Each shard is a separate `claude` process, so memory
 grows with shard count. There is no figure to quote: measure your own. `docker
-stats` shows the container's total; per-process resident memory comes from `ps`
-inside it:
+stats` shows the container's total; the image has no `ps`, so per-process
+resident memory comes from `/proc` inside it:
 
 ```bash
 docker stats --no-stream
-docker compose -f config/docker-compose.yml --env-file config/.env \
-  exec karakos ps -eo pid,rss,args
+docker compose -f config/docker-compose.yml --env-file config/.env exec karakos bash -c 'for d in /proc/[0-9]*; do c=$(tr "\0" " " < $d/cmdline); case "$c" in *[c]laude*) echo "${d#/proc/} $(grep VmRSS $d/status) ${c:0:60}";; esac; done'
 ```
 
-Read the `rss` column (kilobytes) of the lines that run `claude`.
+Each line is one `claude` process: its pid, its resident memory (`VmRSS`, in
+kB) and the start of its command line.
 
 ## The hive
 
