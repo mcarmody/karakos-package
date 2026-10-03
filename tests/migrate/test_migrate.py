@@ -99,7 +99,7 @@ def test_env_bypass_and_production_refusal(tmp_path, monkeypatch):
 # -- detector ----------------------------------------------------------------
 
 def test_detect_buckets(tmp_path):
-    def tree(name, agents_json=True, dot=False, yaml=False, sessions=False, queue=False):
+    def tree(name, agents_json=True, dot=False, yaml=False, rate=False, queue=False):
         r = tmp_path / name
         (r / "config").mkdir(parents=True)
         if agents_json:
@@ -111,15 +111,14 @@ def test_detect_buckets(tmp_path):
         sql = "CREATE TABLE x(a);"
         if queue:
             sql += "CREATE TABLE message_queue(id);"
-        if sessions:
-            sql += "CREATE TABLE sessions(id);"
+        if rate:
+            sql += "CREATE TABLE rate_limit_state(agent);"
         mk_db(r / "data" / "memory" / "agent-server.db", sql)
         return detect_version(r / "data", r / "config")
 
     assert tree("v10").version == "1.0"
-    assert tree("v11", dot=True).version == "1.1"
     assert tree("v13", dot=True, queue=True).version == "1.3"
-    assert tree("v15", dot=True, sessions=True).version == "1.5"
+    assert tree("v15", dot=True, rate=True).version == "1.5"
     assert tree("v15y", agents_json=False, yaml=True, dot=True).version == "1.5"
     d = detect_version(tmp_path / "nothing" / "data", tmp_path / "nothing" / "config")
     assert d.version == "unknown" and d.evidence
