@@ -4,6 +4,11 @@ Session Summarizer — Generates session summaries for agent context preservatio
 
 Reads recent agent stream logs, calls Claude to generate a summary, validates
 required headers, and outputs to checkpoint file for next session re-injection.
+
+NOTE (step 2.6): the agent server no longer calls this script. A session now
+hands itself over through a handoff note written by the session that holds the
+context (lib/session_policy.py). This stays in the tree for one release as a
+manual tool and will be removed after that.
 """
 
 import argparse
@@ -18,7 +23,7 @@ from datetime import datetime
 WORKSPACE_ROOT = Path(os.environ.get("WORKSPACE_ROOT", "/workspace"))
 STREAM_LOG_DIR = WORKSPACE_ROOT / "logs" / "agent-streams"
 SUMMARY_DIR = WORKSPACE_ROOT / "logs" / "session-summaries"
-LAST_SUMMARY_TEMPLATE = WORKSPACE_ROOT / "data" / "last-session-summary-{agent}.md"
+SUMMARY_FILE_TEMPLATE = WORKSPACE_ROOT / "data" / "last-session-summary-{agent}.md"
 AUDIT_LOG = WORKSPACE_ROOT / "logs" / "summarizer-audit.jsonl"
 
 # How many rotated stream logs to walk back through. agent-server rolls to a
@@ -209,7 +214,7 @@ def call_summarizer(stream_content: str) -> tuple[bool, str, dict]:
 def save_summary(agent: str, summary: str):
     """Save summary to checkpoint file and timestamped archive"""
     # Create checkpoint (overwrites)
-    checkpoint_path = Path(str(LAST_SUMMARY_TEMPLATE).format(agent=agent))
+    checkpoint_path = Path(str(SUMMARY_FILE_TEMPLATE).format(agent=agent))
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     with open(checkpoint_path, "w") as f:
         f.write(summary)

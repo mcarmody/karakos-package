@@ -253,6 +253,17 @@ class Harness:
             return []
         return [json.loads(l) for l in path.read_text().splitlines() if l]
 
+    def handoff_files(self, shard=None):
+        """Names of the files in data/handoff/ (notes and rotated copies),
+        sorted; for one shard (`<shard>.md` and `<shard>.<ts>.md`) or all."""
+        d = self.workspace / "data" / "handoff"
+        if not d.is_dir():
+            return []
+        names = sorted(p.name for p in d.iterdir())
+        if shard is None:
+            return names
+        return [n for n in names if n == f"{shard}.md" or n.startswith(f"{shard}.")]
+
     def beacon(self, shard):
         """The shard's liveness beacon (data/health/agents/<shard>.json), or None."""
         path = self.workspace / "data" / "health" / "agents" / f"{shard}.json"
@@ -289,3 +300,13 @@ class Harness:
                 if line.strip():
                     events.append(json.loads(line))
         return events
+
+
+def handoff_rule(note="open threads: none", **step):
+    """A fake-claude rule that answers the handoff prompt by writing `note` to
+    the path the prompt names and replying PASS (step 2.6). Extra keywords go
+    into the step (e.g. ``hang=True`` to make the handoff turn never answer)."""
+    body = {"text": "PASS", "write_file_from_prompt": note, **step}
+    if body.get("hang"):
+        body.pop("write_file_from_prompt")
+    return {"match": r"\[handoff\]", "step": body}

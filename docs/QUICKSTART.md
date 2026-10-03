@@ -129,7 +129,7 @@ pass the right flags:
 | Command | What it does |
 |---|---|
 | `make up` | Start the container |
-| `make down` | Stop it — agents finalize sessions first, up to 45s |
+| `make down` | Stop it — in-flight turns finish first, up to 45s |
 | `make logs` | Follow the log |
 | `make shell` | A shell inside the container, as the `karakos` user |
 | `make pull` | Fetch a newer image |
@@ -191,7 +191,7 @@ what a builder is allowed to touch — see
 make down
 ```
 
-Agents finalize their sessions before exit, which can take up to 45 seconds.
+In-flight turns finish before exit, which can take up to 45 seconds.
 Data lives in Docker volumes and survives.
 
 ## Troubleshooting

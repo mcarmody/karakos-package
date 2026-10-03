@@ -37,11 +37,11 @@ def agent_server(tmp_path, monkeypatch):
     async def fake_get_or_create_session(agent):
         return "session-1234"
 
-    async def fake_load_last_session(agent):
-        return {"status": "not_found"}
+    async def fake_session_cleared_at(agent):
+        return None
 
     monkeypatch.setattr(mod, "get_or_create_session", fake_get_or_create_session)
-    monkeypatch.setattr(mod, "load_last_session", fake_load_last_session)
+    monkeypatch.setattr(mod, "session_cleared_at", fake_session_cleared_at)
 
     yield mod
 

@@ -29,6 +29,12 @@ REGISTRY_VERSION = 2
 ID_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 ROLES = ("primary", "monitor", "builder", "reviewer", "custom")
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
+RESET_MODES = ("reset", "compact")
+CONTEXT_BUDGET_MIN = 20000
+CONTEXT_BUDGET_WARN_ABOVE = 1000000
+# handoff_on_reset when the key is not written: the roles that carry a
+# long-lived conversation. An explicit value always wins (step 2.6).
+HANDOFF_DEFAULT_ROLES = ("primary", "custom")
 
 # key -> (default, type-check description). Order is the canonical key order.
 _DEFAULTS = {
@@ -39,7 +45,8 @@ _DEFAULTS = {
     "token_budget_4h": None,
     "token_budget_min_pause_s": 1800,
     "context_budget_tokens": None,
-    "handoff_on_reset": False,
+    "handoff_on_reset": False,   # effective default is by role, see HANDOFF_DEFAULT_ROLES
+    "reset_mode": "reset",
     "system_prompt": None,
     "prompt": None,
     "tool_streaming": True,
@@ -58,6 +65,7 @@ _LEGACY_PASSTHROUGH = (
     "system_prompt", "prompt", "model", "max_turns", "timeout", "tool_streaming",
     "stream_to_channel", "dashboard_chat", "allowed_tools", "disallowed_tools", "env",
     "label", "token_budget_4h", "token_budget_min_pause_s", "work_stealing",
+    "context_budget_tokens", "reset_mode",
 )
 
 
@@ -124,8 +132,10 @@ def _check_type(aid, key, val, errors, warnings=None):
             and not (_is_int(val) and 60 <= val <= 21600):
         errors.append(f"{p} must be an integer from 60 to 21600")
     elif key == "context_budget_tokens" and val is not None \
-            and not (_is_int(val) and val > 0):
-        errors.append(f"{p} must be a positive integer or null")
+            and not (_is_int(val) and val >= CONTEXT_BUDGET_MIN):
+        errors.append(f"{p} must be an integer of at least {CONTEXT_BUDGET_MIN}, or null")
+    elif key == "reset_mode" and val not in RESET_MODES:
+        errors.append(f"{p} must be one of {', '.join(RESET_MODES)}")
     elif key in ("handoff_on_reset", "tool_streaming", "stream_to_channel",
                  "dashboard_chat") and not isinstance(val, bool):
         errors.append(f"{p} must be true or false")
@@ -217,6 +227,8 @@ class Registry:
                     val = a.explicit[key]
                     entry[key] = list(val) if isinstance(val, list) else \
                         dict(val) if isinstance(val, dict) else val
+            # The one value the server reads: explicit wins, else by role.
+            entry["handoff_on_reset"] = bool(a.settings["handoff_on_reset"])
             if a.discord.get("token_env"):
                 entry["discord_bot_token_env"] = a.discord["token_env"]
             if a.discord.get("bot_id_env"):
@@ -283,6 +295,12 @@ def parse_registry(data, channel_names=None):
             else:
                 settings[key] = type(default)(default) if isinstance(default, (list, dict)) \
                     else default
+        if "handoff_on_reset" not in body:
+            settings["handoff_on_reset"] = role in HANDOFF_DEFAULT_ROLES
+        cb = body.get("context_budget_tokens")
+        if _is_int(cb) and cb > CONTEXT_BUDGET_WARN_ABOVE:
+            warnings.append(f"agent '{aid}': context_budget_tokens {cb} is above "
+                            f"{CONTEXT_BUDGET_WARN_ABOVE}, larger than any model window")
         if role == "monitor" and body.get("token_budget_4h") is not None:
             errors.append(f"agent '{aid}': a monitor cannot have a token budget "
                           f"(a paused monitor could not report the pause)")

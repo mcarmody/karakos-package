@@ -12,7 +12,7 @@ These rules apply to every agent in {{SYSTEM_NAME}}.
 
 - **Bash**: system commands, git operations, scripting. Avoid destructive operations without explicit permission.
 - **Memory**: check memory before answering factual questions about past conversations or decisions; record important facts and decisions for future reference.
-- **Session management**: use `session.finalize` when approaching context limits or before long-running tasks; the summary is re-injected on the next session start.
+- **Session management**: use `session.finalize` when you want to continue in a fresh session (a long task finished, the thread has grown heavy); a handoff note you will receive is written for you.
 
 ### Escalation
 
