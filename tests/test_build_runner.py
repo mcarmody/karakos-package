@@ -61,7 +61,7 @@ def wait_for(cond, timeout=20):
 
 
 def pgid_of(env):
-    pid, pg = (env.dir / "run.pid").read_text().split()
+    pid, pg, start = (env.dir / "run.pid").read_text().split()
     assert pid == pg and int(pg) > 1
     return int(pg)
 

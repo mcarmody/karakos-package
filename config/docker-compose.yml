@@ -11,6 +11,11 @@ services:
       # image build stage produces from the pinned karakos-dashboard ref.
       - ../config:/workspace/config
       - ../agents:/workspace/agents
+      # Stays in 2.0: `.karakos/config.json` (written by setup.sh) is still read
+      # for the owner and system name (lib/prompt_compose.py `_owner_system`,
+      # used when OWNER_NAME/SYSTEM_NAME are not in the environment) and by the
+      # `workspace` MCP tool (mcp/tools-server.py status/config). Remove the
+      # mount only once both stop reading it.
       - ../.karakos:/workspace/.karakos
       # Persist runtime data (sqlite, logs, JSONL message archive, inbox
       # dispatches) across container restarts.

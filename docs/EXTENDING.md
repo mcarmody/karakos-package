@@ -180,13 +180,14 @@ global. Tests must not read `HOME`, bind real ports or touch Discord;
 `tests/test_no_home_access.py` enforces this. The `Harness` signatures are
 frozen by `tests/test_harness_api.py`.
 
-**Known load flakes.** Under full-suite load a few harness tests have timed out
-and then passed alone or on rerun: `test_depth_cap_two_for_calls` and
-`test_two_shards_calling_each_other_is_refused_at_once` (hive timeouts, in
-`tests/test_hive_harness.py`) and `test_no_boundary_runs_as_next_turn` (a
-`wait_for` in `tests/test_steering_harness.py`). They are timing sensitivity, not
-logic failures: rerun the test alone before treating one as a regression, and
-give a new harness wait a generous timeout.
+**Load timeouts.** `test_depth_cap_two_for_calls` and
+`test_two_shards_calling_each_other_is_refused_at_once` timed out under
+full-suite load because a reply could land between the caller's long-poll checks and
+its wait and be missed (fixed: `msgqueue.work_version`, with a regression test in
+`tests/test_hive_harness.py` that holds the gap open). `test_no_boundary_runs_as_next_turn`
+raced two results 5 ms apart against a 20 ms poll (fixed with a step delay).
+If a harness test times out under load, look for a missed wake-up or a race
+before raising a wait; raise one only when the work is shown to be slow.
 
 ## Using the Builder Agent
 

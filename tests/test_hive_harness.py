@@ -608,3 +608,39 @@ def test_call_rows_are_not_steered_into(harness):
 
 def test_call_rows_are_not_stealable(harness):
     pytest.skip("2.4 (work stealing) is not merged: nothing to exclude call rows from yet")
+
+
+# -- lost wake-up in the caller's long poll -------------------------------------------------
+
+def test_reply_landing_between_the_poll_checks_is_not_missed(harness):
+    """Cause of the full-suite timeouts in test_depth_cap_two_for_calls and
+    test_two_shards_calling_each_other_is_refused_at_once. GET /hive/call checks
+    for a reply, then reads the call row (a second await), then waits for a
+    wake-up on the caller. A reply inserted and notified in that gap was missed
+    (the notify task had already run), and the poll then slept its whole 20 s slice
+    while the answer sat in the queue. Under load the gap widens; here it is held
+    open on purpose, so a regression fails in seconds, not by luck."""
+    h = harness(agents=["a", "b"])
+
+    async def scenario():
+        async with h:
+            real = h.module._hive_fetch
+
+            async def slow(sql, params=()):
+                rows = await real(sql, params)
+                if sql.startswith("SELECT processed, response"):
+                    await asyncio.sleep(1.0)       # the gap: after the reply check, before waiting
+                return rows
+            h.module._hive_fetch = slow
+            h.script(default={"text": "ok"}, rules=[
+                rule("hive call from a", {"text": "answer-b"}, shard="^b$"),
+                rule("GO", {"mcp": [tool("hive_call", to="b", question="q")],
+                            "text": "A:{{mcp:0.answer}}"}, shard="^a$")])
+            t0 = time.monotonic()
+            await h.send("a", "GO")
+            await settle(h, "a", "b", timeout=10)
+            return time.monotonic() - t0
+
+    elapsed = run(scenario())
+    assert h.queue_rows("a")[0]["response"] == "A:answer-b"
+    assert elapsed < 8                    # a missed wake-up costs the 20 s poll slice

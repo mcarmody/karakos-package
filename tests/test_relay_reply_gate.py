@@ -158,7 +158,7 @@ def adapter(relay, monkeypatch):
         return None
 
     async def fake_send(message, agent):
-        a.routed.append((agent, message.content))
+        a.routed.append((agent.agent, message.content))   # agent is a Route; compare the agent id explicitly
 
     a.capture_message = fake_capture
     a.send_to_agent_server = fake_send

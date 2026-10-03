@@ -74,3 +74,11 @@ def test_one_x_registry_without_shards():
     assert r("lobby", registry_=reg1) == Route("a", "a", "primary_fallback")
     assert r("x", "b", registry_=reg1) == Route("b", "b", "mention")
     assert r("x", "b", registry_=reg1).shard == "b"
+
+
+def test_route_does_not_equal_its_agent_id_string():
+    from routing import Route
+    r = Route("a-2", "a", "channel")
+    assert r != "a" and r != "a-2"
+    assert r == Route("a-2", "a", "channel") and r != Route("a", "a", "channel")
+    assert len({r, Route("a-2", "a", "channel")}) == 1       # still hashable

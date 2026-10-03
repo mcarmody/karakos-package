@@ -7,7 +7,9 @@
 #
 # Stops the stack, runs the in-container migrator (bin/karakos-migrate) with the
 # volumes mounted, with the backup written to a host path, and prints the restore
-# command. The 2.0 image is selected with KARAKOS_VERSION (default 2.0.0).
+# command. The 2.0 image is selected with KARAKOS_VERSION: the environment, else the
+# KARAKOS_VERSION line in config/.env, else v2.0 (a tag release.yml publishes:
+# v<major>.<minor>, v<major> and latest; a bare 2.0.0 is never pushed).
 # Run it from a checkout / install directory that holds config/docker-compose.yml.
 set -euo pipefail
 
@@ -40,7 +42,17 @@ done
 [ -f "$COMPOSE_FILE" ] || { echo "no compose file at $COMPOSE_FILE" >&2; exit 2; }
 mkdir -p "$BACKUP_TO"
 BACKUP_ABS="$(cd "$BACKUP_TO" && pwd)"
-export KARAKOS_VERSION="${KARAKOS_VERSION:-2.0.0}"
+# Not in the environment: read it from the compose env file (parsed, never
+# sourced) so a pinned tag in config/.env is the tag the migrator runs.
+if [ -z "${KARAKOS_VERSION:-}" ]; then
+  ENV_FILE="$(dirname "$COMPOSE_FILE")/.env"
+  if [ -f "$ENV_FILE" ]; then
+    v="$(sed -n 's/^[[:space:]]*\(export[[:space:]]\{1,\}\)\{0,1\}KARAKOS_VERSION=//p' "$ENV_FILE" | tail -1 \
+         | sed -e 's/[[:space:]]*#.*$//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e "s/^\"\(.*\)\"$/\1/" -e "s/^'\(.*\)'$/\1/")"
+    KARAKOS_VERSION="$v"
+  fi
+fi
+export KARAKOS_VERSION="${KARAKOS_VERSION:-v2.0}"
 DC=("$DOCKER" compose -f "$COMPOSE_FILE")
 MIGRATE=(/workspace/bin/karakos-migrate)
 

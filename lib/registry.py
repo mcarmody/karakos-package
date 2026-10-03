@@ -474,6 +474,57 @@ _DEFAULT_MONITOR = {"name": "relay", "role": "monitor", "model": "haiku",
                                "core": True, "house_style": True}}
 
 
+_MCP_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-[^}]*)?\}")
+# Names the spawner already supplies (lib/spawn_env.py allowlist, agent-server identity).
+_MCP_ENV_SKIP_PREFIXES = ("KARAKOS_", "AGENT_SERVER_", "LC_", "XDG_")
+_MCP_ENV_SKIP = frozenset({"WORKSPACE_ROOT", "PATH", "HOME", "USER", "LANG", "TZ", "TERM",
+                           "TMPDIR", "SHELL", "PWD"})
+
+
+def mcp_env_names(workspace):
+    """Env var NAMES the workspace's .mcp.json references as ${NAME} (or
+    ${NAME:-default}) in any string: sorted, names only, never values. 2.0 builds
+    the claude subprocess env from an allowlist, so a 1.x server that expanded
+    ${NAME} from the inherited environment sees nothing unless the agent's
+    `env:` names it. Unreadable or absent file: no names."""
+    try:
+        doc = json.loads((Path(workspace) / ".mcp.json").read_text())
+    except (OSError, ValueError):
+        return []
+    found = set()
+
+    def walk(node):
+        if isinstance(node, str):
+            found.update(_MCP_REF.findall(node))
+        elif isinstance(node, dict):
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+
+    walk(doc)
+    return sorted(n for n in found if n not in _MCP_ENV_SKIP
+                  and not n.startswith(_MCP_ENV_SKIP_PREFIXES))
+
+
+def mcp_env_additions(workspace, agents):
+    """{agent id: [names]} that migration would add to each agent's `env:`:
+    every non-monitor agent in `agents` (id -> entry dict), names not already
+    keys of its env. The monitor holds no tools that need them and keeps the
+    narrower environment."""
+    names = mcp_env_names(workspace)
+    out = {}
+    for aid, entry in agents.items():
+        if entry.get("role") == "monitor":
+            continue
+        have = entry.get("env") or {}
+        add = [n for n in names if n not in have]
+        if add:
+            out[aid] = add
+    return out
+
+
 def legacy_to_registry_dict(old, channels=None):
     """Convert a parsed 1.x agents.json dict (and channels.json dict) into a
     schema-2 mapping. Pure. Raises RegistryError when the input is unusable."""
@@ -552,6 +603,10 @@ def migrate_legacy(workspace):
         except (OSError, ValueError):
             channels = None
     doc = legacy_to_registry_dict(old, channels)
+    for aid, add in mcp_env_additions(workspace, doc["agents"]).items():
+        env = dict(doc["agents"][aid].get("env") or {})
+        env.update({n: "${%s}" % n for n in add})      # a reference, resolved at spawn
+        doc["agents"][aid]["env"] = env
     names, _ = _channel_names(workspace)
     parse_registry(doc, names)                      # refuse before writing anything
     text = ("# Karakos agent registry (schema 2). Migrated from agents.json.\n"

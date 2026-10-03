@@ -363,6 +363,15 @@ async def set_partial(db, id, text) -> None:
 # One Condition per (event loop, shard); the loop in the key keeps tests that
 # run a fresh loop each from sharing a Condition across loops.
 _conds: dict = {}
+# Per-(loop, shard) count of notify() calls, bumped synchronously. A waiter that
+# read the count before it looked at the database passes it as `since`, so a
+# notify that fires between its check and its wait is not lost (a Condition
+# wake-up only reaches tasks already waiting).
+_versions: dict = {}
+
+
+def work_version(shard) -> int:
+    return _versions.get((asyncio.get_running_loop(), shard), 0)
 
 
 def _cond(shard) -> asyncio.Condition:
@@ -385,13 +394,19 @@ def notify(shard) -> None:
         asyncio.get_running_loop()
     except RuntimeError:
         return
+    key = (asyncio.get_running_loop(), shard)
+    _versions[key] = _versions.get(key, 0) + 1
     asyncio.get_running_loop().create_task(_notify(shard))
 
 
-async def wait_for_work(shard, timeout) -> bool:
-    """Block until `shard` is notified (True) or `timeout` seconds pass (False)."""
+async def wait_for_work(shard, timeout, since=None) -> bool:
+    """Block until `shard` is notified (True) or `timeout` seconds pass (False).
+    With `since` (a work_version() read before the caller checked its state),
+    returns True at once if a notify already happened after that read."""
     c = _cond(shard)
     async with c:
+        if since is not None and work_version(shard) != since:
+            return True
         try:
             await asyncio.wait_for(c.wait(), timeout)
         except asyncio.TimeoutError:
