@@ -7,6 +7,7 @@ import json
 import re
 import sqlite3
 import unicodedata
+from urllib.parse import quote
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -50,6 +51,22 @@ class GraphStore:
     def read(self):
         conn = self.connect()
         try:
+            yield conn
+        finally:
+            conn.close()
+
+    @contextmanager
+    def read_ro(self):
+        """Read-only connection (mode=ro, query_only). Never creates the file."""
+        if not self.path.exists():
+            raise GraphNotInitialised(f"graph database not found: {self.path}")
+        conn = sqlite3.connect(f"file:{quote(self.path.as_posix())}?mode=ro", uri=True,
+                               timeout=5.0, isolation_level=None)
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute("PRAGMA query_only=ON")
+            check_schema(conn)
             yield conn
         finally:
             conn.close()
