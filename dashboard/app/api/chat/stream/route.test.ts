@@ -34,7 +34,7 @@ function seed(processed: number, opts: { response?: string; agent?: string } = {
 
 async function events(): Promise<Array<Record<string, unknown>>> {
   const req = new NextRequest("http://localhost/api/chat/stream?message_id=m1", {
-    headers: { cookie: `karakos_session=${apiMod.generateSessionToken("mike")}` },
+    headers: { cookie: `karakos_session=${apiMod.generateSessionToken("alpha")}` },
   });
   const res = await GET(req);
   expect(res.status).toBe(200);
