@@ -386,7 +386,10 @@ def test_backfill_covers_entities(store, tmp_path, monkeypatch):
     assert go(store, tmp_path)["embed"]["embedded"] == 1
 
 
-def test_backfill_skips_quietly_without_a_model(store, tmp_path):
+def test_backfill_skips_quietly_without_a_model(store, tmp_path, monkeypatch):
+    # Force "no model" whatever the host has installed (CI and dev hosts carry one).
+    monkeypatch.setenv("KARAKOS_SEMANTIC_RECALL", "0")
+    embed._reset()
     store.add_observation("no model here", embed=False)
     stats = go(store, tmp_path)
     assert stats["embed"]["embedded"] == 0 and "no embedding model" in stats["embed"]["skipped"]
