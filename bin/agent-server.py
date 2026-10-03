@@ -3463,6 +3463,36 @@ async def handle_hive_call_cancel(request):
     return web.json_response({"status": "cancelled"})
 
 
+async def _graph_browse(request, route, entity_id=None):
+    if not _bearer_ok(request):
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    from lib.graph import browse
+    loop = asyncio.get_running_loop()
+    status, body = await loop.run_in_executor(
+        None, browse.handle, route, dict(request.query), WORKSPACE_ROOT / "data", entity_id)
+    return web.json_response(body, status=status)
+
+
+async def handle_graph_status(request):
+    """GET /graph/status (docs/graph-browse-api.md)."""
+    return await _graph_browse(request, "status")
+
+
+async def handle_graph_observations(request):
+    """GET /graph/observations."""
+    return await _graph_browse(request, "observations")
+
+
+async def handle_graph_entities(request):
+    """GET /graph/entities."""
+    return await _graph_browse(request, "entities")
+
+
+async def handle_graph_entity(request):
+    """GET /graph/entities/{id}."""
+    return await _graph_browse(request, "entity", request.match_info["id"])
+
+
 async def handle_hive_calls(request):
     """GET /hive/calls: the call log (docs/hive-call-log.md)."""
     if not _bearer_ok(request):
@@ -4126,6 +4156,10 @@ def create_app(with_lifecycle: bool = True) -> web.Application:
     app.router.add_get("/hive/call/{call_id}", handle_hive_call_get)
     app.router.add_post("/hive/call/{call_id}/cancel", handle_hive_call_cancel)
     app.router.add_get("/hive/calls", handle_hive_calls)
+    app.router.add_get("/graph/status", handle_graph_status)
+    app.router.add_get("/graph/observations", handle_graph_observations)
+    app.router.add_get("/graph/entities", handle_graph_entities)
+    app.router.add_get("/graph/entities/{id}", handle_graph_entity)
 
     # Register startup/shutdown handlers
     if with_lifecycle:

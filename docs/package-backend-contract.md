@@ -235,6 +235,25 @@ All `POST`, no body, `200`/`404 {"error": "Unknown agent"}`:
 | `/agents/{name}/kill` | stops the subprocess without respawning |
 | `/agents/{name}/flush` | marks queued messages skipped; `{"status": "flushed", "flushed": <count>}` |
 
+### Graph browse (`GET /graph/*`, step 5.5)
+
+Read-only reads of the memory graph for the `/memory` page. Full reference, with every parameter and error code: the package's `docs/graph-browse-api.md`. Keyword search only (FTS5); the endpoints open the graph read-only and never touch `last_seen_at`. Not part of the `release/2.0` stability contract. The dashboard reaches them through `/api/memory/*` (`lib/memoryBackend.ts`), package profile only, 403 for an agent-restricted account.
+
+| Endpoint | Returns |
+|---|---|
+| `GET /graph/status` | counts, `embed_model`, `last_consolidation` |
+| `GET /graph/observations?q=&kind=&entity=&domain=&agent=&state=&limit=&cursor=` | `{observations: [...], next}` |
+| `GET /graph/entities?q=&kind=&state=&limit=&cursor=` | `{entities: [...], next}` |
+| `GET /graph/entities/{id}` | `{entity, neighbors, counts}`; 404 `unknown_entity` |
+
+```json
+{"observations": [{"id": 1, "kind": "fact", "content": "alpha prefers green tea",
+  "entity": {"id": 1, "name": "Alpha", "kind": "thing"}, "mentions": [], "importance": 5.0,
+  "archived_at": null, "superseded_by": null}], "next": "b:1"}
+```
+
+A missing or too-new graph is `503 {"error": "graph_not_initialised", ...}`; the dashboard passes 400, 404 and 503 through and turns anything else into `502`.
+
 ## Gaps (the dashboard needs it, the server does not have it)
 
 | # | Need | Today | Owner |
@@ -244,7 +263,7 @@ All `POST`, no body, `200`/`404 {"error": "Unknown agent"}`:
 | G3 | Per-agent last message, `messages_processed`, session age and compaction count for the roster | Not in `/agents` or `/health`; the roster shows blanks/zeros under this profile | Unowned; propose adding to `/agents` alongside 2.1 |
 | G4 | A cost endpoint the dashboard can use instead of opening the sqlite file | `GET /cost` exists, but `app/api/cost` (and `finance/usage-timeseries`, `conversations/metrics`, `chat/history|result|stream`, `history/*`) read `agent-server.db` directly via `AGENT_SERVER_DB_PATH`, which needs the file mounted into the dashboard container and the sqlite drivers | 5.3 (image build) decides: mount the DB, or 5.1 re-points these routes at HTTP. Time series and chat history have no HTTP endpoint at all |
 | G5 | Server-side session/transcript replay for `chat/stream` | Read from the sqlite file only | Same decision as G4 |
-| G6 | Memory browser data | No endpoint | 5.5 |
+| G6 | Memory browser data | **Closed by 5.5**: `GET /graph/*` (package 5.5a) consumed by `/memory` and `/api/memory/*` | - |
 
 ## Existing dashboard calls that do not match this server
 
