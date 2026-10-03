@@ -20,6 +20,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import hive
 import msgqueue
+import stealing
 
 HOOK_NAMES = ("before_claim", "on_turn_start", "on_event", "on_turn_end")
 
@@ -93,6 +94,7 @@ class TurnBatch:
     message_ids: List[str]
     channel_id: str
     content: str
+    origin: str = "queue"   # "stolen" for a batch taken from a sibling (step 2.4)
 
 
 @dataclass
@@ -116,6 +118,8 @@ class ServerState:
         self.hooks = TurnHooks(lambda: self._server.log)
         self.active_turns: Dict[str, TurnBatch] = {}
         self.hive = hive.HiveState()  # open hive calls (in memory only, step 2.3)
+        self.stolen_total: Dict[str, int] = {}     # thief shard -> rows stolen (2.4)
+        self.steal_timers: Dict[Tuple[str, str], Any] = {}  # (thief, victim) -> TimerHandle
 
     def __getattr__(self, name):
         if name in _SERVER_NAMES:
@@ -175,18 +179,124 @@ def format_batch(rows, format_attachments, sentinel: str = AUTOMATED_SENTINEL) -
     return content
 
 
+def batch_from_rows(state: ServerState, shard: str, rows: list,
+                    origin: str = "queue") -> TurnBatch:
+    """Format claimed rows into a TurnBatch for `shard`."""
+    content = format_batch(rows, state.format_attachments,
+                           state.AUTOMATED_TRAFFIC_SENTINEL)
+    return TurnBatch(
+        shard=shard, rows=rows,
+        message_ids=[m["message_id"] for m in rows],
+        channel_id=rows[0]["channel_id"], content=content, origin=origin)
+
+
 async def claim_next(state: ServerState, shard: str) -> Optional[TurnBatch]:
     """Claim the next batch (priority DESC, created_at, id; expired rows are
     skipped inside claim_batch) and format it. None for an empty queue."""
     rows = await msgqueue.claim_batch(state.db, shard, 20)
     if not rows:
         return None
-    content = format_batch(rows, state.format_attachments,
-                           state.AUTOMATED_TRAFFIC_SENTINEL)
-    return TurnBatch(
-        shard=shard, rows=rows,
-        message_ids=[m["message_id"] for m in rows],
-        channel_id=rows[0]["channel_id"], content=content)
+    return batch_from_rows(state, shard, rows)
+
+
+# =============================================================================
+# Work stealing (step 2.4)
+# =============================================================================
+
+def _specs_of(state: ServerState):
+    """ShardSpec-like objects for every shard (default shards when none loaded)."""
+    specs = state._specs()
+    if specs:
+        return specs
+    return [type("S", (), {"id": s, "agent": s})() for s in state.agent_config]
+
+
+def _gate_paused(state: ServerState, shard: str) -> bool:
+    gate = getattr(state, "usage_gate", None)
+    return bool(gate and shard in gate.paused)
+
+
+def _arm_steal_timer(state: ServerState, thief: str, victim: str, delay: float) -> None:
+    """One timer per (thief, victim); it starts a drain on the thief when it fires."""
+    key = (thief, victim)
+    if key in state.steal_timers:
+        return
+    loop = asyncio.get_running_loop()
+
+    def fire():
+        state.steal_timers.pop(key, None)
+        loop.create_task(drain_shard(state, thief))
+
+    state.steal_timers[key] = loop.call_later(max(delay, 0.0) + 0.05, fire)
+
+
+async def steal_next(state: ServerState, thief: str) -> Optional[TurnBatch]:
+    """Take waiting rows from a busy sibling shard of the same agent, or None.
+    Off unless the agent's `work_stealing.enabled`. The rows keep agent =
+    victim; the turn (session, cost, post) is the thief's."""
+    cfg = state.cfg(thief)
+    sc = stealing.steal_config(cfg)
+    if not sc.enabled or _gate_paused(state, thief):
+        return None
+    specs = _specs_of(state)
+    agent = state.agent_of(thief)
+    mine = [s.id for s in specs if s.agent == agent]
+    if len(mine) < 2:
+        return None
+    depths = await msgqueue.queued_depths(state.db, mine)
+    held = await state.agent_hold_until(thief)
+    if not stealing.thief_ready(state.agent_states.get(thief), held,
+                                depths.get(thief, 0)):
+        return None
+    age = stealing.min_age_s(sc, cfg)
+    victims = stealing.candidate_victims(specs, thief, state.agent_states, depths)
+    for victim in victims:
+        rows = await msgqueue.claim_stolen(state.db, thief, victim, sc.max_rows, age)
+        if rows:
+            state.stolen_total[thief] = state.stolen_total.get(thief, 0) + len(rows)
+            state.log.info(f"steal thief={thief} victim={victim} rows={len(rows)}")
+            return batch_from_rows(state, thief, rows, origin="stolen")
+    # Nothing takeable yet: a row of a stealable kind may just be too young.
+    for victim in victims:
+        wait = await msgqueue.steal_wait_s(state.db, victim, age)
+        if wait is not None:
+            _arm_steal_timer(state, thief, victim, wait)
+    return None
+
+
+def _stealing_on(state: ServerState, shard: str) -> bool:
+    return stealing.steal_config(state.cfg(shard)).enabled
+
+
+async def maybe_steal_wake(state: ServerState, shard: str,
+                           busy: Optional[str] = None) -> None:
+    """Arm one timer per (idle ready sibling, busy victim) so a row waiting
+    behind a busy shard is picked up after min_age. No polling: nothing is
+    scheduled while no victim has waiting rows. `busy` names a shard that has
+    just claimed a batch and is about to be PROCESSING (its state flips a
+    moment later)."""
+    agent = state.agent_of(shard)
+    specs = _specs_of(state)
+    mine = [s.id for s in specs if s.agent == agent]
+    if len(mine) < 2:
+        return
+    cfg = state.cfg(shard)
+    sc = stealing.steal_config(cfg)
+    if not sc.enabled:
+        return
+    depths = await msgqueue.queued_depths(state.db, mine)
+    age = stealing.min_age_s(sc, cfg)
+    states = dict(state.agent_states)
+    if busy:
+        states[busy] = "PROCESSING"
+    for thief in mine:
+        if _gate_paused(state, thief):
+            continue
+        held = await state.agent_hold_until(thief)
+        if not stealing.thief_ready(states.get(thief), held, depths.get(thief, 0)):
+            continue
+        for victim in stealing.candidate_victims(specs, thief, states, depths):
+            _arm_steal_timer(state, thief, victim, age)
 
 
 # =============================================================================
@@ -616,6 +726,21 @@ async def finish_turn(state: ServerState, shard: str, result: TurnResult):
     if row and row["count"]:
         state.log.info(f"{agent} has {row['count']} messages still queued — draining again")
         asyncio.create_task(drain_shard(state, shard))
+    elif _stealing_on(state, shard):
+        # This shard is about to be free with nothing of its own: a busy
+        # sibling's waiting rows may be stolen (drain_shard decides).
+        await maybe_steal_idle(state, shard)
+
+
+async def maybe_steal_idle(state: ServerState, shard: str) -> None:
+    """If a sibling has waiting rows, start a drain on `shard` (it queues on
+    the lock held by the caller, then claims or steals)."""
+    mine = [s.id for s in _specs_of(state) if s.agent == state.agent_of(shard)]
+    if len(mine) < 2:
+        return
+    depths = await msgqueue.queued_depths(state.db, mine)
+    if any(depths[sid] for sid in mine if sid != shard):
+        asyncio.create_task(drain_shard(state, shard))
 
 
 async def drain_shard(state: ServerState, shard: str):
@@ -644,7 +769,12 @@ async def drain_shard(state: ServerState, shard: str):
 
         batch = await claim_next(state, shard)
         if batch is None:
+            batch = await steal_next(state, shard)
+        if batch is None:
             return
+        if batch.origin == "queue" and _stealing_on(state, shard):
+            # Backlog behind this (possibly long) turn: an idle sibling may take it.
+            asyncio.create_task(maybe_steal_wake(state, shard, busy=shard))
 
         await state.hooks.fire("on_turn_start", shard, batch)
         result = await run_turn(state, shard, batch)
@@ -666,7 +796,9 @@ def notify_enqueued(state: ServerState, shard: str, channel_id: str) -> None:
     st = state.agent_states.get(shard)
     if st == "IDLE":
         asyncio.create_task(drain_shard(state, shard))
-    elif st == "PROCESSING":
+    elif st in ("PROCESSING", "ERROR_RECOVERY") and _stealing_on(state, shard):
+        asyncio.create_task(maybe_steal_wake(state, shard))
+    if st == "PROCESSING":
         # Agent is mid-turn in another channel. Without this, a message
         # landing behind a busy turn shows no typing indicator and no ack
         # until the drain happens to reach it — indistinguishable from being

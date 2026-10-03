@@ -56,6 +56,7 @@ _DEFAULTS = {
     "disallowed_tools": [],
     "env": {},
     "label": None,
+    "work_stealing": {"enabled": False, "after_s": 5, "max_rows": 5},
 }
 _KNOWN_KEYS = {"name", "role", "shards", "discord"} | set(_DEFAULTS)
 
@@ -63,7 +64,7 @@ _KNOWN_KEYS = {"name", "role", "shards", "discord"} | set(_DEFAULTS)
 _LEGACY_PASSTHROUGH = (
     "system_prompt", "prompt", "model", "max_turns", "timeout", "tool_streaming",
     "stream_to_channel", "dashboard_chat", "allowed_tools", "disallowed_tools", "env",
-    "label", "token_budget_4h", "token_budget_min_pause_s",
+    "label", "token_budget_4h", "token_budget_min_pause_s", "work_stealing",
     "context_budget_tokens", "reset_mode",
 )
 
@@ -116,7 +117,7 @@ def _is_str_list(v):
     return isinstance(v, list) and all(isinstance(x, str) for x in v)
 
 
-def _check_type(aid, key, val, errors):
+def _check_type(aid, key, val, errors, warnings=None):
     p = f"agent '{aid}': '{key}'"
     if key == "model" and not (isinstance(val, str) and val):
         errors.append(f"{p} must be a non-empty string")
@@ -151,6 +152,22 @@ def _check_type(aid, key, val, errors):
                     errors.append(f"{p}.{k} must be true or false")
                 elif k not in ("section", "core", "house_style"):
                     errors.append(f"{p}: unknown key '{k}'")
+    elif key == "work_stealing":
+        if not isinstance(val, dict):
+            errors.append(f"{p} must be a mapping (enabled, after_s, max_rows)")
+        else:
+            for k, v in val.items():
+                if k == "enabled" and not isinstance(v, bool):
+                    errors.append(f"{p}.enabled must be true or false")
+                elif k == "after_s" and not (isinstance(v, (int, float))
+                                             and not isinstance(v, bool)
+                                             and 0 <= v <= 300):
+                    errors.append(f"{p}.after_s must be a number from 0 to 300")
+                elif k == "max_rows" and not (_is_int(v) and 1 <= v <= 20):
+                    errors.append(f"{p}.max_rows must be an integer from 1 to 20")
+                elif k not in ("enabled", "after_s", "max_rows"):
+                    if warnings is not None:
+                        warnings.append(f"agent '{aid}': unknown key 'work_stealing.{k}'")
     elif key in ("allowed_tools", "disallowed_tools") and not _is_str_list(val):
         errors.append(f"{p} must be a list of strings")
     elif key == "env" and not (isinstance(val, dict)
@@ -272,7 +289,7 @@ def parse_registry(data, channel_names=None):
         settings, explicit = {}, {}
         for key, default in _DEFAULTS.items():
             if key in body:
-                _check_type(aid, key, body[key], errors)
+                _check_type(aid, key, body[key], errors, warnings)
                 explicit[key] = body[key]
                 settings[key] = body[key]
             else:
