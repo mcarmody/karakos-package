@@ -25,7 +25,7 @@ NC='\033[0m' # No Color
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STATE_FILE="${SCRIPT_DIR}/.setup-state.json"
 ENV_FILE="${SCRIPT_DIR}/config/.env"
-AGENTS_CONFIG="${SCRIPT_DIR}/config/agents.json"
+AGENTS_CONFIG="${SCRIPT_DIR}/config/agents.yaml"
 CHANNELS_CONFIG="${SCRIPT_DIR}/config/channels.json"
 DOCKER_COMPOSE="${SCRIPT_DIR}/config/docker-compose.yml"
 KARAKOS_CONFIG="${SCRIPT_DIR}/.karakos/config.json"
@@ -262,6 +262,9 @@ main() {
         PRIMARY_AGENT_NAME=$(get_state primary_agent_name)
         log "Primary agent: $PRIMARY_AGENT_NAME"
     fi
+    # The registry keys everything by id: lowercase letters, digits, hyphens.
+    PRIMARY_AGENT_NAME=$(printf '%s' "$PRIMARY_AGENT_NAME" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9\n-' '-' | sed 's/^[^a-z]*//' | cut -c1-32)
+    PRIMARY_AGENT_NAME="${PRIMARY_AGENT_NAME:-karakos}"
 
     # Step 4: Anthropic authentication
     echo
@@ -406,38 +409,42 @@ EOF
 
     chmod 600 "$ENV_FILE"
 
-    # Create agents.json
+    # Create agents.yaml (schema 2; see lib/registry.py)
     cat > "$AGENTS_CONFIG" <<EOF
-{
-  "agents": {
-    "${PRIMARY_AGENT_NAME}": {
-      "model": "sonnet",
-      "max_turns": 200,
-      "timeout": 10800,
-      "system_prompt": "agents/${PRIMARY_AGENT_NAME}/SYSTEM_PROMPT.md",
-      "tool_streaming": true,
-      "stream_to_channel": true,
-      "discord_bot_token_env": "DISCORD_BOT_TOKEN_PRIMARY",
-      "discord_bot_id_env": "DISCORD_BOT_ID_PRIMARY"
-    },
-    "relay": {
-      "model": "haiku",
-      "max_turns": 10,
-      "timeout": 300,
-      "system_prompt": "agents/relay/SYSTEM_PROMPT.md",
-      "tool_streaming": false,
-      "stream_to_channel": false,
-      "dashboard_chat": false
-    }
-  }
-}
+version: 2
+agents:
+  ${PRIMARY_AGENT_NAME}:
+    name: ${PRIMARY_AGENT_NAME}
+    role: primary
+    model: sonnet
+    max_turns: 200
+    timeout: 10800
+    system_prompt: agents/${PRIMARY_AGENT_NAME}/SYSTEM_PROMPT.md
+    tool_streaming: true
+    stream_to_channel: true
+    discord:
+      token_env: DISCORD_BOT_TOKEN_PRIMARY
+      bot_id_env: DISCORD_BOT_ID_PRIMARY
+    shards:
+      - id: ${PRIMARY_AGENT_NAME}
+        channels: [general]
+  relay:
+    name: relay
+    role: monitor
+    model: haiku
+    max_turns: 10
+    timeout: 300
+    system_prompt: agents/relay/SYSTEM_PROMPT.md
+    tool_streaming: false
+    stream_to_channel: false
+    dashboard_chat: false
 EOF
 
     # Create channels.json
-    CHANNELS_JSON="{\"server_id\": \"$DISCORD_SERVER_ID\", \"channels\": {\"general\": {\"id\": \"$CHANNEL_GENERAL\", \"default_agent\": \"${PRIMARY_AGENT_NAME}\"}, \"signals\": {\"id\": \"$CHANNEL_SIGNALS\", \"default_agent\": null}"
+    CHANNELS_JSON="{\"server_id\": \"$DISCORD_SERVER_ID\", \"channels\": {\"general\": {\"id\": \"$CHANNEL_GENERAL\"}, \"signals\": {\"id\": \"$CHANNEL_SIGNALS\"}"
 
     if [ -n "$CHANNEL_STAFF" ]; then
-        CHANNELS_JSON="${CHANNELS_JSON}, \"staff-comms\": {\"id\": \"$CHANNEL_STAFF\", \"default_agent\": null}"
+        CHANNELS_JSON="${CHANNELS_JSON}, \"staff-comms\": {\"id\": \"$CHANNEL_STAFF\"}"
     fi
 
     CHANNELS_JSON="${CHANNELS_JSON}}}"

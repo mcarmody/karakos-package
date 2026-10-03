@@ -32,10 +32,22 @@ def workspace(tmp_path):
         "Channels:\n{{CHANNELS}}\n\nOther agents:\n{{OTHER_AGENTS}}\n"
     )
 
-    agents_json = tmp_path / "config" / "agents.json"
-    agents_json.write_text(json.dumps({"agents": {}}, indent=2) + "\n")
+    (tmp_path / "config" / "agents.yaml").write_text(
+        "# my registry\n"
+        "version: 2\n"
+        "agents:\n"
+        "  boss:\n    name: boss\n    role: primary\n"
+        "  relay:\n    name: relay\n    role: monitor\n"
+    )
 
     return tmp_path
+
+
+def _legacy(workspace):
+    import sys
+    sys.path.insert(0, str(PACKAGE_ROOT / "lib"))
+    import registry
+    return registry.load_registry(workspace).legacy_view()
 
 
 def _run(workspace, *args, env_extra=None):
@@ -65,7 +77,7 @@ def test_creates_agent_with_simple_name(workspace):
     assert agent_dir.is_dir()
     assert (agent_dir / "SYSTEM_PROMPT.md").is_file()
 
-    agents = json.loads((workspace / "config" / "agents.json").read_text())
+    agents = _legacy(workspace)
     assert "alpha" in agents["agents"]
     assert agents["agents"]["alpha"]["model"] == "sonnet"
 
@@ -93,7 +105,7 @@ def test_discord_token_with_quotes_does_not_inject(workspace):
     assert result.returncode == 0, f"stderr: {result.stderr}\nstdout: {result.stdout}"
     assert not sentinel.exists(), "injection landed — heredoc terminator failed"
 
-    agents = json.loads((workspace / "config" / "agents.json").read_text())
+    agents = _legacy(workspace)
     assert agents["agents"]["beta"].get("discord_bot_token_env") == "DISCORD_BOT_TOKEN_BETA"
 
 
@@ -102,7 +114,7 @@ def test_register_writes_correct_env_var_name(workspace):
     result = _run(workspace, "ops-relay", "--discord-token", "anything")
     assert result.returncode == 0, f"stderr: {result.stderr}"
 
-    agents = json.loads((workspace / "config" / "agents.json").read_text())
+    agents = _legacy(workspace)
     assert agents["agents"]["ops-relay"]["discord_bot_token_env"] == "DISCORD_BOT_TOKEN_OPS_RELAY"
 
 

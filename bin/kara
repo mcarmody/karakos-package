@@ -13,7 +13,7 @@ message and a dashboard message are indistinguishable to the agent.
 Env vars:
   AGENT_SERVER_URL    http://127.0.0.1:18791  (where to POST)
   AGENT_SERVER_TOKEN  required (Bearer token)
-  KARA_AGENT          first agent in agents.json by default
+  KARA_AGENT          primary agent in agents.yaml by default
   KARA_CHANNEL        cli (override to mirror into another surface)
   KARA_TIMEOUT        300  (seconds for one-shot)
   KARA_HISTORY        ~/.karakos/kara_history (REPL history file)
@@ -99,15 +99,12 @@ def _default_agent() -> str:
     explicit = os.environ.get("KARA_AGENT")
     if explicit:
         return explicit
-    cfg = _REPO_ROOT / "config" / "agents.json"
-    if cfg.exists():
-        try:
-            data = json.loads(cfg.read_text())
-            agents = data.get("agents") or {}
-            if agents:
-                return next(iter(agents.keys()))
-        except Exception:
-            pass
+    try:
+        sys.path.insert(0, str(_REPO_ROOT / "lib"))
+        import registry
+        return registry.load_registry(_REPO_ROOT).primary().id
+    except Exception:
+        pass
     try:
         agents = _list_agents()
         if agents:

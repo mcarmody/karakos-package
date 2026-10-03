@@ -289,8 +289,8 @@ its own persona and journal without being handed its own process lifecycle.
 |-------------|---------------|-----|
 | `persona/voice.md` | None | Loaded fresh each session |
 | `skills/*/` | Agent session reset | Dashboard → Reset |
-| `config/agents.json`, adding an agent | None | `bin/create-agent.sh` hot-registers via POST `/agents/{name}/register` |
-| `config/agents.json`, changing an existing agent | Agent respawn | POST `/agents/{name}/reload` (keeps context) or `/reset` (drops it) |
+| `config/agents.yaml`, adding an agent | None | `bin/create-agent.sh` hot-registers via POST `/agents/{name}/register` |
+| `config/agents.yaml`, changing an existing agent | Agent respawn | POST `/agents/{name}/reload` (keeps context) or `/reset` (drops it) |
 | `bin/agent-server.py` | Container restart | `make down && make up` |
 | `Dockerfile` | Container rebuild | see [Local development build](#local-development-build) |
 
@@ -329,7 +329,7 @@ want to edit:
 | File | Holds |
 |---|---|
 | `.env` | Secrets, ports, limits — everything below |
-| `agents.json` | The agent registry: model, `max_turns`, timeout, streaming flags |
+| `agents.yaml` | The agent registry: model, `max_turns`, timeout, streaming flags |
 | `channels.json` | Which Discord servers and channels are watched, and each channel's `default_agent`, `reply_gate` and `guest_agents` |
 | `claude-settings.json` | Hook wiring and the tool permission policy |
 | `protected-paths.json` | What a builder agent may and may not commit |
@@ -479,17 +479,16 @@ all agents — there is no per-agent settings file.
 `config/claude-settings.json`'s own `env` key is applied by the CLI to its
 own process environment, but since that file is shared, it's install-wide,
 not per-agent. For environment scoped to a single agent, add an `env`
-object to that agent's entry in `config/agents.json`:
+object to that agent's entry in `config/agents.yaml`:
 
-```json
-{
-  "agents": {
-    "researcher": {
-      "system_prompt": "agents/researcher/SYSTEM_PROMPT.md",
-      "env": { "ANTHROPIC_SMALL_FAST_MODEL": "claude-haiku-4-5" }
-    }
-  }
-}
+```yaml
+agents:
+  researcher:
+    name: researcher
+    role: custom
+    system_prompt: agents/researcher/SYSTEM_PROMPT.md
+    env:
+      ANTHROPIC_SMALL_FAST_MODEL: claude-haiku-4-5
 ```
 
 `bin/agent-server.py` layers this onto its own environment (not a
@@ -510,17 +509,15 @@ call and what it is working on:
 This exists so a four-minute turn is distinguishable from a hung one — the
 typing indicator alone cannot tell you the difference. **It is on by
 default.** To silence it for an agent, set `tool_streaming` in that agent's
-`config/agents.json` entry:
+`config/agents.yaml` entry:
 
-```json
-{
-  "agents": {
-    "researcher": {
-      "system_prompt": "agents/researcher/SYSTEM_PROMPT.md",
-      "tool_streaming": false
-    }
-  }
-}
+```yaml
+agents:
+  researcher:
+    name: researcher
+    role: custom
+    system_prompt: agents/researcher/SYSTEM_PROMPT.md
+    tool_streaming: false
 ```
 
 The lines are throttled, and the throttle is what makes on-by-default safe:

@@ -58,16 +58,21 @@ def tmp_workspace(tmp_path):
     for d in dirs:
         (tmp_path / d).mkdir(parents=True, exist_ok=True)
 
-    # Create minimal agents config
-    agents_config = {
-        "agents": {
-            "test-agent": {
-                "system_prompt": "agents/test-agent/SYSTEM_PROMPT.md",
-                "discord_bot_token_env": "DISCORD_BOT_TOKEN_TEST",
-            }
-        }
-    }
-    (tmp_path / "config" / "agents.json").write_text(json.dumps(agents_config))
+    # Minimal agents registry (schema 2): a primary plus the required monitor.
+    (tmp_path / "config" / "agents.yaml").write_text(
+        "version: 2\n"
+        "agents:\n"
+        "  test-agent:\n"
+        "    name: test-agent\n"
+        "    role: primary\n"
+        "    system_prompt: agents/test-agent/SYSTEM_PROMPT.md\n"
+        "    discord:\n"
+        "      token_env: DISCORD_BOT_TOKEN_TEST\n"
+        "  relay:\n"
+        "    name: relay\n"
+        "    role: monitor\n"
+        "    model: haiku\n"
+    )
 
     # Create minimal channels config
     channels_config = {
@@ -79,6 +84,24 @@ def tmp_workspace(tmp_path):
     (tmp_path / "config" / "channels.json").write_text(json.dumps(channels_config))
 
     return tmp_path
+
+
+LEGACY_AGENTS = {
+    "agents": {
+        "test-agent": {
+            "system_prompt": "agents/test-agent/SYSTEM_PROMPT.md",
+            "discord_bot_token_env": "DISCORD_BOT_TOKEN_TEST",
+        }
+    }
+}
+
+
+@pytest.fixture
+def legacy_workspace(tmp_workspace):
+    """A 1.x-shaped workspace: config/agents.json, no agents.yaml, unstamped."""
+    (tmp_workspace / "config" / "agents.yaml").unlink()
+    (tmp_workspace / "config" / "agents.json").write_text(json.dumps(LEGACY_AGENTS))
+    return tmp_workspace
 
 
 @pytest.fixture

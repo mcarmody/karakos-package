@@ -130,7 +130,8 @@ def test_unknown_keys_warn_not_error():
     assert any("wat" in w for w in reg.warnings)
 
 
-def test_legacy_view_equals_conftest_dict(tmp_workspace):
+def test_legacy_view_equals_conftest_dict(legacy_workspace):
+    tmp_workspace = legacy_workspace
     old = json.loads((tmp_workspace / "config" / "agents.json").read_text())
     data = {"version": 2, "agents": {
         "test-agent": {"name": "Test", "role": "primary",

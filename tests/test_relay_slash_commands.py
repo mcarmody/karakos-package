@@ -319,7 +319,13 @@ def test_channel_default_agent_is_used_when_no_option_given(relay, monkeypatch):
     monkeypatch.setattr(relay, "OWNER_DISCORD_ID", OWNER)
     monkeypatch.setattr(relay, "agent_config", {"amos": {}, "kothar": {}})
     monkeypatch.setattr(relay, "channels_config", {
-        "channels": {"general": {"id": "555", "default_agent": "kothar"}}})
+        "channels": {"general": {"id": "555"}}})
+    import registry
+    monkeypatch.setattr(relay, "registry_obj", registry.parse_registry({
+        "version": 2, "agents": {
+            "amos": {"name": "amos", "role": "primary"},
+            "kothar": {"name": "kothar", "role": "monitor", "shards": [
+                {"id": "kothar", "channels": ["general"]}]}}}))
     http = FakeHttpSession()
     adapter = make_adapter(relay, http)
 

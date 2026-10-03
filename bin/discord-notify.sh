@@ -31,10 +31,10 @@ fi
 
 # Get first available bot token
 BOT_TOKEN=""
-if [[ -f "$WORKSPACE_ROOT/config/agents.json" ]]; then
-    BOT_TOKEN=$(python3 -c "
-import json, os
-cfg = json.load(open('$WORKSPACE_ROOT/config/agents.json'))
+REGISTRY_PY="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib" && pwd)/registry.py"
+BOT_TOKEN=$(python3 "$REGISTRY_PY" --workspace "$WORKSPACE_ROOT" legacy 2>/dev/null | python3 -c "
+import json, os, sys
+cfg = json.load(sys.stdin)
 for name, info in cfg.get('agents', {}).items():
     env_var = info.get('discord_bot_token_env', '')
     if env_var:
@@ -43,7 +43,6 @@ for name, info in cfg.get('agents', {}).items():
             print(token)
             break
 " 2>/dev/null || echo "")
-fi
 
 if [[ -z "$BOT_TOKEN" ]]; then
     echo "Error: no Discord bot token available" >&2

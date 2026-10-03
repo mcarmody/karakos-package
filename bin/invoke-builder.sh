@@ -12,22 +12,12 @@ WORKSPACE_ROOT="${WORKSPACE_ROOT:-/workspace}"
 AGENT_SERVER="http://127.0.0.1:${AGENT_SERVER_PORT:-18791}"
 AGENT_SERVER_TOKEN="${AGENT_SERVER_TOKEN:-}"
 
-# Determine builder agent name from config
-BUILDER_AGENT=""
-if [ -f "$WORKSPACE_ROOT/config/agents.json" ]; then
-    BUILDER_AGENT=$(python3 -c "
-import json
-cfg = json.load(open('$WORKSPACE_ROOT/config/agents.json'))
-for name, info in cfg.get('agents', {}).items():
-    prompt_path = info.get('system_prompt', '')
-    if 'builder' in prompt_path or 'builder' in name:
-        print(name)
-        break
-" 2>/dev/null || echo "")
-fi
+# Determine builder agent name from config/agents.yaml (role: builder)
+REGISTRY_PY="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib" && pwd)/registry.py"
+BUILDER_AGENT=$(python3 "$REGISTRY_PY" --workspace "$WORKSPACE_ROOT" role builder 2>/dev/null | head -1 || echo "")
 
 if [[ -z "$BUILDER_AGENT" ]]; then
-    echo "Error: no builder agent found in agents.json" >&2
+    echo "Error: no builder agent found in agents.yaml" >&2
     exit 1
 fi
 

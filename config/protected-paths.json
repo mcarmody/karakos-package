@@ -10,6 +10,7 @@
     "Dockerfile",
     "config/protected-paths.json",
     "config/hooks.json",
+    "config/agents.yaml",
     "config/secrets-allow.txt",
     "bin/hooks-sync.py",
     "system/check-secrets.py",

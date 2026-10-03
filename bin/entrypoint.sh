@@ -56,9 +56,11 @@ fi
 # message. A genuinely empty data dir is a fresh install and is stamped here
 # (the migrator is the only writer of 1.x data; an empty dir holds none).
 PKG_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+STAMP_VERIFIED=0
 if [ "${KARAKOS_SKIP_STAMP_CHECK:-}" != "1" ] || [ "${KARAKOS_ENV:-}" = "production" ]; then
     python3 "$PKG_ROOT/lib/migrate/guard.py" check "$WORKSPACE_ROOT/data" || exit $?
     python3 "$PKG_ROOT/lib/migrate/guard.py" stamp --fresh "$WORKSPACE_ROOT/data" || exit $?
+    STAMP_VERIFIED=1
 fi
 
 # Ensure data directories exist
@@ -70,14 +72,19 @@ mkdir -p \
     "$WORKSPACE_ROOT/logs/session-summaries" \
     "$WORKSPACE_ROOT/inbox"
 
-# Create inbox dirs for each configured agent
-if [ -f "$WORKSPACE_ROOT/config/agents.json" ]; then
-    for agent in $(python3 -c "import json; print(' '.join(json.load(open('$WORKSPACE_ROOT/config/agents.json'))['agents'].keys()))"); do
-        mkdir -p "$WORKSPACE_ROOT/inbox/$agent"
-        mkdir -p "$WORKSPACE_ROOT/agents/$agent/inbox"
-        mkdir -p "$WORKSPACE_ROOT/agents/$agent/journal"
-    done
+# Create inbox dirs for each configured agent (config/agents.yaml via the
+# registry). Boot never converts 1.x config: `karakos migrate` does, and the
+# stamp check above refuses an unmigrated directory. A missing or invalid
+# registry after the stamp is an error.
+if ! AGENT_IDS=$(python3 "$PKG_ROOT/lib/registry.py" --workspace "$WORKSPACE_ROOT" ids); then
+    echo "ERROR: config/agents.yaml is missing or invalid (see above)." >&2
+    exit 1
 fi
+for agent in $AGENT_IDS; do
+    mkdir -p "$WORKSPACE_ROOT/inbox/$agent"
+    mkdir -p "$WORKSPACE_ROOT/agents/$agent/inbox"
+    mkdir -p "$WORKSPACE_ROOT/agents/$agent/journal"
+done
 
 # Initialize git if not already (used by the protected-paths pre-commit hook
 # which logs/blocks edits to system files made by builder/reviewer agents).
@@ -92,7 +99,11 @@ fi
 
 # Regenerate the hooks section of config/claude-settings.json from config/hooks.json
 # (safety rails, opt-in heavy-build block). Idempotent; never blocks startup.
-python3 "$WORKSPACE_ROOT/bin/hooks-sync.py" "$WORKSPACE_ROOT" || true
+# Runs only after the schema-stamp check passed: it writes config files, and boot
+# must never mutate 1.x data (the migrator runs hooks-sync for a 1.x install).
+if [ "$STAMP_VERIFIED" = "1" ]; then
+    python3 "$WORKSPACE_ROOT/bin/hooks-sync.py" "$WORKSPACE_ROOT" || true
+fi
 
 # Install protected paths git hook
 if [ -f "$WORKSPACE_ROOT/system/check-protected-paths.py" ]; then

@@ -31,7 +31,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --template NAME        Base template: primary, relay, builder, reviewer (default: primary)"
             echo "  --model MODEL          Claude model: opus, sonnet, haiku (default: sonnet)"
             echo "  --discord-token TOKEN  Discord bot token (optional)"
-            echo "  --ephemeral            Don't persist to agents.json"
+            echo "  --ephemeral            Don't persist to agents.yaml"
             echo "  --max-turns N          Max agentic turns (default: 200)"
             exit 0
             ;;
@@ -67,16 +67,17 @@ if [[ ! -f "$TEMPLATE_PATH" ]]; then
     exit 1
 fi
 
-# Check for name conflict
-AGENTS_JSON="$WORKSPACE_ROOT/config/agents.json"
-if [[ -f "$AGENTS_JSON" ]]; then
-    EXISTING=$(AGENTS_JSON="$AGENTS_JSON" python3 - <<'PY' 2>/dev/null || echo ""
-import json, os
-cfg = json.load(open(os.environ['AGENTS_JSON']))
-print(' '.join(cfg.get('agents', {}).keys()))
-PY
-)
-    if echo "$EXISTING" | grep -qw "$AGENT_NAME"; then
+# Check for name conflict (config/agents.yaml via lib/registry.py)
+SCRIPT_REAL="$(readlink -f "${BASH_SOURCE[0]}")"
+REGISTRY_LIB="$(cd "$(dirname "$SCRIPT_REAL")/../lib" && pwd)"
+AGENTS_YAML="$WORKSPACE_ROOT/config/agents.yaml"
+if [[ "$EPHEMERAL" == "false" ]]; then
+    if [[ ! -f "$AGENTS_YAML" ]]; then
+        echo "Error: $AGENTS_YAML not found; if this install predates 2.0 run: karakos migrate" >&2
+        exit 1
+    fi
+    EXISTING=$(python3 "$REGISTRY_LIB/registry.py" --workspace "$WORKSPACE_ROOT" ids 2>/dev/null || echo "")
+    if echo "$EXISTING" | grep -qxF "$AGENT_NAME"; then
         echo "Error: agent '$AGENT_NAME' already exists" >&2
         exit 1
     fi
@@ -96,11 +97,19 @@ OWNER_NAME="${OWNER_NAME:-User}"
 CHANNELS=""
 CHANNELS_JSON="$WORKSPACE_ROOT/config/channels.json"
 if [[ -f "$CHANNELS_JSON" ]]; then
-    CHANNELS=$(CHANNELS_JSON="$CHANNELS_JSON" python3 - <<'PY' 2>/dev/null || echo "- #general"
-import json, os
+    CHANNELS=$(CHANNELS_JSON="$CHANNELS_JSON" REGISTRY_LIB="$REGISTRY_LIB" WORKSPACE_ROOT="$WORKSPACE_ROOT" python3 - <<'PY' 2>/dev/null || echo "- #general"
+import json, os, sys
 cfg = json.load(open(os.environ['CHANNELS_JSON']))
-for name, info in cfg.get('channels', {}).items():
-    default = info.get('default_agent', '')
+reg = None
+try:
+    sys.path.insert(0, os.environ['REGISTRY_LIB'])
+    import registry
+    reg = registry.load_registry(os.environ['WORKSPACE_ROOT'])
+except Exception:
+    pass
+for name in cfg.get('channels', {}):
+    shard = reg.shard_for_channel(name) if reg else None
+    default = shard.agent if shard else ''
     print(f'- #{name}' + (f' (default: {default})' if default else ''))
 PY
 )
@@ -108,10 +117,12 @@ fi
 
 # Build other agents list
 OTHER_AGENTS=""
-if [[ -f "$AGENTS_JSON" ]]; then
-    OTHER_AGENTS=$(AGENTS_JSON="$AGENTS_JSON" AGENT_NAME="$AGENT_NAME" python3 - <<'PY' 2>/dev/null || echo ""
-import json, os
-cfg = json.load(open(os.environ['AGENTS_JSON']))
+if [[ -f "$AGENTS_YAML" ]]; then
+    OTHER_AGENTS=$(REGISTRY_LIB="$REGISTRY_LIB" WORKSPACE_ROOT="$WORKSPACE_ROOT" AGENT_NAME="$AGENT_NAME" python3 - <<'PY' 2>/dev/null || echo ""
+import os, sys
+sys.path.insert(0, os.environ['REGISTRY_LIB'])
+import registry
+cfg = registry.load_registry(os.environ['WORKSPACE_ROOT']).legacy_view()
 self_name = os.environ['AGENT_NAME']
 for name, info in cfg.get('agents', {}).items():
     if name != self_name:
@@ -126,8 +137,8 @@ sed \
     -e "s/{{AGENT_NAME}}/$AGENT_NAME/g" \
     -e "s/{{SYSTEM_NAME}}/$SYSTEM_NAME/g" \
     -e "s/{{OWNER_NAME}}/$OWNER_NAME/g" \
-    -e "s|{{CHANNELS}}|$CHANNELS|g" \
-    -e "s|{{OTHER_AGENTS}}|$OTHER_AGENTS|g" \
+    -e "s|{{CHANNELS}}|${CHANNELS//$'\n'/\\n}|g" \
+    -e "s|{{OTHER_AGENTS}}|${OTHER_AGENTS//$'\n'/\\n}|g" \
     "$TEMPLATE_PATH" > "$AGENT_DIR/SYSTEM_PROMPT.md"
 
 # Create empty voice.md for user customization
@@ -151,45 +162,47 @@ mkdir -p "$WORKSPACE_ROOT/inbox/$AGENT_NAME"
 echo "  Created: $AGENT_DIR/"
 echo "  System prompt generated from $TEMPLATE template"
 
-# Register in agents.json (unless ephemeral)
-if [[ "$EPHEMERAL" == "false" && -f "$AGENTS_JSON" ]]; then
-    AGENTS_JSON="$AGENTS_JSON" \
+# Register in agents.yaml (unless ephemeral). write_agent appends/edits via
+# lib/registry.py, validates the result, and preserves existing comments.
+if [[ "$EPHEMERAL" == "false" ]]; then
+    REGISTRY_LIB="$REGISTRY_LIB" \
+    WORKSPACE_ROOT="$WORKSPACE_ROOT" \
     AGENT_NAME="$AGENT_NAME" \
+    TEMPLATE="$TEMPLATE" \
     MODEL="$MODEL" \
     MAX_TURNS="$MAX_TURNS" \
     DISCORD_TOKEN="$DISCORD_TOKEN" \
     python3 - <<'PY'
-import json
 import os
+import sys
 
-agents_json = os.environ['AGENTS_JSON']
+sys.path.insert(0, os.environ['REGISTRY_LIB'])
+import registry
+
 agent_name = os.environ['AGENT_NAME']
-model = os.environ['MODEL']
-max_turns = int(os.environ['MAX_TURNS'])
-discord_token = os.environ.get('DISCORD_TOKEN', '')
-
-with open(agents_json) as f:
-    cfg = json.load(f)
-
-agents = cfg.setdefault('agents', {})
+template = os.environ['TEMPLATE']
+role = template if template in ('builder', 'reviewer') else 'custom'
 entry = {
-    'model': model,
-    'max_turns': max_turns,
+    'name': agent_name,
+    'role': role,
+    'model': os.environ['MODEL'],
+    'max_turns': int(os.environ['MAX_TURNS']),
     'system_prompt': f'agents/{agent_name}/SYSTEM_PROMPT.md',
 }
 
-if discord_token:
-    env_var = 'DISCORD_BOT_TOKEN_' + agent_name.upper().replace('-', '_')
-    entry['discord_bot_token_env'] = env_var
+if os.environ.get('DISCORD_TOKEN', ''):
     # Note: user must add the actual token to .env
+    entry['discord'] = {
+        'token_env': 'DISCORD_BOT_TOKEN_' + agent_name.upper().replace('-', '_')
+    }
 
-agents[agent_name] = entry
-
-with open(agents_json, 'w') as f:
-    json.dump(cfg, f, indent=2)
-    f.write('\n')
+try:
+    registry.write_agent(os.environ['WORKSPACE_ROOT'], agent_name, entry)
+except registry.RegistryError as e:
+    print(e, file=sys.stderr)
+    sys.exit(1)
 PY
-    echo "  Registered in agents.json"
+    echo "  Registered in agents.yaml"
 fi
 
 # Notify agent server (hot-load)

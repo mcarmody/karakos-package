@@ -40,6 +40,12 @@ def make_workspace(tmp_path: Path, registration_exit: int = 0) -> Path:
     for name in ("data", "logs", "inbox", "bin"):
         (tmp_path / name).mkdir()
 
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "agents.yaml").write_text(
+        "version: 2\nagents:\n"
+        "  a:\n    name: a\n    role: primary\n"
+        "  m:\n    name: m\n    role: monitor\n")
+
     # entrypoint.sh invokes this with `python3 <path>`, same as every other
     # bin/*.py script in supervisord.conf — so the stub has to be real
     # Python, not a shell script with a shebang python3 would ignore.

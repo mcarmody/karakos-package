@@ -30,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 # lib/ holds modules shared by more than one script; it sits beside bin/.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import ask_handler  # noqa: E402
+import registry as agent_registry  # noqa: E402
 import tengwar  # noqa: E402
 
 # =============================================================================
@@ -134,7 +135,7 @@ def strip_mentions(text: str) -> str:
 # =============================================================================
 
 # Anything outside this set is replaced. That covers `/` and `\` — an uploader
-# controls the filename, and a name like `../../config/agents.json` must not be
+# controls the filename, and a name like `../../config/agents.yaml` must not be
 # able to choose where the relay writes.
 _UNSAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]")
 
@@ -384,7 +385,7 @@ class GuestBudget:
 # =============================================================================
 
 WORKSPACE_ROOT = Path(os.environ.get("WORKSPACE_ROOT", "/workspace"))
-AGENTS_CONFIG_PATH = WORKSPACE_ROOT / "config" / "agents.json"
+AGENTS_CONFIG_PATH = WORKSPACE_ROOT / "config" / "agents.yaml"
 CHANNELS_CONFIG_PATH = WORKSPACE_ROOT / "config" / "channels.json"
 MESSAGES_DIR = WORKSPACE_ROOT / "data" / "messages"
 ATTACHMENTS_DIR = WORKSPACE_ROOT / "data" / "attachments"
@@ -435,6 +436,7 @@ log.addHandler(console)
 # Global state
 agent_config: Dict = {}
 channels_config: Dict = {}
+registry_obj = None
 discord_id_to_agent: Dict[int, str] = {}
 active_dispatches: Dict[str, asyncio.Task] = {}
 dispatch_semaphores: Dict[str, asyncio.Semaphore] = {}
@@ -465,16 +467,18 @@ def spool_deferred_message(payload: dict, reason: str) -> Optional[Path]:
 
 def load_config():
     """Load agent and channel configuration"""
-    global agent_config, channels_config, discord_id_to_agent
+    global agent_config, channels_config, discord_id_to_agent, registry_obj
 
-    # Load agents
-    if AGENTS_CONFIG_PATH.exists():
-        with open(AGENTS_CONFIG_PATH) as f:
-            config_data = json.load(f)
-            agent_config = config_data.get("agents", {})
-    else:
+    # Load agents (config/agents.yaml via the registry; no legacy fallback)
+    try:
+        loaded = agent_registry.load_registry(WORKSPACE_ROOT)
+    except agent_registry.RegistryError as e:
+        log.error(f"Agent registry unusable: {e}")
         agent_config = {}
-        log.warning(f"Agents config not found: {AGENTS_CONFIG_PATH}")
+        registry_obj = None
+    else:
+        registry_obj = loaded
+        agent_config = registry_obj.legacy_view()["agents"]
 
     # Load channels
     if CHANNELS_CONFIG_PATH.exists():
@@ -493,6 +497,15 @@ def load_config():
                 discord_id_to_agent[int(bot_id)] = agent_name
 
     log.info(f"Loaded config for {len(agent_config)} agents, {len(channels_config.get('channels', {}))} channels")
+
+
+def default_agent_for(channel_name) -> Optional[str]:
+    """The agent that owns a channel's default routing: the registry shard
+    listing the channel (replaces channels.json `default_agent`)."""
+    if not channel_name or registry_obj is None:
+        return None
+    shard = registry_obj.shard_for_channel(channel_name)
+    return shard.agent if shard else None
 
 
 def load_server_ids(config: Dict) -> set:
@@ -721,7 +734,7 @@ class DiscordAdapter(discord.Client):
         channel_config = {}
         if channel_name:
             channel_config = channels_config.get("channels", {}).get(channel_name, {}) or {}
-        channel_default = channel_config.get("default_agent")
+        channel_default = default_agent_for(channel_name)
 
         # System commands run here, not in the agent. An agent that has stopped
         # reading its queue cannot process its own `/clear`, and that is the
@@ -788,7 +801,7 @@ class DiscordAdapter(discord.Client):
         """Whether a message from another bot may be routed to an agent.
 
         Two rules, and the first is the one that matters. A bot NEVER routes on
-        a channel's `default_agent` — it must @mention an agent by name. Two
+        a channel's default agent — it must @mention an agent by name. Two
         installs sharing a channel with a default agent answer each other
         forever otherwise, and the bill is the first anyone hears about it.
 
@@ -888,8 +901,7 @@ class DiscordAdapter(discord.Client):
         channel_name = self.get_channel_name(str(getattr(interaction.channel, "id", "")))
         channel_default = None
         if channel_name:
-            channel_default = (channels_config.get("channels", {})
-                               .get(channel_name, {}) or {}).get("default_agent")
+            channel_default = default_agent_for(channel_name)
 
         # handle_sys_command reads .channel, .author and .content off a
         # message. An interaction carries all three under different names;

@@ -36,7 +36,7 @@ def write_agents_config(workspace: Path, agents) -> None:
     in 1.1b, the legacy agents.json derived from the registry's legacy_view().
     `agents` is a list of ids or {id: registry-schema overrides}; the first is
     the primary, the rest `custom`. A registry needs a monitor, so one is added
-    to the yaml when none is given (it is not written to agents.json)."""
+    to the yaml when none is given."""
     import yaml
     sys.path.insert(0, str(PACKAGE_ROOT / "lib"))
     try:
@@ -61,9 +61,7 @@ def write_agents_config(workspace: Path, agents) -> None:
         yaml.safe_dump({"version": registry.REGISTRY_VERSION, "agents": entries},
                        sort_keys=False))
     reg = registry.load_registry(workspace)  # fails loudly on a bad harness config
-    legacy = reg.legacy_view()["agents"]
-    (config / "agents.json").write_text(
-        json.dumps({"agents": {n: legacy[n] for n in agents}}))
+    assert reg.primary()  # (the server reads agents.yaml directly)
     (config / "claude-settings.json").write_text(
         json.dumps({"permissions": {"allow": [], "deny": []}}))
 
