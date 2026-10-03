@@ -577,7 +577,7 @@ and shell commands the agent runs inherit exactly this, so a skill that reads a
 token must have the agent's `env:` name it. `KARAKOS_ENV_PASSTHROUGH=1` restores
 the old inherit-everything behaviour for debugging and is refused when
 `KARAKOS_ENV=production`. `AGENT_SERVER_TOKEN` is the one secret that is still
-passed to every non-monitor agent (see
+passed to every agent subprocess (see
 [ARCHITECTURE.md](ARCHITECTURE.md#credentials)). A skill author's rule of thumb:
 document the variables your tool reads so operators can add them.
 

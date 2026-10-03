@@ -356,7 +356,7 @@ applies at the next spawn.
 `KARAKOS_ENV_PASSTHROUGH=1` restores the old inherit-everything behaviour for
 debugging, and is refused when `KARAKOS_ENV=production`.
 
-**`AGENT_SERVER_TOKEN` is still passed** to every non-monitor agent subprocess.
+**`AGENT_SERVER_TOKEN` is still passed** to every agent subprocess.
 That is a residual, not an oversight: the agent's MCP servers call back into
 the agent server with it. Any tool the agent runs can therefore use it to call
 every authenticated route of the agent server. What limits it: the server is

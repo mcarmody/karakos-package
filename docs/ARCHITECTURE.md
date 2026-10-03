@@ -14,10 +14,23 @@ don't.
 - [MCP tool servers](#mcp-tool-servers)
 - [Dashboard](#dashboard)
 - [Agent lifecycle](#agent-lifecycle)
+- [Agents and the registry](#agents-and-the-registry)
+- [The turn loop](#the-turn-loop)
+- [Queue and sessions](#queue-and-sessions)
+- [Shards](#shards)
+- [The hive](#the-hive)
+- [Prompt composition](#prompt-composition)
+- [Guard rails](#guard-rails)
 - [Memory](#memory)
+- [Comms](#comms)
+- [Monitoring](#monitoring)
+- [Build queue](#build-queue)
+- [Credentials](#credentials)
 - [Protected paths](#protected-paths)
 - [Data layout](#data-layout)
+- [The upgrade model](#the-upgrade-model)
 - [Known gaps](#known-gaps)
+- [Where each 2.0 feature lives](#where-each-20-feature-lives)
 
 ## The shape of it
 
@@ -89,7 +102,9 @@ Every agent-server endpoint requires `Authorization: Bearer $AGENT_SERVER_TOKEN`
 | `~/.claude`, `~/.claude.json` | Bind-mounted host credentials, read-write so token refresh persists |
 
 Everything else — `bin/`, `mcp/`, `skills/`, `system/`, the built dashboard —
-is baked into the image and replaced on upgrade.
+is baked into the image and replaced on upgrade. The container health check and
+supervisord's `autorestart` are the only watchdogs for the supervised programs:
+there is no host-side watchdog for a dead scheduler (a post-2.0 item).
 
 ## The two message paths
 
@@ -382,44 +397,24 @@ name, duration and outcome.
 
 ## Dashboard
 
-Next.js, served by `npx next start` on port 3000.
+The dashboard is `karakos-dashboard`, built from the commit pinned in
+`dashboard.ref` under `KARAKOS_PROFILE=package`, and served on
+`${DASHBOARD_PORT:-3000}`. This repository carries no dashboard source and does
+not document its pages (that belongs to the dashboard repository); the contract
+between the two is [package-backend-contract.md](package-backend-contract.md):
+the agent-server routes the dashboard may call and the files it reads. Build
+routes and the pin are in [EXTENDING.md](EXTENDING.md#dashboard-build).
 
-| Page | Description |
-|---|---|
-| `/` | Agent status cards, uptime, queue depth |
-| `/agents` | Per-agent detail — status, cost, model, session reset |
-| `/chat` | Direct chat with an agent, streamed |
-| `/conversations` | Message feed with channel / human / tool-use filters |
-| `/costs` | Spend by agent and by conversation |
-| `/system` | Server health, component status |
-| `/settings` | Configuration viewer |
-| `/login` | Sign-in |
-
-### Authentication
-
-A login form, not HTTP Basic. Credentials are `DASHBOARD_USER` /
-`DASHBOARD_PASSWORD`; success sets `karakos_session`, a base64 HMAC-SHA256
-cookie with a 24-hour expiry, verified by every API route before it proxies
-anything.
-
-### Chat flow
-
-```
-Browser ──POST /api/chat──▶ agent-server POST /message   (channel_id "0")
-Browser ◀── EventSource /api/chat/stream ── polls the SQLite queue row
-```
-
-The stream route is an SSE *response* over a **200 ms poll of
-`data/memory/agent-server.db`** — it reads the `response`, `processed` and
-`activity` columns of the message's row and emits the string delta. It calls
-no agent-server endpoint. It gives up after 5 minutes. `/api/chat/history`
-likewise reads the database file directly.
+**Authentication** is a login form (`DASHBOARD_USER` / `DASHBOARD_PASSWORD`)
+that sets the `karakos_session` cookie, an HMAC token keyed by `SESSION_SECRET`,
+verified by every dashboard API route. Cookie and lifetime settings changed in
+2.0 ([UPGRADING.md](UPGRADING.md#auth-and-env-changes)).
 
 **`channel_id "0"` means headless: do not post to Discord.** Every outbound
 Discord path short-circuits on it — the reply, the typing indicator, tool
 activity lines, crash notices — and `ask_user` refuses to run. It is also the
 default when `/message` omits a channel id, which is what `bin/poke.sh
---silent` and `bin/kara` rely on.
+--silent` and `bin/kara` rely on, and what dashboard chat uses.
 
 ## Agent lifecycle
 
@@ -475,6 +470,95 @@ stops the subprocesses. It starts no summarizer and no handoff turn; sessions
 persist and the next boot resumes them. `bin/summarize-session.py` remains as a
 manual tool for one release.
 
+## Agents and the registry
+
+`config/agents.yaml` (parsed only by `lib/registry.py`, schema version 2) is the
+one description of the fleet. Each agent has an id (`^[a-z][a-z0-9-]{0,31}$`, the
+key of everything it owns), a display `name`, and a `role`: `primary`, `monitor`,
+`builder`, `reviewer` or `custom`. Exactly one primary and one monitor are
+required. Keys, all optional: `model`, `effort` (`low`, `medium`, `high`,
+`xhigh`, `max`), `max_turns`, `timeout`, `token_budget_4h`,
+`token_budget_min_pause_s`, `context_budget_tokens`, `handoff_on_reset`,
+`reset_mode`, `prompt` (and the legacy `system_prompt`), `tool_streaming`,
+`stream_to_channel`, `dashboard_chat`, `allowed_tools`, `disallowed_tools`,
+`env`, `label`, `work_stealing`, `steering`, `shards` (each with its `channels`)
+and `discord` (`token_env`, `bot_id_env`). Unknown keys warn and are ignored.
+The server reads it at start and on reload; the relay re-reads it when the file
+changes.
+
+## The turn loop
+
+`lib/turn_loop.py` is the loop the agent server runs per shard: **claim** a batch
+of queued rows, **run** one turn on the shard's subprocess, **finish** it (post
+the reply, mark rows, re-check the queue). Everything in it takes a shard id.
+Extension points are four hooks, `before_claim`, `on_turn_start`, `on_event` and
+`on_turn_end`. `before_claim` is where gates live: the operator pause, then the
+account breaker, the token budget and the weekly governor (see
+[Guard rails](#guard-rails)). A gate that defers a drain changes nothing in the
+queue or in shard states and arms a timer to resume.
+
+## Queue and sessions
+
+`data/memory/agent-server.db` holds `message_queue`, `sessions`, `cost_events`
+and `rate_limit_state`. The queue's `agent` column holds the **shard id**, and so
+does every other key in the server. **The one rule: every piece of
+per-conversation runtime state is keyed by shard id.** The only exception is
+account-level state, which is a fact about the account (`rate_limit_state` is one
+row per window type). The database is in rollback-journal mode, so code reads it
+in one hop and never leaves a cursor open across an `await`
+([EXTENDING.md](EXTENDING.md#what-survives-an-upgrade)).
+
+## Shards
+
+A shard is one `claude` subprocess of an agent. An agent without `shards:` has a
+single shard whose id is the agent id, which is why 1.x history carries over. The
+relay routes a Discord message to a shard by the channel ownership in the
+registry (`lib/routing.py`); `lib/shards.py` plans the shard set and diffs it on
+reload. Adding shards and measuring their memory:
+[EXTENDING.md](EXTENDING.md#shards).
+
+## The hive
+
+Shards talk to each other with **buzz** (fire and forget) and **hive call** (a
+blocking question), implemented in `lib/hive.py` with routes under `/hive/`:
+calls nest at most two deep, a shard cannot call itself or one already waiting on
+it, an unanswered call expires with an `expired` reply, and a queued call whose
+callee crashes is answered with an error. **Work stealing** (`lib/stealing.py`, off
+by default) lets an idle shard take rows waiting behind a busy sibling.
+**Steering** (`lib/steering.py`, on by default) writes a message that arrives
+mid-turn straight to the running turn. `GET /hive/calls` is the **call log**
+([hive-call-log.md](hive-call-log.md)).
+
+## Prompt composition
+
+`lib/prompt_compose.py` builds each shard's system prompt from the shared core
+(`agents/CORE.md`), the agent section, optional per-shard text and the fleet
+house style (`agents/HOUSE_STYLE.md`). A `<!-- core:insert -->` line is the
+**splice marker** for where the core goes; generated blocks are fenced with
+`<!-- begin:core -->` and `<!-- end:core -->` **wrapper markers** (and
+`house-style`) and are stripped before composing again, so composition is
+idempotent. See [EXTENDING.md](EXTENDING.md#prompts).
+
+## Guard rails
+
+- **Rate-limit breaker** (`lib/rate_limits.py`): the CLI reports headroom in-band;
+  the state is keyed by **window type** (`five_hour`, `seven_day`, ...), never by
+  agent. An open breaker defers every row, human included.
+- **Token budget** (`lib/token_budget.py`): per agent, input plus output tokens
+  over a trailing four hours across all its shards; a pause lasts at least
+  `token_budget_min_pause_s`.
+- **Usage governor** (`lib/usage_gate.py`, `config/governor.yaml`): machine-started
+  work (heartbeats, scheduled pokes, queued builds) yields when the account's
+  seven-day usage reaches a threshold; human messages never do; a `monitor`
+  agent's rows are never gated.
+- **Cost caps**: `COST_DAILY_LIMIT` and `COST_MONTHLY_LIMIT`, enforced when a
+  message is queued.
+- **Context handoff**: see [Agent lifecycle](#agent-lifecycle).
+- **Bash rails and secrets check**: `system/hooks/bash-safety-rails.py` denies
+  destructive commands; `system/check-secrets.py` is a pre-commit check;
+  `lib/redact.py` masks credential-shaped strings in the stream-log tee,
+  `turn_events` and tool lines.
+
 ## Memory
 
 Durable memory is one knowledge graph: `data/memory/graph.db` (SQLite, FTS5,
@@ -528,6 +612,81 @@ job (`lib/graph/consolidate.py`) builds episodes from the previous day's
 messages, decays and archives them, merges duplicates, tidies entities and
 backfills embeddings.
 
+## Comms
+
+- **Relay routing.** The relay holds the one Discord websocket and sends each
+  message to a shard (`lib/routing.py`); the rules are in
+  [EXTENDING.md](EXTENDING.md#routing).
+- **Reply gate.** A channel's `reply_gate` decides whether an agent answers a
+  message not addressed to it: a heuristic tier, and an optional small-model
+  classifier tier that fails closed (`lib/reply_gate_config.py`,
+  `lib/reply_classifier.py`). `lib/post_guard.py` keeps empty text and the
+  `PASS` convention reply out of channels.
+- **Outbox.** Replies are written to `data/outbox/outbox.db` before they are
+  sent (`lib/outbox.py`). A row is `pending`, `sending`, `delivered`, `dead` or
+  `discarded`; failures retry with exponential backoff (5 s times three per
+  attempt, capped at an hour; 429s honour the limit), and a row goes `dead` after
+  `DISCORD_OUTBOX_MAX_ATTEMPTS` tries (12) or `DISCORD_OUTBOX_MAX_AGE_S` (86400 s)
+  or on a permanent error. Delivery is **at-least-once**, narrowed by a per-chunk
+  nonce. Operators use `python3 lib/outbox.py {stats,list,show,retry,discard}`
+  with the server down or `GET /outbox`, `GET /outbox/{id}`, `POST
+  /outbox/{id}/retry` and `POST /outbox/{id}/discard` with it up. `GET /health`
+  carries `outbox` (`pending`, `sending`, `dead`, `oldest_pending_age_s`);
+  `dead_letters` counts dead rows and `dead_letter_path` is deprecated.
+- **Discord switches** (all off by default; `threads`, `reaction_notices`,
+  `edit_reroute`, `suppress_embeds`): [DISCORD_SETUP.md](DISCORD_SETUP.md#optional-behaviours).
+- **Pause and effort.** `/pause [minutes]` and `/resume` hold and release a
+  shard's queue (`lib/operator_pause.py`, `data/operator-pause.json`; the turn in
+  progress finishes). `/effort <level>` sets an agent-level `--effort` override
+  (`lib/runtime_overrides.py`, `data/runtime-overrides.json`); the registry file
+  is never edited at runtime. Routes: `POST /agents/{name}/pause`, `/resume`,
+  `/effort`.
+
+## Monitoring
+
+The `monitor` agent is a cheap model with a tool deny list (no shell, write or web
+tools; `MONITOR_DISALLOWED_TOOLS` in `lib/registry.py`). Around it, plain code
+does the detecting: scheduled jobs touch **heartbeats** (`lib/heartbeats.py`),
+**drift** compares the job table with the live schedule (`lib/drift.py`),
+**stall diagnosis** says why a shard is silent (`lib/stall.py`), and
+`lib/monitor_tick.py` runs once a minute and turns findings into alerts.
+**Alerts** (`lib/alerts.py`, `config/monitor.yaml`) post straight to Discord
+through `bin/discord-notify.sh`, never through the agent poke path, because a
+wedged agent never reads its queue. `lib/outbox_audit.py` audits message
+delivery from the outbox.
+
+## Build queue
+
+Off by default (`config/build-queue.yaml`). When enabled, briefs in
+`inbox/builder/` and `inbox/reviewer/` become rows in `data/build-queue.db`
+(`lib/buildq.py`, operator CLI `bin/buildq`); `lib/build_dispatcher.py` admits
+them against per-host concurrency and a resource probe (`lib/build_hosts.py`),
+runs them locally or over ssh on a remote host (`lib/build_run.py`,
+`bin/build-runner.sh`), and fails a build that opened no PR. Provisioning a remote
+host: [EXTENDING.md](EXTENDING.md#build-queue).
+
+## Credentials
+
+What each process holds, and what it hands on:
+
+| Process | Holds | Passes on |
+|---|---|---|
+| `agent-server` | every variable in `config/.env`, the mounted `~/.claude` login | to each agent subprocess: the allowlist, the agent's `env:`, and the identity variables below |
+| `relay` | the Discord bot tokens | nothing to agents |
+| `claude` subprocess (and its hooks and shell commands) | the allowlist (`PATH`, `HOME`, `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, ...), the variables its `env:` names, and `KARAKOS_AGENT`, `KARAKOS_SHARD`, `WORKSPACE_ROOT`, `AGENT_SERVER_PORT`, `AGENT_SERVER_URL` and `AGENT_SERVER_TOKEN` | to its MCP servers, unchanged |
+| MCP tool servers | what the subprocess passed | calls back into the agent server with the token |
+| dashboard | `SESSION_SECRET`, its login, `AGENT_SERVER_TOKEN` | proxies authenticated calls |
+
+**`AGENT_SERVER_TOKEN` is still passed to every agent subprocess. This is a
+residual.** The agent's MCP servers call back into the server with it, so any
+tool the agent runs can use it against every authenticated route (`/message`,
+`/agents/...`, `/outbox/...`, `/hive/...`, the graph routes). What limits it: the
+server is published on `127.0.0.1` only (`config/docker-compose.yml`), the
+monitor agent's deny list removes its shell, write and web tools, and the
+allowlist keeps every other secret out. A scoped per-shard credential, after
+which the token would be dropped from the subprocess environment, is a post-2.0
+item.
+
 ## Protected paths
 
 `config/protected-paths.json`, enforced by a pre-commit hook that
@@ -553,6 +712,7 @@ being handed the keys to its own process lifecycle.
 
 ```
 data/                                  # named volume
+├── .schema-version                    # the stamp: schema, package, migrated_from
 ├── memory/
 │   ├── agent-server.db                # message_queue, sessions, cost_events,
 │   │                                  #   rate_limit_state
@@ -574,6 +734,10 @@ data/                                  # named volume
 │   └── wedge-check-state.json
 ├── taskboard.json
 ├── outbox/outbox.db                   # durable Discord replies: retry + audit (6.1)
+├── build-queue.db                     # build queue (when enabled)
+├── operator-pause.json                # /pause holds, keyed by shard id
+├── runtime-overrides.json             # /effort overrides, keyed by agent id
+├── migration-reports/                 # migration-report.md from the migrator
 ├── handoff/<shard>.md                 # note for the next fresh session (rotated)
 └── stop-hook-extensions.json
 
@@ -585,21 +749,88 @@ logs/                                  # named volume
 └── session-summaries/<agent>-<ts>.md
 
 inbox/<agent>/                         # named volume — builder/reviewer briefs
+
+backups/                               # in the checkout: migrator backups,
+                                       #   pre-2.0-<timestamp>/ with MANIFEST.json
 ```
 
 Note `data/memory/agent-server.db` — the queue database lives under
 `memory/`, not at the top of `data/`.
 
+## The upgrade model
+
+A data directory carries a stamp, `data/.schema-version`. The 2.0 image checks it
+before touching anything and **exits 78** on an unstamped non-empty directory or
+an older schema. A fresh, empty data directory is stamped by setup. The migrator
+(`python3 -m lib.migrate`, host wrapper `bin/karakos migrate`) is the only writer
+of existing data: it detects the layout, takes a backup, runs the steps in
+`lib/migrate/steps/`, verifies each and writes the stamp last. Backups are the
+only way back; memory has no downgrade. Operator procedure:
+[UPGRADING.md](UPGRADING.md). Rule for contributors: runtime state is keyed by
+shard id, and only `lib/migrate/steps/` mutates existing data.
+
 ## Known gaps
 
 Documented so you don't spend an evening deciding whether it's your install.
-Each is a real defect in the code, not a configuration mistake.
+Each is a real limit of the code, not a configuration mistake.
 
 - **Session-summary retention mis-buckets hyphenated agent names.**
   `bin/purge-data.py` splits the agent out of the filename at the first
   hyphen, so `test-agent` and `test-bot` share one 30-file budget and evict
   each other. ([#156](https://github.com/mcarmody/karakos-package/issues/156))
-- **There is no context-budget compaction.** The `sessions` table carries
-  `input_tokens`, `compaction_count` and `last_compacted`, and the tokens are
-  written after every turn, but nothing reads them back or compares them to a
-  threshold. Only the monetary caps are enforced.
+- **Context management is a handoff reset, not compaction.** `context_budget_tokens`
+  resets a shard at the end of the turn that reaches it, after a handoff note
+  (see [Agent lifecycle](#agent-lifecycle)). `reset_mode: compact` is inert: it
+  behaves as `reset` until `/compact` over stream-json is proven against the real
+  CLI (`COMPACT_VERIFIED` in `lib/session_policy.py`). The `compaction_count` and
+  `last_compacted` columns of `sessions` are not read by anything.
+- **`AGENT_SERVER_TOKEN` reaches agent subprocesses** (see [Credentials](#credentials)).
+  A scoped credential is post-2.0.
+- **No host-side watchdog for a dead scheduler.** The container health check and
+  supervisord's restart are what exist.
+- **The migrator does not fill `env:` from `.mcp.json`**, the 2.0 compose template
+  still mounts `.karakos`, and `logs/` and `inbox/` are not in the backup
+  ([UPGRADING.md](UPGRADING.md#the-real-run)).
+- **Remote build kill is guarded by pid file and exit file, not process start
+  time**, so a recycled process group could in theory be signalled after the
+  runner died without writing its exit file.
+
+## Where each 2.0 feature lives
+
+One row per step; every path exists in the checkout (`tests/test_docs.py` checks).
+
+| Step | Feature | Files |
+|---|---|---|
+| 0.5 | Coupling check, review gates | `system/check-coupling.sh`, `system/coupling-denylist.txt` |
+| 1.0 | Schema stamp and migrator core | `lib/migrate/guard.py`, `lib/migrate/runner.py`, `lib/migrate/backup.py`, `lib/migrate/detect.py` |
+| 1.1a / 1.1b | Registry and its migration | `lib/registry.py`, `lib/migrate/steps/10_registry.py` |
+| 1.2 | Queue schema | `lib/msgqueue.py`, `lib/migrate/steps/20_queue.py` |
+| 1.3 / 1.3b | Prompt composition, legacy prompt flags | `lib/prompt_compose.py`, `agents/CORE.md`, `agents/HOUSE_STYLE.md` |
+| 1.4 | Safety hooks | `bin/hooks-sync.py`, `config/hooks.json`, `system/hooks/bash-safety-rails.py`, `system/check-secrets.py` |
+| 1.5 | Context metric | `lib/session_policy.py`, `lib/migrate/steps/30_sessions.py` |
+| 1.6 | Subprocess env allowlist | `lib/spawn_env.py` |
+| 1.7 | Small portable fixes | `system/check-coupling.sh` |
+| 2.0 | Turn loop | `lib/turn_loop.py` |
+| 2.1 | Shards | `lib/shards.py`, `lib/registry.py` |
+| 2.2 | Relay routing | `lib/routing.py`, `bin/relay.py` |
+| 2.3 | Buzz and hive call | `lib/hive.py`, `docs/hive-call-log.md` |
+| 2.4 | Work stealing | `lib/stealing.py` |
+| 2.5 | Steering | `lib/steering.py` |
+| 2.6 | Context handoff | `lib/session_policy.py`, `bin/agent-server.py` |
+| 2.7 | Rate-limit breaker, budget, governor | `lib/rate_limits.py`, `lib/token_budget.py`, `lib/usage_gate.py`, `lib/usage_governor.py`, `config/governor.yaml`, `lib/migrate/steps/35_rate_limit.py` |
+| 3.1 | Primary template | `agents/templates/primary.md`, `bin/create-agent.sh` |
+| 3.2 | Monitor agent | `agents/templates/monitor.md`, `lib/monitor_tick.py`, `lib/drift.py`, `lib/stall.py`, `lib/alerts.py`, `lib/heartbeats.py`, `lib/outbox_audit.py`, `lib/migrate/steps/12_monitor.py` |
+| 3.3 | Build queue | `lib/buildq.py`, `lib/build_dispatcher.py`, `lib/build_hosts.py`, `lib/build_run.py`, `bin/buildq`, `bin/build-runner.sh`, `lib/migrate/steps/50_build_queue.py` |
+| 4.1 | Graph store | `lib/graph/store.py`, `lib/graph/schema.py`, `lib/graph/embed.py` |
+| 4.2 / 4.2b | Memory tools, rewired consumers | `lib/graph/tools.py`, `lib/graph/recall.py`, `mcp/tools-server.py`, `system/hooks/inject-recall.py` |
+| 4.3 | Consolidation job | `lib/graph/consolidate.py`, `lib/monitor_jobs/memory_consolidate.py`, `bin/graph-consolidate.py` |
+| 4.4 | Memory migrator | `lib/migrate/steps/40_memory.py` |
+| 5.0 / 5.4 | Dashboard adapter and fleet pages (dashboard repo) | `docs/package-backend-contract.md` |
+| 5.1 / 5.2 | Profile flag, auth and env (dashboard repo) | `docs/package-backend-contract.md` |
+| 5.3 | Pinned package dashboard build | `dashboard.ref`, `dashboard.ref.sha256`, `bin/fetch-dashboard.sh`, `bin/build-dashboard-bundle.sh`, `bin/dashboard-stage.sh` |
+| 5.5 | Memory browser read API | `lib/graph/browse.py`, `docs/graph-browse-api.md` |
+| 6.1 | Discord outbox | `lib/outbox.py`, `lib/migrate/steps/60_outbox.py` |
+| 6.2 | Discord UX switches | `lib/discord_ux.py` |
+| 6.3 | Reply gate classifier | `lib/reply_gate_config.py`, `lib/reply_classifier.py`, `lib/post_guard.py` |
+| 6.4 | Pause, effort, redaction | `lib/operator_pause.py`, `lib/runtime_overrides.py`, `lib/redact.py` |
+| 7.1 | `karakos migrate` | `bin/karakos`, `bin/karakos-migrate`, `lib/migrate/__main__.py`, `lib/migrate/compose.py` |
