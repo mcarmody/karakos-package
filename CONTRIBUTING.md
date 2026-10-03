@@ -23,6 +23,15 @@ pytest tests/test_setup.py -v   # a single file
 `main` — check it locally with `bash -n` on shell scripts and `python -m
 py_compile` on Python scripts before opening a PR if you touched either.
 
+## The dashboard
+
+The web dashboard is not in this repo. The image builds
+[`karakos-dashboard`](https://github.com/mcarmody/karakos-dashboard) at the
+commit pinned in `dashboard.ref` (with `dashboard.ref.sha256`); send dashboard
+changes there, then bump the pin here in a one-line PR (both files). The source
+is private and is never committed: see "Dashboard build" in `docs/EXTENDING.md`
+for how to get a build without access.
+
 ## Making a change
 
 1. Fork the repo and branch from `main`.

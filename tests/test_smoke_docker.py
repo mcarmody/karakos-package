@@ -6,6 +6,7 @@ resulting image contains all expected components. This would have caught both
 of Ian's installation issues (missing package-lock.json, invalid route export).
 """
 
+import re
 import subprocess
 import pytest
 from pathlib import Path
@@ -32,17 +33,28 @@ class TestDockerBuild:
 
     @pytest.mark.slow
     def test_docker_build_has_dashboard(self):
-        """Built image should contain compiled dashboard."""
+        """Built image records the dashboard ref and loads its native modules."""
         result = subprocess.run(
             [
-                "docker", "run", "--rm", "karakos-test:smoke",
-                "test", "-d", "/workspace/dashboard/.next",
+                "docker", "run", "--rm", "--entrypoint", "test", "karakos-test:smoke",
+                "-f", "/workspace/dashboard/.dashboard-ref",
             ],
             capture_output=True,
             text=True,
             timeout=30,
         )
-        assert result.returncode == 0, "Dashboard .next directory missing from image"
+        assert result.returncode == 0, "/workspace/dashboard/.dashboard-ref missing from image"
+        result = subprocess.run(
+            [
+                "docker", "run", "--rm", "--entrypoint", "node", "karakos-test:smoke", "-e",
+                "require('/workspace/dashboard/node_modules/better-sqlite3');"
+                "require('/workspace/dashboard/node_modules/sqlite3');console.log('native ok')",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert "native ok" in result.stdout, f"native modules failed to load:\n{result.stderr}"
 
     @pytest.mark.slow
     def test_docker_build_has_python_deps(self):
@@ -106,16 +118,6 @@ class TestFileStructure:
     def test_required_file_exists(self, path):
         assert (PACKAGE_ROOT / path).exists(), f"Required file missing: {path}"
 
-    @pytest.mark.parametrize("path", [
-        "dashboard/package.json",
-        "dashboard/package-lock.json",
-        "dashboard/app/layout.tsx",
-        "dashboard/app/page.tsx",
-        "dashboard/lib/api.ts",
-    ])
-    def test_dashboard_file_exists(self, path):
-        assert (PACKAGE_ROOT / path).exists(), f"Dashboard file missing: {path}"
-
     def test_scripts_are_executable(self):
         """Shell scripts should have execute permission."""
         non_executable = []
@@ -142,7 +144,9 @@ class TestDockerCompose:
 
         Creates a minimal .env if missing, since compose references it.
         """
-        import tempfile
+        import shutil
+        if not shutil.which("docker"):
+            pytest.skip("docker not installed")
         env_path = PACKAGE_ROOT / "config" / ".env"
         created_env = False
 
@@ -166,113 +170,76 @@ class TestDockerCompose:
                 env_path.unlink()
 
 
+class TestDashboardPin:
+    """The dashboard is karakos-dashboard at a pinned ref, not a tree in this repo."""
+
+    def test_dashboard_ref_is_a_full_sha(self):
+        ref = (PACKAGE_ROOT / "dashboard.ref").read_text().strip()
+        assert re.fullmatch(r"[0-9a-f]{40}", ref), f"dashboard.ref must be a 40-hex sha, got {ref!r}"
+        assert len((PACKAGE_ROOT / "dashboard.ref").read_text().strip().splitlines()) == 1
+
+    def test_dashboard_ref_sha256_is_hex(self):
+        digest = (PACKAGE_ROOT / "dashboard.ref.sha256").read_text().strip()
+        assert re.fullmatch(r"[0-9a-f]{64}", digest), "dashboard.ref.sha256 must be 64 hex chars"
+
+    def test_bundle_pin_file_exists(self):
+        assert (PACKAGE_ROOT / "dashboard.bundle.sha256").exists()
+
+    def test_dashboard_source_not_tracked(self):
+        out = subprocess.run(
+            ["git", "ls-files", "dashboard", "vendor"],
+            cwd=str(PACKAGE_ROOT), capture_output=True, text=True,
+        ).stdout
+        assert out.strip() == "", f"dashboard source or vendored tarball is tracked:\n{out}"
+        assert not (PACKAGE_ROOT / "dashboard").exists()
+
+
 class TestDockerfileCopyTargets:
-    """Verify that paths referenced in Dockerfile COPY commands exist.
+    """Verify COPY sources in the Dockerfile are paths the build stage produces.
 
     Prevents build failures like #33 where COPY --from=dashboard-build
-    referenced /app/public but no public/ directory existed.
+    referenced /app/public but no public/ directory existed. The old check
+    looked in the in-repo dashboard/; the stage now builds from a pinned ref,
+    so the check parses the Dockerfile and the stage script instead.
     """
 
-    def test_dashboard_copy_sources_exist(self):
-        """Directories copied from dashboard into the image must exist."""
-        import re
-        dockerfile = (PACKAGE_ROOT / "Dockerfile").read_text()
+    def _dockerfile(self):
+        return (PACKAGE_ROOT / "Dockerfile").read_text()
 
-        # Find COPY --from=dashboard-build /app/<path> dashboard/<path>
-        pattern = re.compile(r'COPY\s+--from=dashboard-build\s+/app/(\S+)\s+dashboard/(\S+)')
-        for match in pattern.finditer(dockerfile):
-            src_path = match.group(1)
-            dest_ref = match.group(2)
+    def test_declares_the_build_args(self):
+        df = self._dockerfile()
+        assert re.search(r"^ARG DASHBOARD_REF\b", df, re.M)
+        assert re.search(r"^ARG NODE_MAJOR\b", df, re.M)
 
-            # .next and node_modules are build artifacts — skip
-            if src_path in (".next", "node_modules"):
+    def test_build_and_runtime_stages_share_node_major(self):
+        df = self._dockerfile()
+        # One ARG NODE_MAJOR before the first FROM, referenced by both stages.
+        first_from = df.index("\nFROM ")
+        assert "ARG NODE_MAJOR=" in df[:first_from]
+        assert re.search(r"^FROM node:\$\{NODE_MAJOR\}-bookworm-slim AS dashboard-build", df, re.M)
+        assert "setup_${NODE_MAJOR}.x" in df
+        assert "setup_20.x" not in df and "node:20" not in df
+
+    def test_dashboard_copy_sources_are_produced_by_the_stage(self):
+        df = self._dockerfile()
+        sources = re.findall(r"COPY\s+(?:--\S+\s+)*--from=dashboard-build\s+(\S+)\s+\S+", df)
+        assert sources, "no COPY --from=dashboard-build lines found"
+        stage = (PACKAGE_ROOT / "bin" / "dashboard-stage.sh").read_text()
+        for src in sources:
+            assert src.startswith("/out/"), f"{src} is not under the stage output dir /out"
+            name = src[len("/out/"):]
+            if name.endswith("*"):  # next.config.*: the stage copies each candidate by name
+                assert name[:-1] + "mjs" in stage, f"stage script does not produce {src}"
                 continue
-
-            # For source files/dirs, verify they exist in dashboard/
-            local_path = PACKAGE_ROOT / "dashboard" / src_path
-            assert local_path.exists(), (
-                f"Dockerfile copies dashboard/{src_path} but it doesn't exist. "
-                f"Create it or remove the COPY line. (Fixes #33)"
-            )
-
-
-class TestNextjsRouteExports:
-    """Verify Next.js route files only export valid handlers.
-
-    This test directly prevents the verifySessionToken export bug
-    that broke Ian's build (issue #32).
-    """
-
-    VALID_EXPORTS = {
-        "GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS",
-        # Next.js config exports
-        "dynamic", "dynamicParams", "revalidate", "fetchCache",
-        "runtime", "preferredRegion", "maxDuration",
-        "generateStaticParams", "generateMetadata", "metadata",
-    }
-
-    def test_route_files_have_valid_exports(self):
-        """Route files should only export valid Next.js handlers."""
-        import re
-
-        app_dir = PACKAGE_ROOT / "dashboard" / "app"
-        issues = []
-
-        for route_file in app_dir.rglob("route.ts"):
-            content = route_file.read_text()
-            # Find named exports: export { foo } or export function foo
-            # and export async function foo
-            export_pattern = re.compile(
-                r'export\s+(?:async\s+)?function\s+(\w+)'
-                r'|export\s*\{\s*([^}]+)\s*\}'
-            )
-            for match in export_pattern.finditer(content):
-                if match.group(1):
-                    name = match.group(1)
-                    if name not in self.VALID_EXPORTS:
-                        rel = route_file.relative_to(PACKAGE_ROOT)
-                        issues.append(f"{rel}: invalid export '{name}'")
-                elif match.group(2):
-                    for name in match.group(2).split(","):
-                        name = name.strip().split(" as ")[0].strip()
-                        if name and name not in self.VALID_EXPORTS:
-                            rel = route_file.relative_to(PACKAGE_ROOT)
-                            issues.append(f"{rel}: invalid export '{name}'")
-
-        assert not issues, (
-            "Route files have invalid exports:\n" + "\n".join(issues)
-        )
+            assert name in stage or f'"$OUT/{name}"' in stage, f"stage script does not produce {src}"
 
 
 class TestSessionSecretConsistency:
-    """Verify SESSION_SECRET is handled correctly across the codebase.
+    """Verify SESSION_SECRET is provisioned by the package.
 
-    Catches the split-secret bug where route.ts and lib/api.ts each
-    generated their own random SESSION_SECRET, making auth permanently
-    broken without the env var set.
+    The dashboard-side half (one secret definition, no random fallback) lives
+    in karakos-dashboard now; the package must still generate and document it.
     """
-
-    def test_no_duplicate_session_secret_definitions(self):
-        """Only lib/api.ts should define SESSION_SECRET."""
-        import re
-
-        auth_route = PACKAGE_ROOT / "dashboard" / "app" / "api" / "auth" / "route.ts"
-        content = auth_route.read_text()
-
-        # Should NOT have its own SESSION_SECRET definition
-        assert "SESSION_SECRET" not in content, (
-            "auth/route.ts should not define SESSION_SECRET. "
-            "Import generateSessionToken from @/lib/api instead."
-        )
-
-    def test_auth_route_imports_from_shared_lib(self):
-        """Auth route should import token generation from shared lib."""
-        auth_route = PACKAGE_ROOT / "dashboard" / "app" / "api" / "auth" / "route.ts"
-        content = auth_route.read_text()
-
-        assert "from \"@/lib/api\"" in content or "from '@/lib/api'" in content, (
-            "auth/route.ts should import from @/lib/api for shared session handling"
-        )
 
     def test_setup_generates_session_secret(self):
         """setup.sh must generate SESSION_SECRET in the .env file."""
@@ -288,16 +255,6 @@ class TestSessionSecretConsistency:
         template = (PACKAGE_ROOT / "config" / ".env.template").read_text()
         assert "SESSION_SECRET" in template, (
             "SESSION_SECRET missing from .env.template"
-        )
-
-    def test_no_random_fallback_in_auth_route(self):
-        """Auth route must not have crypto.randomBytes fallback for secrets."""
-        auth_route = PACKAGE_ROOT / "dashboard" / "app" / "api" / "auth" / "route.ts"
-        content = auth_route.read_text()
-
-        assert "randomBytes" not in content, (
-            "auth/route.ts should not generate random secrets. "
-            "SESSION_SECRET should come from the environment via lib/api.ts."
         )
 
 

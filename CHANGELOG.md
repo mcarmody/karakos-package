@@ -14,6 +14,8 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- The package image builds `karakos-dashboard` at the commit pinned in `dashboard.ref` (`KARAKOS_PROFILE=package`) instead of shipping its own `dashboard/` tree, which is deleted. Node is one pinned major (`NODE_MAJOR`) for both stages. Releases attach a pruned dashboard build bundle (no source). `bin/fetch-dashboard.sh`, `bin/build-dashboard-bundle.sh`, `bin/dashboard-stage.sh` (ANDURIL 5.3).
+
 - Rate-limit breaker (account-wide, `rate_limit_state` re-keyed by window type via migrator step `35_rate_limit`), per-agent `token_budget_4h` with a 30-minute minimum pause, and a weekly-usage governor for machine-started work (`config/governor.yaml`). `GET /usage` and `GET /agents` gain additive fields (ANDURIL 2.7).
 
 - Build queue (off by default, `config/build-queue.yaml`): `bin/buildq`, per-host concurrency, an admission probe, remote exec hosts over ssh, cancel with salvage, and an outcome check that fails a build with no PR (`lib/buildq.py`, `lib/build_dispatcher.py`; migrator step `50_build_queue`; ANDURIL 3.3).

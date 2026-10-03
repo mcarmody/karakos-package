@@ -58,3 +58,4 @@ docker-compose.override.yml
 # Composed prompts (debug aid, never the source)
 agents/*/SYSTEM_PROMPT.generated.md
 agents/*/shards/*.generated.md
+vendor/

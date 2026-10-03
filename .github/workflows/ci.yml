@@ -38,9 +38,6 @@ jobs:
         run: |
           find . -name '*.sh' -not -path './.git/*' -exec bash -n {} +
 
-      - name: Check Next.js route exports
-        run: pytest tests/test_smoke_docker.py::TestNextjsRouteExports -v
-
       - name: Validate file structure
         run: pytest tests/test_smoke_docker.py::TestFileStructure -v
 
@@ -66,30 +63,78 @@ jobs:
       - name: Run unit tests
         run: pytest tests/ -v -m "not slow" --tb=short
 
-  # Docker build smoke test — catches Dockerfile and build issues
+  # Docker build smoke test — catches Dockerfile and build issues.
+  # karakos-dashboard is private: the pinned source is fetched with a read-only
+  # token (repo secret DASHBOARD_FETCH_TOKEN). Fork PRs have no secret, so the
+  # image build is skipped there (the structural tests still run elsewhere).
   docker-smoke:
     runs-on: ubuntu-latest
+    env:
+      HAS_DASHBOARD_TOKEN: ${{ secrets.DASHBOARD_FETCH_TOKEN != '' }}
     steps:
       - uses: actions/checkout@v4
 
+      - name: No dashboard token, skipping
+        if: env.HAS_DASHBOARD_TOKEN != 'true'
+        run: echo "no dashboard token (DASHBOARD_FETCH_TOKEN unavailable, e.g. a forked PR), skipping the image build"
+
+      - name: Fetch pinned dashboard source
+        if: env.HAS_DASHBOARD_TOKEN == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.DASHBOARD_FETCH_TOKEN }}
+        run: bin/fetch-dashboard.sh
+
       - name: Set up Docker Buildx
+        if: env.HAS_DASHBOARD_TOKEN == 'true'
         uses: docker/setup-buildx-action@v3
 
       - name: Build Docker image
-        run: docker build -t karakos-test:smoke .
+        if: env.HAS_DASHBOARD_TOKEN == 'true'
+        run: docker build --build-arg DASHBOARD_REF="$(cat dashboard.ref)" -t karakos-test:smoke .
 
       # The image's ENTRYPOINT (bin/entrypoint.sh) requires DASHBOARD_PORT and
       # AGENT_SERVER_TOKEN to be set — those are runtime concerns, not build-
       # artifact checks. Override --entrypoint so each smoke test runs against
       # the image without going through the production startup path.
 
-      - name: Verify dashboard built
-        run: docker run --rm --entrypoint test karakos-test:smoke -d /workspace/dashboard/.next
+      - name: Verify dashboard built from the pinned ref
+        if: env.HAS_DASHBOARD_TOKEN == 'true'
+        run: |
+          docker run --rm --entrypoint test karakos-test:smoke -f /workspace/dashboard/.dashboard-ref
+          test "$(docker run --rm --entrypoint cat karakos-test:smoke /workspace/dashboard/.dashboard-ref)" = "$(cat dashboard.ref)"
+
+      # Proves the native modules load in the RUNTIME image: this is the check
+      # that catches a Node ABI or libc mismatch with the build stage.
+      - name: Verify dashboard native modules load
+        if: env.HAS_DASHBOARD_TOKEN == 'true'
+        run: >
+          docker run --rm --entrypoint node karakos-test:smoke -e
+          "require('/workspace/dashboard/node_modules/better-sqlite3');
+          require('/workspace/dashboard/node_modules/sqlite3');
+          console.log('native ok')"
+
+      # Profile gate (5.1): login is served, a household-only route (/system) is 404, the API is closed.
+      - name: Verify dashboard serves the package login page
+        if: env.HAS_DASHBOARD_TOKEN == 'true'
+        run: |
+          docker run -d --name dash --entrypoint bash -p 3000:3000 \
+            -e DASHBOARD_PASSWORD=ci-only -e SESSION_SECRET=ci-only-ci-only-ci-only-ci-only \
+            -e DASHBOARD_PORT=3000 karakos-test:smoke \
+            -c 'cd /workspace/dashboard && exec npx next start -p 3000'
+          for i in $(seq 1 40); do
+            curl -s -o /dev/null http://localhost:3000/login && break || sleep 2
+          done
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:3000/login)" = 200
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:3000/system)" = 404
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:3000/api/agents)" = 401
+          docker rm -f dash
 
       - name: Verify Python dependencies
+        if: env.HAS_DASHBOARD_TOKEN == 'true'
         run: docker run --rm --entrypoint python3 karakos-test:smoke -c "import aiohttp, aiosqlite, discord; print('ok')"
 
       - name: Verify Node.js installed
+        if: env.HAS_DASHBOARD_TOKEN == 'true'
         run: docker run --rm --entrypoint node karakos-test:smoke --version
 
   # Preflight script — tests bin/preflight.sh check logic via Python test suite

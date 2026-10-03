@@ -24,6 +24,7 @@ route table the code actually builds.
 """
 
 import ast
+import os
 import re
 from pathlib import Path
 
@@ -351,7 +352,14 @@ def test_create_agent_script_targets_register():
 # builds. They are deliberately general -- they do not enumerate the four
 # known-bad paths, so the fifth one fails here too.
 
-DASHBOARD_DIR = PACKAGE_ROOT / "dashboard"
+# ANDURIL 5.3: the dashboard source no longer lives in this repo (the image
+# builds karakos-dashboard from a pinned ref). Point KARAKOS_DASHBOARD_SRC at
+# an extracted checkout to run this contract scan; without it these tests skip.
+DASHBOARD_DIR = Path(os.environ.get("KARAKOS_DASHBOARD_SRC") or PACKAGE_ROOT / "dashboard")
+_needs_dashboard_src = pytest.mark.skipif(
+    not DASHBOARD_DIR.exists(),
+    reason="no dashboard source (set KARAKOS_DASHBOARD_SRC to a karakos-dashboard checkout)",
+)
 # The single chokepoint through which the dashboard talks to agent-server.
 # `test_agent_fetch_is_the_only_door` below is what keeps that true; if it
 # ever stops being true, this whole scan goes blind and that test says so.
@@ -522,6 +530,7 @@ def _route_matches(requested, registered):
     return True
 
 
+@_needs_dashboard_src
 def test_the_dashboard_scan_finds_something():
     """A scan that matched nothing would make the check below pass by vacuum
     -- which is exactly how these four bugs survived to begin with."""
@@ -533,6 +542,7 @@ def test_the_dashboard_scan_finds_something():
     )
 
 
+@_needs_dashboard_src
 def test_every_agent_fetch_path_is_readable():
     """Every call site must yield a path this test can check.
 
@@ -548,6 +558,7 @@ def test_every_agent_fetch_path_is_readable():
     )
 
 
+@_needs_dashboard_src
 def test_agent_fetch_is_the_only_door():
     """The scan assumes every agent-server call goes through agentFetch().
 
@@ -569,6 +580,7 @@ def test_agent_fetch_is_the_only_door():
     )
 
 
+@_needs_dashboard_src
 def test_no_dashboard_route_calls_an_unregistered_agent_server_path():
     """Issue #151 itself, generalised.
 
