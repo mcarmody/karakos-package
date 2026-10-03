@@ -192,6 +192,19 @@ def test_restore_survives_unowned_destination_metadata(tmp_path, monkeypatch):
     assert (root / ".env").read_text() == "TOKEN=abc\n"
 
 
+def test_restore_prunes_when_backup_parent_contains_the_data_root(tmp_path):
+    """karakos migrate --restore mounts the backup at /restore, whose parent is /. Protecting
+    the backup's parent then shielded every file, and nothing the run created was pruned."""
+    root = tmp_path / "ws"
+    make_install(root).close()
+    out = bk.backup(root / "data", root / "config", root / "backups")
+    mounted = tmp_path / "restore"          # parent is tmp_path, an ancestor of data/
+    out.rename(mounted)
+    (root / "data" / "build-queue.db").write_text("created by 2.0")
+    bk.restore(mounted)
+    assert not (root / "data" / "build-queue.db").exists()
+
+
 def test_restore_detects_tampered_backup(tmp_path):
     root = tmp_path / "ws"
     make_install(root).close()
