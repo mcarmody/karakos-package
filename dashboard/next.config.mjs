@@ -1,6 +1,8 @@
-import type { NextConfig } from "next";
+// Plain .mjs on purpose: `next start` in the runtime image has no devDependencies,
+// and Next needs `typescript` installed to load a next.config.ts.
 
-const nextConfig: NextConfig = {
+/** @type {import('next').NextConfig} */
+const nextConfig = {
   output: "standalone",
   env: {
     // Operator-set display name (lib/branding.ts).

@@ -92,7 +92,7 @@ COPY --chown=karakos:karakos --from=dashboard-build /app/.next dashboard/.next
 COPY --chown=karakos:karakos --from=dashboard-build /app/node_modules dashboard/node_modules
 COPY --chown=karakos:karakos --from=dashboard-build /app/public dashboard/public
 COPY --chown=karakos:karakos --from=dashboard-build /app/package.json dashboard/package.json
-COPY --chown=karakos:karakos --from=dashboard-build /app/next.config.ts dashboard/next.config.ts
+COPY --chown=karakos:karakos --from=dashboard-build /app/next.config.mjs dashboard/next.config.mjs
 COPY --chown=karakos:karakos --from=workspace-src /src/ ./
 
 # Dashboard runtime config (variables documented in dashboard/README.md).

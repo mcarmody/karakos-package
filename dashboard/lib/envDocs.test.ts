@@ -4,7 +4,7 @@ import { join } from "path";
 
 /** README.md's environment table may only name variables the dashboard reads. */
 const ROOT = join(__dirname, "..");
-const SRC = ["package.json", "app", "lib", "middleware.ts", "next.config.ts"];
+const SRC = ["package.json", "app", "lib", "middleware.ts", "next.config.mjs"];
 
 function files(p: string): string[] {
   const full = join(ROOT, p);

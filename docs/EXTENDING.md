@@ -355,7 +355,7 @@ vendored; changing the dashboard is an ordinary PR to these files.
   [`dashboard/README.md`](../dashboard/README.md) for the environment it reads.
 - **Image:** the `dashboard-build` stage of the `Dockerfile` runs `npm ci` and
   `next build` on `dashboard/`, prunes dev dependencies and keeps `.next`,
-  `node_modules`, `public`, `package.json` and `next.config.ts`; the runtime
+  `node_modules`, `public`, `package.json` and `next.config.mjs`; the runtime
   stage copies those to `/workspace/dashboard`. Node is one `NODE_MAJOR` for the
   build stage and the runtime image so the native modules (`better-sqlite3`,
   `sqlite3`) built in the first load in the second, and the stage fails if

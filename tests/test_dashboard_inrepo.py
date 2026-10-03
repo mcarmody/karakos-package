@@ -31,7 +31,7 @@ def _runtime_stage():
 
 def test_dashboard_source_is_tracked():
     tracked = set(_tracked("dashboard"))
-    for needed in ["dashboard/package.json", "dashboard/package-lock.json", "dashboard/next.config.ts",
+    for needed in ["dashboard/package.json", "dashboard/package-lock.json", "dashboard/next.config.mjs",
                    "dashboard/tsconfig.json", "dashboard/middleware.ts", "dashboard/app/layout.tsx",
                    "dashboard/README.md"]:
         assert needed in tracked, f"{needed} is not tracked"
@@ -194,3 +194,12 @@ def test_docker_smoke_needs_no_secret_and_checks_the_http_contract():
     assert re.search(r"/login\)\" = 200", job)
     assert re.search(r"/api/agents\)\" = 401", job)
     assert re.search(r"-b jar http://localhost:3000/system\)\" = 404", job)
+
+
+def test_next_config_is_plain_javascript():
+    """The runtime image prunes devDependencies, and Next installs `typescript`
+    on the fly (needing network) to load a next.config.ts."""
+    assert not list(DASH.glob("next.config.ts"))
+    assert (DASH / "next.config.mjs").exists()
+    pkg = json.loads((DASH / "package.json").read_text())
+    assert "typescript" not in pkg.get("dependencies", {}), "typescript is a build-time dev dependency"
