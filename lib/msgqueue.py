@@ -41,15 +41,17 @@ def utc_iso(when=None) -> str:
 async def expire(db, shard, now=None) -> int:
     """Skip queued rows past expires_at; tell a waiting caller. Returns count."""
     now = utc_iso(now)
-    cur = await db.execute(
+    # execute_fetchall runs the statement and drains it in one hop to the
+    # connection's thread. With execute() then fetchall() a RETURNING statement
+    # stays pending across an await, and another shard's commit() on the shared
+    # connection fails with "SQL statements in progress".
+    rows = await db.execute_fetchall(
         "UPDATE message_queue SET processed = ?, response = 'expired',"
         " processed_at = CURRENT_TIMESTAMP"
         " WHERE agent = ? AND processed = ? AND expires_at IS NOT NULL"
         " AND expires_at < ?"
         " RETURNING id, call_id, reply_to_agent",
         (STATUS_SKIPPED, shard, STATUS_QUEUED, now))
-    rows = await cur.fetchall()
-    await cur.close()
     for r in rows:
         if r["call_id"] and r["reply_to_agent"]:
             await db.execute(
@@ -90,13 +92,11 @@ async def claim_batch(db, shard, limit, now=None) -> list:
         where = (f"id IN (SELECT id FROM message_queue WHERE agent = ?"
                  f" AND processed = ? AND call_id IS NULL ORDER BY {_ORDER} LIMIT ?)")
         args = (shard, STATUS_QUEUED, limit)
-    cur = await db.execute(
+    rows = await db.execute_fetchall(
         "UPDATE message_queue SET processed = ?, claimed_by = ?,"
         " processing_started_at = CURRENT_TIMESTAMP"
         f" WHERE {where} AND processed = ? RETURNING *",
         (STATUS_IN_PROGRESS, shard, *args, STATUS_QUEUED))
-    rows = await cur.fetchall()
-    await cur.close()
     await db.commit()
     return sorted(rows, key=lambda r: (-(r["priority"] or 0), r["created_at"], r["id"]))
 

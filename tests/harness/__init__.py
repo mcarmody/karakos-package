@@ -34,13 +34,14 @@ FAKE_ENV_KEYS = ("FAKE_CLAUDE_LOG_DIR", "FAKE_CLAUDE_SCRIPT", "FAKE_CLAUDE_QUEUE
                  "FAKE_CLAUDE_MCP_FAILED", "FAKE_CLAUDE_INIT_DELAY_MS")
 
 
-def write_agents_config(workspace: Path, agents) -> None:
+def write_agents_config(workspace: Path, agents, shards=None) -> None:
     """The one place the harness writes agent config. Emits config/agents.yaml
     (validated through lib/registry.py) and, because the server's readers move
     in 1.1b, the legacy agents.json derived from the registry's legacy_view().
     `agents` is a list of ids or {id: registry-schema overrides}; the first is
     the primary, the rest `custom`. A registry needs a monitor, so one is added
-    to the yaml when none is given."""
+    to the yaml when none is given. `shards` maps an agent id to its shard ids
+    (``{"a": ["a", "a-2"]}``); omitted agents get the default shard."""
     import yaml
     sys.path.insert(0, str(PACKAGE_ROOT / "lib"))
     try:
@@ -62,6 +63,8 @@ def write_agents_config(workspace: Path, agents) -> None:
         # the agent's `env:`, resolved from the server env at spawn.
         entries[name]["env"] = {**{k: "${%s}" % k for k in FAKE_ENV_KEYS},
                                 **(entries[name].get("env") or {})}
+        if shards and name in shards:
+            entries[name]["shards"] = [{"id": sid, "channels": []} for sid in shards[name]]
     if not any(e["role"] == "monitor" for e in entries.values()):
         entries["monitor"] = {"name": "monitor", "role": "monitor", "model": "fake-model"}
     config = workspace / "config"
@@ -76,7 +79,7 @@ def write_agents_config(workspace: Path, agents) -> None:
 
 
 class Harness:
-    def __init__(self, tmp_workspace, agents=["a", "b"]):
+    def __init__(self, tmp_workspace, agents=["a", "b"], shards=None):
         from conftest import import_script  # tests/ is on sys.path under pytest
         self.workspace = Path(tmp_workspace)
         self.agents = list(agents)
@@ -87,7 +90,8 @@ class Harness:
         self._import_script = import_script
         self.module = None
         self.client = None
-        write_agents_config(self.workspace, agents)
+        self.shards = dict(shards or {})
+        write_agents_config(self.workspace, agents, self.shards)
         # A 2.0 workspace is stamped; the server refuses to boot otherwise.
         from lib.migrate.guard import write_stamp
         write_stamp(self.workspace / "data")
@@ -220,8 +224,12 @@ class Harness:
         return self._query(
             "SELECT * FROM message_queue WHERE agent = ? ORDER BY id", (shard,))
 
-    def cost_rows(self):
-        return self._query("SELECT * FROM cost_events ORDER BY id")
+    def cost_rows(self, shard=None):
+        """cost_events rows for one shard id, or all when omitted."""
+        if shard is None:
+            return self._query("SELECT * FROM cost_events ORDER BY id")
+        return self._query(
+            "SELECT * FROM cost_events WHERE agent = ? ORDER BY id", (shard,))
 
     def stream_events(self, shard):
         """Raw stream-json events the server tee'd for this shard (for 1.5)."""

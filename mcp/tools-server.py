@@ -36,6 +36,9 @@ AGENT_SERVER_PORT = os.environ.get("AGENT_SERVER_PORT", "18791")
 AGENT_SERVER_URL = os.environ.get("AGENT_SERVER_URL", f"http://localhost:{AGENT_SERVER_PORT}")
 AGENT_SERVER_TOKEN = os.environ.get("AGENT_SERVER_TOKEN", "")
 KARAKOS_AGENT = os.environ.get("KARAKOS_AGENT", "")
+# The shard this process serves (an agent id for a default shard). Runtime state
+# is keyed by it, so it is what the server wants in POST /ask.
+KARAKOS_SHARD = os.environ.get("KARAKOS_SHARD", "")
 
 # Poll cadence while a question is on screen. Short enough that the agent
 # resumes promptly after a click, long enough not to spin.
@@ -478,7 +481,7 @@ def ask_user(args: dict, sleep=time.sleep, monotonic=time.monotonic) -> dict:
     real clock — the test drives the same loop the agent drives, and the
     deadline is real rather than a fixed sleep.
     """
-    agent = args.get("agent") or KARAKOS_AGENT
+    agent = args.get("agent") or KARAKOS_SHARD or KARAKOS_AGENT
     if not agent:
         return {
             "status": "error",
@@ -851,7 +854,7 @@ def handle_core_tool(tool_name: str, args: dict) -> dict:
             # dropped. Identity comes from KARAKOS_AGENT, which
             # bin/agent-server.py sets on the agent subprocess this server
             # is a child of — the same source ask_user uses.
-            agent = (args.get("agent") or KARAKOS_AGENT).strip()
+            agent = (args.get("agent") or KARAKOS_SHARD or KARAKOS_AGENT).strip()
             if not agent:
                 return {"error": "No agent identity (KARAKOS_AGENT unset); "
                                  "cannot finalize a session"}

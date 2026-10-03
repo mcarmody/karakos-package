@@ -95,7 +95,9 @@ def load_script():
 
 
 def pick_step(script, text):
-    agent = os.environ.get("KARAKOS_AGENT", "")
+    # A rule's "agent" regex is matched against the shard id (the agent id for a
+    # default shard).
+    agent = os.environ.get("KARAKOS_SHARD") or os.environ.get("KARAKOS_AGENT", "")
     for rule in script.get("rules", []):
         if rule.get("agent") and not re.search(rule["agent"], agent):
             continue

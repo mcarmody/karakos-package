@@ -166,7 +166,8 @@ def test_endpoints_and_reset(harness):
             agents = {a["name"]: a for a in (await r.json())["agents"]}
             assert agents["a"]["context_tokens"] == 40105
             assert agents["b"]["context_tokens"] == 9105
-            assert agents["a"]["shards"]["a"]["context_tokens"] == 40105
+            assert agents["a"]["shards"][0]["id"] == "a"  # 2.1: /agents shards is a list
+            assert agents["a"]["shards"][0]["context_tokens"] == 40105
             r = await h.client.get("/health", headers=h._headers())
             health = (await r.json())["agents"]
             assert health["a"]["context_tokens"] == 40105
