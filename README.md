@@ -10,7 +10,7 @@ Discord, and remembers you between restarts.**
 
 Karakos is one Docker container. Point it at a Discord server and an Anthropic
 login, and you get an assistant that is always up: it holds a conversation
-across process restarts, keeps episodic memory it can search, tracks what it
+across process restarts, keeps a searchable knowledge graph of what it learns, tracks what it
 spends and stops at a cap you set, and can be extended with your own tools
 without you writing any process-management code.
 
@@ -161,17 +161,11 @@ release and upgrade on your own schedule; the default is `latest`. See
 **Discord.** Message the bot in a channel it watches. That is the main path
 and the one the system is designed around.
 
-**Dashboard** at `http://localhost:3000`:
-
-| Page | What it's for |
-|---|---|
-| `/` | Agent status, uptime, queue depth |
-| `/agents` | Per-agent detail — model, cost, session reset |
-| `/chat` | Talk to an agent in the browser; replies stay out of Discord |
-| `/conversations` | The message feed, filterable |
-| `/costs` | Spend, by agent and by conversation |
-| `/system` | Component health |
-| `/settings` | Configuration viewer |
+**Dashboard** at `http://localhost:3000`: status, chat, costs, conversations and
+the fleet. It is the separate `karakos-dashboard` project, built into the image
+from a pinned commit; its pages are documented there, and the routes it uses are
+in [docs/package-backend-contract.md](docs/package-backend-contract.md). Chat
+replies stay out of Discord.
 
 **Terminal.** `bin/kara` is a small Python CLI that speaks the same HTTP API
 as the dashboard:
@@ -191,8 +185,10 @@ REPL commands: `/health`, `/agents`, `/agent <name>`, `/cost`, `/reset`,
 ## What ships in the box
 
 **Agents.** Two run by default: **primary**, the general-purpose assistant you
-talk to, and **relay**, a cheap monitor that handles heartbeats and system
-notices. Two more are one command away — **builder**, which takes a spec and
+talk to, and the **monitor** (you name it in the wizard), a cheap agent that
+watches heartbeats, drift and stalls and raises alerts. Agents can have several
+**shards** (parallel conversations that share memory) which talk to each other
+through the **hive** (`buzz` and `hive_call`). Two more are one command away — **builder**, which takes a spec and
 opens a pull request, and **reviewer**, which reviews adversarially before
 merge:
 
@@ -208,6 +204,9 @@ are, rather than starting from a blank persona.
 observations) in `data/memory/graph.db`. Each human prompt gets a short recall
 block from it, and top facts load at session start; semantic search runs on
 local embeddings, so recall costs no API calls.
+
+**Delivery.** Discord replies go through a durable **outbox** with retries and an
+audit trail, so a Discord outage delays an answer instead of losing it.
 
 **Cost control.** Every turn's spend is recorded per agent. Daily and monthly
 caps are enforced at the point a message is queued, and warnings post to your
@@ -254,7 +253,7 @@ A Raspberry Pi 4 or 5, a mini PC, or a small VM all work.
 | [DISCORD_SETUP.md](docs/DISCORD_SETUP.md) | Creating and inviting the bot |
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | You want to know how it actually works |
 | [EXTENDING.md](docs/EXTENDING.md) | Adding skills, tools or agents |
-| [UPGRADING.md](docs/UPGRADING.md) | Moving to a new release |
+| [UPGRADING.md](docs/UPGRADING.md) | Moving to a new release, or from 1.x to 2.0 |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Sending a patch |
 
 ---

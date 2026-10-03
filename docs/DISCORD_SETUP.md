@@ -121,9 +121,9 @@ also use to talk to other people. Two per-channel keys in
 ```json
 {
   "channels": {
-    "general": { "id": "...", "default_agent": "amos" },
-    "kitchen": { "id": "...", "default_agent": "amos", "reply_gate": true },
-    "agent-chat": { "id": "...", "default_agent": "amos", "guest_agents": true }
+    "general": { "id": "...", "default_agent": "main" },
+    "kitchen": { "id": "...", "default_agent": "main", "reply_gate": true },
+    "agent-chat": { "id": "...", "default_agent": "main", "guest_agents": true }
   }
 }
 ```
@@ -140,7 +140,7 @@ is heuristic only. Make it an object to let a small model (Haiku) decide the
 messages the heuristics leave open, such as a plain question said to the room:
 
 ```json
-"kitchen": { "id": "...", "default_agent": "amos",
+"kitchen": { "id": "...", "default_agent": "main",
   "reply_gate": { "classifier": "haiku", "context_messages": 6,
                   "min_confidence": 0.7, "timeout_s": 8,
                   "max_per_minute": 4, "max_per_hour": 60 } }
@@ -204,6 +204,9 @@ logged once and treated as off.
 | `reaction_notices` | `false`, `"owner"` (or `true`), `"humans"` | Tells the agent when a person reacts to one of its messages. The agent normally answers `PASS`, which is not posted. One notice per user and message per minute, at most 10 per channel per minute. | Read Message History |
 | `edit_reroute` | `false`, `true`, or `{"window_s": 900, "max_followups": 3}` | When a person edits a message an agent already received: a still-queued message is rewritten in place, otherwise the agent gets a follow-up with the old and new text. An edit after a `PASS` or empty reply is ignored. | Read Message History |
 | `suppress_embeds` | `false`, `true` | Agent text replies and tool lines are posted with link previews suppressed. Ask prompts keep their embeds. Messages already posted are not changed. | none |
+
+`true` for `threads` means `after_s` 60 and `max_lines` 40; `true` for `edit_reroute`
+means `window_s` 900 and `max_followups` 3.
 
 Reaction notices and edits need the relay to be able to read the message, so the
 bot must be able to see the channel's history. Changes to `channels.json` are

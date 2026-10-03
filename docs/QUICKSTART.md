@@ -44,11 +44,13 @@ cd ~/karakos
 
 ## What the wizard asks
 
-Eight steps:
+Eight steps, plus one prompt inside the third:
 
 1. **System name** — what the installation is called
 2. **Owner name** — how the system addresses you
-3. **Primary agent name** — defaults to the system name
+3. **Primary agent name** — defaults to the system name. Right after it the
+   wizard asks for the **monitoring agent's name** (default `monitor`), the
+   cheap agent that watches the system; it must differ from the primary's
 4. **Anthropic login** — opens a browser for `claude login` (OAuth)
 5. **Discord bot** — token, bot user ID, server ID
 6. **Discord channels** — the general and signals channel IDs
@@ -63,7 +65,9 @@ The credentials `claude login` produces live in `~/.claude/` on the host and
 are bind-mounted into the container, so the `claude` CLI inside it inherits
 the same session. You do not log in twice.
 
-The wizard prints a dashboard password at the end. Write it down.
+The wizard prints a dashboard password at the end. Write it down. On a fresh
+install it also stamps the empty data directory as schema 2, so there is nothing
+to migrate ([UPGRADING.md](UPGRADING.md) is for 1.x installs).
 
 ## Start it
 
@@ -110,8 +114,26 @@ own schedule, set `KARAKOS_VERSION=v1.3` in `config/.env`. Releases are tagged
 
 ## Check that it worked
 
-1. **Dashboard** — open `http://localhost:3000`, log in as `admin` with the
-   wizard's password.
+These commands need no Discord token. They take every port and token from
+`config/.env`, so they work whatever ports you chose:
+
+<!-- smoke -->
+```bash
+set -a; . config/.env; set +a
+docker compose -f config/docker-compose.yml --env-file config/.env ps
+curl -fsS -H "Authorization: Bearer $AGENT_SERVER_TOKEN" "http://localhost:$AGENT_SERVER_PORT/health"
+curl -fsS -o /dev/null -w '%{http_code}\n' "http://localhost:$DASHBOARD_PORT/login"
+docker compose -f config/docker-compose.yml --env-file config/.env exec karakos cat data/.schema-version
+```
+
+The container is `running`, `/health` returns `"status": "healthy"` with your
+agents and an `outbox` with `pending` 0, the login page answers `200`, and the
+stamp file names schema 2.
+
+1. **Dashboard** — open `http://localhost:3000` (or your `DASHBOARD_PORT`; the port
+   in `config/.env`) and log in as `admin` with the wizard's password. Sessions last 30
+   days, and the login works over plain `http://`; behind an HTTPS proxy set
+   `KARAKOS_COOKIE_SECURE=1` ([UPGRADING.md](UPGRADING.md#auth-and-env-changes)).
 2. **Discord** — say hello in your general channel. The primary agent should
    answer within a minute.
 3. **Logs** — `make logs` to watch startup.
@@ -159,7 +181,8 @@ Plus the MCP tool server, which the Claude CLI starts as its own child.
 
 ## First things to try
 
-1. Say hello in Discord.
+1. Say hello in the dashboard's `/chat` (no Discord needed), or in Discord once
+   it is set up.
 2. Ask it something that needs a tool — "what's the system health?"
 3. Open `/chat` in the dashboard and talk to the same agent there; replies
    stay in the browser rather than posting to Discord.
@@ -168,6 +191,13 @@ Plus the MCP tool server, which the Claude CLI starts as its own child.
    along with cost warnings and health alerts. It is quiet by design — the
    health sweep posts only when something is wrong, so silence there is good
    news, not a broken hook.
+
+## Adding Discord later
+
+The dashboard and its chat work without Discord. To add it later, create the bot
+([DISCORD_SETUP.md](DISCORD_SETUP.md)), put its token, bot id, server id and
+channel ids in `config/.env` (the names are in `config/.env.template`), and
+restart with `make down` then `make up`.
 
 ## Adding the coding stack
 
@@ -216,6 +246,14 @@ primary agent's model is set in its config under `agents/`.
 **Something is wrong with Docker or WSL.**
 `make preflight` names the specific problem and the fix, which beats reading
 logs.
+
+**The container exits with code 78.** The schema-stamp guard refused to start.
+On a **fresh install** this should not happen: it means `data/` already held files
+from somewhere else (an earlier install's leftovers in the volume). Remove the
+volume only if you do not need what is in it (`make down`, then
+`docker compose -f config/docker-compose.yml --env-file config/.env down -v`).
+On an **old (1.x) install** it means the data has not been migrated: follow
+[UPGRADING.md](UPGRADING.md); a restart cannot fix it.
 
 **Startup fails complaining that `data/`, `logs/` or `inbox/` is not
 writable.** A previous run left root-owned Docker volumes behind. `make down`,

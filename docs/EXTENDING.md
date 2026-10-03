@@ -180,6 +180,14 @@ global. Tests must not read `HOME`, bind real ports or touch Discord;
 `tests/test_no_home_access.py` enforces this. The `Harness` signatures are
 frozen by `tests/test_harness_api.py`.
 
+**Known load flakes.** Under full-suite load a few harness tests have timed out
+and then passed alone or on rerun: `test_depth_cap_two_for_calls` and
+`test_two_shards_calling_each_other_is_refused_at_once` (hive timeouts, in
+`tests/test_hive_harness.py`) and `test_no_boundary_runs_as_next_turn` (a
+`wait_for` in `tests/test_steering_harness.py`). They are timing sensitivity, not
+logic failures: rerun the test alone before treating one as a regression, and
+give a new harness wait a generous timeout.
+
 ## Using the Builder Agent
 
 The builder agent receives specs as markdown files in its inbox and implements them on feature branches.
@@ -415,6 +423,11 @@ want to edit:
 | `WORKSPACE_ROOT` | `/workspace` in the container |
 | `KARAKOS_VERSION` | Image tag to run, default `latest` |
 | `TZ` | Container timezone — the scheduler's clock times are in it |
+| `SYSTEM_NAME` / `OWNER_NAME` | The installation's name and the owner's name, used in prompts |
+| `KARAKOS_ENV` | `production` makes `KARAKOS_ENV_PASSTHROUGH` and `KARAKOS_SKIP_STAMP_CHECK` refused |
+| `KARAKOS_ENV_PASSTHROUGH` | `1` lets agent subprocesses inherit the server environment (debugging only) |
+| `KARAKOS_SKIP_STAMP_CHECK` | `1` skips the schema-stamp check (tests only) |
+| `KARAKOS_COOKIE_SECURE` / `SESSION_MAX_AGE_SECONDS` | Read by the pinned dashboard, not by this repository: `Secure` session cookie and session lifetime ([UPGRADING.md](UPGRADING.md#auth-and-env-changes)) |
 
 **Cost and capacity:**
 
@@ -423,6 +436,7 @@ want to edit:
 | `COST_DAILY_LIMIT` / `COST_MONTHLY_LIMIT` | Spend caps in USD, enforced when a message is queued |
 | `COST_WARNING_THRESHOLD` | Fraction of a cap that triggers a warning, default 0.75 |
 | `MAX_CONCURRENT_BUILDERS` / `MAX_CONCURRENT_REVIEWERS` | Parallel dispatches |
+| `KARAKOS_REPLY_CLASSIFIER` | `off` disables the reply gate's classifier tier install-wide ([DISCORD_SETUP.md](DISCORD_SETUP.md#shared-channels-optional)) |
 | `GUEST_TURN_LIMIT` | Turns a bot author may consume, default 12 |
 | `DISCORD_POST_MAX_ATTEMPTS` | Per-chunk tries for incidental posts (tool lines, notices), default 3 |
 | `DISCORD_OUTBOX_MAX_ATTEMPTS` / `DISCORD_OUTBOX_MAX_AGE_S` | Outbox retries (default 12) and age limit (default 86400 s) before a reply is marked dead |
@@ -431,6 +445,7 @@ want to edit:
 
 | Variable | Description |
 |---|---|
+| `STREAM_LOG_RETENTION_DAYS` / `HANDOFF_TURN_TIMEOUT_S` | Raw stream-log retention (default 7) and the wait for a context-handoff turn |
 | `MEMORY_DECAY_RATE` | Episode importance decay per pass (0–1), applied from `base_importance` |
 | `MEMORY_CUTOFF` | Importance below which an episode is eligible to be dropped |
 | `MEMORY_PRUNE_GRACE_DAYS` | Days an episode is protected from pruning regardless of score, measured from `inserted_at`; default 7 |
@@ -553,18 +568,27 @@ object to that agent's entry in `config/agents.yaml`:
 
 ```yaml
 agents:
-  researcher:
-    name: researcher
+  helper:
+    name: helper
     role: custom
-    system_prompt: agents/researcher/SYSTEM_PROMPT.md
     env:
       ANTHROPIC_SMALL_FAST_MODEL: claude-haiku-4-5
+      GITHUB_TOKEN: ${GITHUB_TOKEN}
 ```
 
-`bin/agent-server.py` layers this onto its own environment (not a
-replacement) when spawning that agent's subprocess, so the agent still
-inherits `WORKSPACE_ROOT`, API credentials, etc. An agent with no `env` key
-spawns exactly as before this feature existed (`env=None`, plain inherit).
+A subprocess's environment is built from nothing (`lib/spawn_env.py`): an
+allowlist of inert names from the server (`PATH`, `HOME`, locale, proxy and CA
+settings, `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CONFIG_DIR`,
+`LC_*`, `XDG_*`), then this agent's `env:`, then the server's own identity
+variables. `${NAME}` as a whole value is resolved from the server environment at
+spawn; an unset name logs a warning and the key is left out. Hooks, MCP servers
+and shell commands the agent runs inherit exactly this, so a skill that reads a
+token must have the agent's `env:` name it. `KARAKOS_ENV_PASSTHROUGH=1` restores
+the old inherit-everything behaviour for debugging and is refused when
+`KARAKOS_ENV=production`. `AGENT_SERVER_TOKEN` is the one secret that is still
+passed to every agent subprocess (see
+[ARCHITECTURE.md](ARCHITECTURE.md#credentials)). A skill author's rule of thumb:
+document the variables your tool reads so operators can add them.
 
 ### Mid-turn tool activity lines
 
@@ -583,10 +607,10 @@ default.** To silence it for an agent, set `tool_streaming` in that agent's
 
 ```yaml
 agents:
-  researcher:
-    name: researcher
+  helper:
+    name: helper
     role: custom
-    system_prompt: agents/researcher/SYSTEM_PROMPT.md
+    system_prompt: agents/helper/SYSTEM_PROMPT.md
     tool_streaming: false
 ```
 
@@ -606,6 +630,234 @@ channel, so the summary is an allow-list rather than a best-effort dump.
 
 Agents running with `channel_id` `"0"` (the local/headless lane) post
 nothing, as with every other Discord surface.
+
+## Shards
+
+A shard is one `claude` subprocess of an agent. An agent with no `shards:` key
+has one shard whose id **equals the agent id**, which is why history, queue rows
+and sessions from before shards existed carry over unchanged. To add a shard,
+list shards explicitly and keep the first one's id the agent's id:
+
+```yaml
+agents:
+  main:
+    name: Main
+    role: primary
+    shards:
+      - id: main
+        channels: [general]
+      - id: main-ops
+        channels: [ops]
+```
+
+- Shard ids match `^[a-z][a-z0-9-]{0,31}$`, are unique across the registry and
+  may not equal another agent's id. Channels are names from `config/channels.json`;
+  **a channel belongs to at most one shard** (the registry refuses the file
+  otherwise), and the relay routes by that ownership
+  ([Routing](#routing)).
+- Optional per-shard prompt text lives in `agents/<id>/shards/<shard-id>.md`
+  (`agents/templates/shard.md` is a starting point). Sibling shards share the
+  agent's memory graph and files.
+- Apply with `POST /agents/<id>/reload` (or `/reload`); the relay re-reads the
+  registry, so it needs no restart.
+- **Every piece of per-conversation runtime state is keyed by shard id**: queue
+  rows, sessions, cost rows, states, locks, pauses, handoff notes. Account-level
+  facts (the rate-limit breaker) are not keyed by shard or agent.
+
+**Memory per process.** Each shard is a separate `claude` process, so memory
+grows with shard count. There is no figure to quote: measure your own. `docker
+stats` shows the container's total; the image has no `ps`, so per-process
+resident memory comes from `/proc` inside it:
+
+```bash
+docker stats --no-stream
+docker compose -f config/docker-compose.yml --env-file config/.env exec karakos bash -c 'for d in /proc/[0-9]*; do c=$(tr "\0" " " < $d/cmdline); case "$c" in *[c]laude*) echo "${d#/proc/} $(grep VmRSS $d/status) ${c:0:60}";; esac; done'
+```
+
+Each line is one `claude` process: its pid, its resident memory (`VmRSS`, in
+kB) and the start of its command line.
+
+## The hive
+
+Shards talk to each other through two MCP tools (`mcp/tools-server.py`):
+
+- **`buzz`**: leave a message for another shard (an agent id or a shard id) and
+  carry on; the recipient handles it as an ordinary turn and no result comes
+  back. At most five per turn.
+- **`hive_call`**: ask a shard a question and block the turn until the answer
+  arrives. Use it only when you cannot continue without the answer.
+
+Limits live in `lib/hive.py`: calls nest at most **two deep** (`HIVE_MAX_DEPTH`);
+a shard cannot call itself or a shard already waiting on it; the default timeout
+is 120 s, clamped to 5 to 900 s; a call that is never picked up expires and the
+caller gets an `expired` reply; a paused callee returns `callee_paused`. The
+HTTP side is `POST /hive/buzz`, `POST /hive/call`, `GET /hive/call/{call_id}`,
+`POST /hive/call/{call_id}/cancel`. **The call log** is `GET /hive/calls`
+([hive-call-log.md](hive-call-log.md)).
+
+Two per-agent settings in `config/agents.yaml` shape throughput:
+
+```yaml
+agents:
+  main:
+    work_stealing: {enabled: false, after_s: 5, max_rows: 5}   # idle shards take rows waiting behind a busy sibling
+    steering: {enabled: true, coalesce_ms: 300, max_lines_per_turn: 8}  # messages that arrive mid-turn are written to the running turn
+```
+
+## Memory
+
+Durable memory is the knowledge graph (`data/memory/graph.db`, code in
+`lib/graph`); [ARCHITECTURE.md](ARCHITECTURE.md#memory) describes the store.
+Agents use two MCP tools:
+
+- **`memory`**: `write` (a fact, episode or pattern, optionally about a named
+  subject), `recall` (ranked search with one hop of linked entities; modes
+  `auto`, `keyword`, `recent`) and `status`. The older `remember`, `facts` and
+  `recent` actions remain as deprecated aliases.
+- **`graph`**: read and write entities and edges directly.
+
+A nightly consolidation job (`lib/monitor_jobs/memory_consolidate.py`; run by
+hand with `bin/graph-consolidate.py --dry-run`) builds episodes from the day's
+messages, decays and archives them, merges duplicates and backfills embeddings.
+
+**The recall override.** `config/recall-source` (or `KARAKOS_RECALL_SOURCE`)
+**replaces** the graph recall in the per-prompt hook; it does not add to it. A
+source written against 1.x that read `memory.db` finds nothing on 2.0.
+
+## Prompts
+
+An agent's system prompt is composed (`lib/prompt_compose.py`) from, in order:
+the shared core (`agents/CORE.md`), the agent section
+(`agents/<id>/SYSTEM_PROMPT.md`), optional shard text, and the fleet house style
+(`agents/HOUSE_STYLE.md`) last. Registry control, per agent:
+
+```yaml
+agents:
+  main:
+    prompt:
+      section: agents/main/SYSTEM_PROMPT.md
+      core: true
+      house_style: true
+```
+
+If the section holds a line `<!-- core:insert -->`, the core is spliced there
+instead of at the top. Generated blocks are wrapped in
+`<!-- begin:core -->` / `<!-- end:core -->` and the `house-style` equivalent;
+they are stripped before composing, so composing twice is idempotent.
+Placeholders (`{{AGENT_NAME}}`, `{{SYSTEM_NAME}}`, `{{OWNER_NAME}}`,
+`{{CHANNELS}}`, `{{OTHER_AGENTS}}`, `{{SHARD_ID}}`) are filled at compose time.
+
+- **Renaming a display name** (`name:`) is a manual edit of `config/agents.yaml`
+  followed by a session reset. **An agent id cannot be renamed**: it keys every
+  row.
+- **Adopting the 2.0 templates** (`agents/templates/primary.md`, `monitor.md`) on
+  an upgraded install is opt-in: copy the template, point `prompt.section` at
+  it, and, for the monitor, accept that its prompt, tool deny list and limits
+  come with it. An existing monitor keeps its own prompt until you do.
+- **The reset rule.** A resumed session ignores a changed system prompt. After
+  editing a prompt, `/reset` the agent (`reload` keeps the old one).
+
+## Build queue
+
+`config/build-queue.yaml` is off by default (`enabled: false`): briefs dropped in
+`inbox/builder/` and `inbox/reviewer/` are then run directly. With `enabled:
+true` they are queued, with priority, per-host concurrency, an admission probe,
+cancel and a bounded retry; `bin/buildq` is the operator CLI. Keys:
+`default_host`, `hosts` (each `kind: local|ssh`, `concurrency`, `target`,
+`workdir`, `probe`, `min_free_ram_mb`, `max_load1`, `repo_url`), `roles`,
+`cost_ceiling_usd` (applies to ssh runs only), `retry`, `governor`,
+`unreachable_grace_s`. Host names, ssh targets and probe commands come only from
+this file, never from a brief.
+
+**Provisioning a remote build host.** The dispatcher pipes `bin/build-runner.sh`
+to the host over ssh. The host needs `bash`, `git`, the `claude` CLI and, for
+builds, `gh`, installed for the ssh user, and an ssh alias or destination that
+works non-interactively. **Credentials are the remote's own; none are
+forwarded**: `git` and `gh` use whatever the remote user is logged in with.
+
+## What survives an upgrade
+
+These are the seams that stay yours across image upgrades:
+
+| Seam | Behaviour |
+|---|---|
+| `config/agents.yaml` | The registry warns on unknown keys instead of failing |
+| `prompt:` per agent | Your section file stays; core and house style are flags |
+| `config/hooks.json` | `bin/hooks-sync.py` rebuilds only the hooks under `system/hooks/`; hooks you added to `config/claude-settings.json` are preserved |
+| `skills/` | Discovered at startup; yours are untouched |
+| `config/channels.json` | Keys you add (`route`, `ux`, `reply_gate`, ...) are read when present and ignored when not |
+| `config/monitor.yaml`, `config/governor.yaml`, `config/build-queue.yaml` | Optional files with built-in defaults when absent; the migrator creates `build-queue.yaml` only when it is missing and never overwrites it |
+
+The [stability contract](#release20-stability-contract) says what else is stable.
+
+**Queue database reads.** `data/memory/agent-server.db` is in rollback-journal
+mode, so a read cursor left open across an `await` blocks every writer. In code
+that touches the queue, read with one-hop `await db.execute_fetchall(...)` and
+write with `msgqueue.write_commit(...)`; never `async with db.execute(...)`
+followed by `fetchone()` across awaits, and never hold an unexhausted cursor.
+
+## Native deployments (not supported, lessons)
+
+Docker plus supervisord is the supported deployment. A native one has to supply
+what the container supplies. The lessons:
+
+1. **Order units with `Wants=` plus `After=`, never `BindsTo=`.** `BindsTo=`
+   stops the dependent unit whenever the dependency stops or restarts, so
+   restarting the agent server takes the relay and scheduler down with it and a
+   failed start cascades. `Wants=` plus `After=` starts them in order and lets
+   each survive the other's restart and reconnect.
+2. **Run as a non-root user.** The CLI refuses `--dangerously-skip-permissions`
+   as root.
+3. **Set `PATH` or the CLI path explicitly.** systemd's `PATH` does not include
+   the directory the CLI installs to; put it in the unit or an `EnvironmentFile`.
+4. **Handle exit 78.** The schema-stamp guard exits 78 and a restart loop cannot
+   fix it: add `RestartPreventExitStatus=78` and run
+   `python3 lib/migrate/guard.py check data` in `ExecStartPre=`.
+5. **Give `TimeoutStopSec` at least the compose `stop_grace_period` (45 s)** so
+   agents finalize sessions.
+6. **Use `KillMode=control-group`** so tool processes an agent started die with
+   the service. Never restart by pattern-matching `claude` with `pkill`: it kills
+   every agent's process. Stop the unit.
+7. **Set `WORKSPACE_ROOT` and the working directory explicitly.**
+
+An example, not shipped as files; paths and user are placeholders:
+
+```text
+# /etc/systemd/system/karakos-agent-server.service
+[Unit]
+Description=Karakos agent server
+After=network-online.target
+
+[Service]
+User=karakos
+WorkingDirectory=/opt/karakos
+Environment=WORKSPACE_ROOT=/opt/karakos
+EnvironmentFile=/opt/karakos/config/.env
+Environment=PATH=/opt/karakos/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStartPre=/usr/bin/python3 /opt/karakos/lib/migrate/guard.py check /opt/karakos/data
+ExecStart=/usr/bin/python3 /opt/karakos/bin/agent-server.py
+Restart=on-failure
+RestartPreventExitStatus=78
+TimeoutStopSec=45
+KillMode=control-group
+
+# /etc/systemd/system/karakos-relay.service  (the scheduler is the same shape)
+[Unit]
+Description=Karakos relay
+Wants=karakos-agent-server.service
+After=karakos-agent-server.service
+
+[Service]
+User=karakos
+WorkingDirectory=/opt/karakos
+Environment=WORKSPACE_ROOT=/opt/karakos
+EnvironmentFile=/opt/karakos/config/.env
+ExecStart=/usr/bin/python3 /opt/karakos/bin/relay.py
+Restart=on-failure
+RestartPreventExitStatus=78
+TimeoutStopSec=45
+KillMode=control-group
+```
 
 ## Review checklist
 
@@ -648,8 +900,8 @@ data directory is a fresh install and is stamped (`guard.py stamp --fresh`).
 when `KARAKOS_ENV=production`.
 
 **Boot code may only check the stamp, never alter data.** The migrator
-(`python3 -m lib.migrate [--dry-run|--auto|--force|--to-backup DIR]`, wrapper
-`bin/karakos-migrate`) is the only writer of 1.x data. It detects the version
+(`python3 -m lib.migrate [--dry-run|--auto|--force|--backup-to DIR|--to-backup DIR]`, wrapper
+`bin/karakos-migrate`; the host command is `bin/karakos migrate`) is the only writer of 1.x data. It detects the version
 (read-only fingerprints, `detect.py`), takes a backup (`backup.py`, sqlite
 online backup plus a hashed `MANIFEST.json`), runs each applicable step in
 `lib/migrate/steps/NN_name.py` order, verifies each, and writes the stamp last.
@@ -659,9 +911,19 @@ no `--force`), 78 guard.
 
 A step module exposes `STEP = Step(name, from_schema, to_schema, detect, apply, verify)`.
 
+Contributor rules: runtime state is keyed by shard id, and **only
+`lib/migrate/steps/` mutates existing data**; boot may check the stamp and create
+files that did not exist.
+
 | Step | Owns |
 |------|------|
-| 1.1b | config (agents.json to agents.yaml) |
-| 1.2  | queue schema |
-| 1.5  | sessions schema |
-| 4.4  | memory |
+| `05_layout` | compose file and `.env` rewrite (originals kept as `.pre-2.0`), `logs/` and `inbox/` import |
+| `10_registry` | config: `agents.json` to `agents.yaml`, prompt flags, hooks sync |
+| `12_monitor` | the default monitor's 2.0 template |
+| `20_queue` | queue schema |
+| `30_sessions` | sessions schema |
+| `35_rate_limit` | rate-limit table re-keyed by window type |
+| `40_memory` | `memory.db` to `graph.db` (the only code that opens `memory.db`) |
+| `50_build_queue` | build queue database and config |
+| `60_outbox` | dead-letter file to outbox `dead` rows |
+| `90_stamp` | integrity check before the runner writes the stamp |

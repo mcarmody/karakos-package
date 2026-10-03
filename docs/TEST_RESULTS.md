@@ -1,5 +1,10 @@
 # Karakos Package — Integration Test Results
 
+> **Historical record.** This file is the validation record of the 1.0 package
+> (March 2026). It describes 1.0 behaviour and is kept as it was; it is not
+> maintained for later releases. For what the code does now, read
+> [ARCHITECTURE.md](ARCHITECTURE.md) and [UPGRADING.md](UPGRADING.md).
+
 **Test Date:** 2026-03-30
 **Version:** 1.0.0
 **Test Environment:** Phase 5 validation against acceptance criteria
