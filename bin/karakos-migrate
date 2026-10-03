@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Wrapper: karakos-migrate [--dry-run|--auto|--force|--to-backup DIR]
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+exec python3 -m lib.migrate "$@"

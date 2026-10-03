@@ -51,6 +51,16 @@ EOF
     exit 1
 fi
 
+# Schema stamp: refuse to start on unstamped (1.x) or too-old data BEFORE
+# anything below creates files in data/. Exit 78 with a "run: karakos migrate"
+# message. A genuinely empty data dir is a fresh install and is stamped here
+# (the migrator is the only writer of 1.x data; an empty dir holds none).
+PKG_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [ "${KARAKOS_SKIP_STAMP_CHECK:-}" != "1" ] || [ "${KARAKOS_ENV:-}" = "production" ]; then
+    python3 "$PKG_ROOT/lib/migrate/guard.py" check "$WORKSPACE_ROOT/data" || exit $?
+    python3 "$PKG_ROOT/lib/migrate/guard.py" stamp --fresh "$WORKSPACE_ROOT/data" || exit $?
+fi
+
 # Ensure data directories exist
 mkdir -p \
     "$WORKSPACE_ROOT/data/messages" \

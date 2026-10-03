@@ -569,3 +569,32 @@ For downstream forks tracking `release/2.0`:
   hook file names, MCP tool names.
 - Small portable fixes submitted by forks are welcome on `release/2.0` now;
   landing them early lets forks rebase once.
+
+## lib/migrate (schema stamp and migrator)
+
+`data/.schema-version` (`{"schema": 2, "package": "2.0.0", "migrated_from": ..., "stamped_at": ...}`)
+marks a data directory as 2.0. `bin/entrypoint.sh` and `bin/agent-server.py`
+call `lib/migrate/guard.py: require_stamp` before touching any data and exit
+78 on an unstamped non-empty directory or an older schema. An empty or absent
+data directory is a fresh install and is stamped (`guard.py stamp --fresh`).
+`KARAKOS_SKIP_STAMP_CHECK=1` bypasses the check for tests only and is refused
+when `KARAKOS_ENV=production`.
+
+**Boot code may only check the stamp, never alter data.** The migrator
+(`python3 -m lib.migrate [--dry-run|--auto|--force|--to-backup DIR]`, wrapper
+`bin/karakos-migrate`) is the only writer of 1.x data. It detects the version
+(read-only fingerprints, `detect.py`), takes a backup (`backup.py`, sqlite
+online backup plus a hashed `MANIFEST.json`), runs each applicable step in
+`lib/migrate/steps/NN_name.py` order, verifies each, and writes the stamp last.
+A failed step leaves the stamp absent and prints the backup path and restore
+command. Exit codes: 0 ok, 1 step failed, 2 usage, 3 refused (unknown schema,
+no `--force`), 78 guard.
+
+A step module exposes `STEP = Step(name, from_schema, to_schema, detect, apply, verify)`.
+
+| Step | Owns |
+|------|------|
+| 1.1b | config (agents.json to agents.yaml) |
+| 1.2  | queue schema |
+| 1.5  | sessions schema |
+| 4.4  | memory |

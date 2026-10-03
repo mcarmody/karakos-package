@@ -16,6 +16,7 @@ import glob
 import json
 import os
 import sqlite3
+import sys
 import time
 from pathlib import Path
 
@@ -23,6 +24,7 @@ HARNESS_DIR = Path(__file__).resolve().parent
 FAKE_BIN_DIR = HARNESS_DIR / "bin"
 PACKAGE_ROOT = HARNESS_DIR.parent.parent
 DEFAULT_TOKEN = "harness-token"
+sys.path.insert(0, str(PACKAGE_ROOT))  # lib.migrate
 
 _ENV_KEYS = ("PATH", "WORKSPACE_ROOT", "AGENT_SERVER_TOKEN", "FAKE_CLAUDE_LOG_DIR",
              "FAKE_CLAUDE_SCRIPT", "DISCORD_BOT_TOKEN", "OWNER_DISCORD_ID")
@@ -59,6 +61,9 @@ class Harness:
         self.module = None
         self.client = None
         write_agents_config(self.workspace, agents)
+        # A 2.0 workspace is stamped; the server refuses to boot otherwise.
+        from lib.migrate.guard import write_stamp
+        write_stamp(self.workspace / "data")
         self.script()
 
     # -- lifecycle ---------------------------------------------------------
