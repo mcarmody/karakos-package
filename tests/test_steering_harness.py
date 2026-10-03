@@ -438,6 +438,8 @@ def test_agent_level_disable_is_per_agent(harness):
 
     async def scenario():
         async with h:
+            # The fake writes argv a beat after the spawn: wait for both.
+            await h.wait_for(lambda: h.argv("a") is not None and h.argv("b") is not None)
             assert "--replay-user-messages" in h.argv("a")
             assert "--replay-user-messages" not in h.argv("b")
             await h.send("b", "A-msg")

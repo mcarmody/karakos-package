@@ -1103,7 +1103,7 @@ async def respawn_watcher(shard: str, proc: asyncio.subprocess.Process):
         await start_agent_subprocess(shard)
         if turn_loop.steering_on(STATE, shard):
             # Released steered rows are queued again: deliver them to the new process.
-            asyncio.create_task(turn_loop.drain_shard(STATE, shard))
+            turn_loop.spawn(STATE, turn_loop.drain_shard(STATE, shard))
 
     await notify_respawn(shard, f"the subprocess exited unexpectedly (code {returncode})")
 
@@ -1900,12 +1900,16 @@ async def write_turn_event(message_ids: List[str], seq: int, kind: str, content:
     if not message_ids or db is None:
         return
     try:
-        for mid in message_ids:
-            await db.execute(
-                "INSERT INTO turn_events (message_id, seq, kind, content) VALUES (?, ?, ?, ?)",
-                (mid, seq, kind, content),
-            )
-        await db.commit()
+        def job(conn):
+            try:
+                conn.executemany(
+                    "INSERT INTO turn_events (message_id, seq, kind, content) VALUES (?, ?, ?, ?)",
+                    [(mid, seq, kind, content) for mid in message_ids])
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+        await db._execute(job, db._conn)  # one hop: no write lock held across an await
     except Exception as e:
         log.warning(f"turn_events insert failed: {e}")
 
@@ -3820,7 +3824,7 @@ async def begin_reset(shard, reason):
             elif await _run_compact(shard):
                 sp.inflight.pop(shard, None)
                 sp.last_reset_at[shard] = time.time()
-                asyncio.create_task(turn_loop.drain_shard(STATE, shard))
+                turn_loop.spawn(STATE, turn_loop.drain_shard(STATE, shard))
                 return
         with_handoff = (
             reason != sp_lib.REASON_OVERFLOW
@@ -3896,7 +3900,7 @@ async def do_reset(shard):
     finally:
         sp.resetting.pop(shard, None)
     # Queued human rows run on the fresh session.
-    asyncio.create_task(turn_loop.drain_shard(STATE, shard))
+    turn_loop.spawn(STATE, turn_loop.drain_shard(STATE, shard))
 
 
 # =============================================================================
@@ -4051,6 +4055,7 @@ async def graceful_shutdown(sig):
 
     # No summarizer and no handoff turn here: the stop timeout cannot hold a
     # model turn. Sessions persist and the next boot resumes them.
+    await turn_loop.cancel_background(STATE)
     # Kill subprocesses
     log.info("Terminating agent subprocesses...")
     for agent in list(agent_processes.keys()):
@@ -4148,6 +4153,10 @@ async def startup(app):
 async def shutdown(app):
     """Cleanup on shutdown"""
     log.info("Server shutdown initiated")
+
+    # Background drain/steal/steer tasks first: none may touch the db or a
+    # process after they are closed.
+    await turn_loop.cancel_background(STATE)
 
     # Kill all subprocesses
     for agent in list(agent_processes.keys()):

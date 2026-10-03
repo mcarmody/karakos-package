@@ -47,6 +47,27 @@ def utc_iso(when=None) -> str:
     return when.strftime(_TS)
 
 
+async def write_commit(db, sql, params=(), fetch=False):
+    """Run one write statement and commit it in a single hop to the
+    connection's thread; returns (rows, rowcount). `execute()` then `commit()`
+    is two hops, and between them the connection holds SQLite's write lock while
+    waiting on the event loop. Anything that blocks the loop in that gap
+    (a synchronous writer sharing the file, as the harness tests have) can never
+    be answered by our own commit, and waits out its whole busy timeout."""
+    def job(conn):
+        try:
+            cur = conn.execute(sql, params)
+            rows = cur.fetchall() if fetch else None
+            n = cur.rowcount
+            cur.close()
+            conn.commit()
+            return rows, n
+        except BaseException:
+            conn.rollback()
+            raise
+    return await db._execute(job, db._conn)
+
+
 async def expire(db, shard, now=None) -> int:
     """Skip queued rows past expires_at; tell a waiting caller. Returns count."""
     now = utc_iso(now)
@@ -54,25 +75,32 @@ async def expire(db, shard, now=None) -> int:
     # connection's thread. With execute() then fetchall() a RETURNING statement
     # stays pending across an await, and another shard's commit() on the shared
     # connection fails with "SQL statements in progress".
-    rows = await db.execute_fetchall(
-        "UPDATE message_queue SET processed = ?, response = 'expired',"
-        " processed_at = CURRENT_TIMESTAMP"
-        " WHERE agent = ? AND processed = ? AND expires_at IS NOT NULL"
-        " AND expires_at < ?"
-        " RETURNING id, call_id, reply_to_agent",
-        (STATUS_SKIPPED, shard, STATUS_QUEUED, now))
-    for r in rows:
-        if r["call_id"] and r["reply_to_agent"]:
-            await db.execute(
-                "INSERT OR IGNORE INTO message_queue"
-                " (agent, channel, channel_id, server, author, author_id, is_bot,"
-                "  content, message_id, call_id, owner_agent)"
-                " VALUES (?, 'call', '0', 'local', ?, '0', 1, ?, ?, ?, ?)",
-                (r["reply_to_agent"], shard,
-                 json.dumps({"error": "expired", "call_id": r["call_id"]}),
-                 f"expired-{r['call_id']}-{r['id']}", r["call_id"],
-                 r["reply_to_agent"]))
-    await db.commit()
+    def job(conn):
+        try:
+            rows = conn.execute(
+                "UPDATE message_queue SET processed = ?, response = 'expired',"
+                " processed_at = CURRENT_TIMESTAMP"
+                " WHERE agent = ? AND processed = ? AND expires_at IS NOT NULL"
+                " AND expires_at < ?"
+                " RETURNING id, call_id, reply_to_agent",
+                (STATUS_SKIPPED, shard, STATUS_QUEUED, now)).fetchall()
+            for r in rows:
+                if r["call_id"] and r["reply_to_agent"]:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO message_queue"
+                        " (agent, channel, channel_id, server, author, author_id, is_bot,"
+                        "  content, message_id, call_id, owner_agent)"
+                        " VALUES (?, 'call', '0', 'local', ?, '0', 1, ?, ?, ?, ?)",
+                        (r["reply_to_agent"], shard,
+                         json.dumps({"error": "expired", "call_id": r["call_id"]}),
+                         f"expired-{r['call_id']}-{r['id']}", r["call_id"],
+                         r["reply_to_agent"]))
+            conn.commit()
+            return rows
+        except BaseException:
+            conn.rollback()
+            raise
+    rows = await db._execute(job, db._conn)
     if rows:
         for target in {r["reply_to_agent"] for r in rows
                        if r["call_id"] and r["reply_to_agent"]}:
@@ -103,12 +131,12 @@ async def claim_batch(db, shard, limit, now=None) -> list:
                  f" AND processed = ? AND call_id IS NULL"
                  f" AND channel != '{INTERNAL_CHANNEL}' ORDER BY {_ORDER} LIMIT ?)")
         args = (shard, STATUS_QUEUED, limit)
-    rows = await db.execute_fetchall(
+    rows, _ = await write_commit(
+        db,
         "UPDATE message_queue SET processed = ?, claimed_by = ?,"
         " processing_started_at = CURRENT_TIMESTAMP"
         f" WHERE {where} AND processed = ? AND {_NOT_REPLY} RETURNING *",
-        (STATUS_IN_PROGRESS, shard, *args, STATUS_QUEUED))
-    await db.commit()
+        (STATUS_IN_PROGRESS, shard, *args, STATUS_QUEUED), fetch=True)
     return sorted(rows, key=lambda r: (-(r["priority"] or 0), r["created_at"], r["id"]))
 
 
@@ -119,7 +147,8 @@ async def claim_steerable(db, shard, channel_id, limit, now=None) -> list:
     expired row. Returns exactly the rows this caller now owns, in dispatch
     order."""
     await expire(db, shard, now)
-    rows = await db.execute_fetchall(
+    rows, _ = await write_commit(
+        db,
         "UPDATE message_queue SET processed = ?, claimed_by = ?,"
         " processing_started_at = CURRENT_TIMESTAMP"
         " WHERE id IN (SELECT id FROM message_queue WHERE agent = ? AND processed = ?"
@@ -128,8 +157,7 @@ async def claim_steerable(db, shard, channel_id, limit, now=None) -> list:
         f" AND channel_id = ? ORDER BY {_ORDER} LIMIT ?)"
         " AND processed = ? RETURNING *",
         (STATUS_IN_PROGRESS, shard, shard, STATUS_QUEUED, str(channel_id),
-         int(limit), STATUS_QUEUED))
-    await db.commit()
+         int(limit), STATUS_QUEUED), fetch=True)
     return sorted(rows, key=lambda r: (r["created_at"], r["id"]))
 
 
@@ -178,7 +206,8 @@ async def claim_stolen(db, thief, victim, limit, min_age_s, now=None) -> list:
               "q": STATUS_QUEUED, "ip": STATUS_IN_PROGRESS,
               "now_epoch": int(now_dt.timestamp()),
               "cutoff": _age_cutoff(now_dt, min_age_s)}
-    rows = await db.execute_fetchall(
+    rows, _ = await write_commit(
+        db,
         "UPDATE message_queue SET processed = :ip, claimed_by = :thief,"
         " processing_started_at = CURRENT_TIMESTAMP"
         " WHERE id IN (SELECT m.id FROM message_queue m"
@@ -194,8 +223,7 @@ async def claim_stolen(db, thief, victim, limit, min_age_s, now=None) -> list:
         "         OR (e.created_at = m.created_at AND e.id < m.id))"
         f"    AND NOT ({_stealable('e.')} AND e.created_at <= :cutoff))))"
         "  ORDER BY m.created_at ASC, m.id ASC LIMIT :limit)"
-        " AND processed = :q RETURNING *", params)
-    await db.commit()
+        " AND processed = :q RETURNING *", params, fetch=True)
     return sorted(rows, key=lambda r: (r["created_at"], r["id"]))
 
 
@@ -309,21 +337,18 @@ async def release(db, ids) -> int:
     ids = list(ids)
     if not ids:
         return 0
-    cur = await db.execute(
+    _, n = await write_commit(
+        db,
         "UPDATE message_queue SET processed = ?, claimed_by = NULL,"
         " processing_started_at = NULL"
         f" WHERE id IN ({','.join('?' * len(ids))}) AND processed = ?",
         (STATUS_QUEUED, *ids, STATUS_IN_PROGRESS))
-    n = cur.rowcount
-    await cur.close()
-    await db.commit()
     return n
 
 
 async def set_partial(db, id, text) -> None:
-    await db.execute("UPDATE message_queue SET partial_response = ? WHERE id = ?",
-                     (text, id))
-    await db.commit()
+    await write_commit(db, "UPDATE message_queue SET partial_response = ? WHERE id = ?",
+                       (text, id))
 
 
 # --- wake-up ---------------------------------------------------------------

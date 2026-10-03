@@ -157,6 +157,8 @@ class ServerState:
         self.hive = hive.HiveState()  # open hive calls (in memory only, step 2.3)
         self.stolen_total: Dict[str, int] = {}     # thief shard -> rows stolen (2.4)
         self.steal_timers: Dict[Tuple[str, str], Any] = {}  # (thief, victim) -> TimerHandle
+        self.bg_tasks: set = set()   # drain/steal/steer tasks; shutdown cancels and awaits them
+        self.closing = False
         # Steering (2.5), all keyed by shard id.
         self.steer: Dict[str, steering.Ledger] = {}          # lines the CLI has not replayed
         self.steer_lock: Dict[str, asyncio.Lock] = {}        # every stdin writer holds it
@@ -274,7 +276,7 @@ def _arm_steal_timer(state: ServerState, thief: str, victim: str, delay: float) 
 
     def fire():
         state.steal_timers.pop(key, None)
-        loop.create_task(drain_shard(state, thief))
+        spawn(state, drain_shard(state, thief))
 
     state.steal_timers[key] = loop.call_later(max(delay, 0.0) + 0.05, fire)
 
@@ -351,6 +353,34 @@ async def maybe_steal_wake(state: ServerState, shard: str,
 # =============================================================================
 # Write / read
 # =============================================================================
+
+def spawn(state: ServerState, coro) -> Optional[asyncio.Task]:
+    """create_task for work that touches the db or a shard's process (drain,
+    steal wake, steer). Tracked so `cancel_background` can end it before the db
+    closes; refused (coroutine closed) once shutdown has begun."""
+    if state.closing:
+        coro.close()
+        return None
+    task = asyncio.get_running_loop().create_task(coro)
+    state.bg_tasks.add(task)
+    task.add_done_callback(state.bg_tasks.discard)
+    return task
+
+
+async def cancel_background(state: ServerState) -> None:
+    """Shutdown: stop new spawns and steal timers, cancel every tracked task and
+    wait for them, so none touches the db after it closes."""
+    state.closing = True
+    for handle in list(state.steal_timers.values()):
+        handle.cancel()
+    state.steal_timers.clear()
+    me = asyncio.current_task()
+    tasks = [t for t in state.bg_tasks if t is not me]
+    for t in tasks:
+        t.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
 
 def steering_on(state: ServerState, shard: str) -> bool:
     return steering.steer_config(state.cfg(shard)).enabled
@@ -845,7 +875,7 @@ async def steer_enqueued(state: ServerState, shard: str, channel_id: str) -> Non
         if (state.active_turns.get(shard) is not batch
                 or not steering.steerable(state, shard, rows[0])):
             await msgqueue.release(state.db, ids)
-            asyncio.create_task(drain_shard(state, shard))
+            spawn(state, drain_shard(state, shard))
             return
         text = format_batch(rows, state.format_attachments,
                             state.AUTOMATED_TRAFFIC_SENTINEL)
@@ -885,12 +915,12 @@ async def interrupt_with_message(state: ServerState, shard: str, message: str,
     `fallback(shard)` (today's kill-and-respawn interrupt)."""
     import uuid
     message_id = f"interrupt-{uuid.uuid4()}"
-    await state.db.execute(
+    await msgqueue.write_commit(
+        state.db,
         "INSERT INTO message_queue (agent, channel, channel_id, server, author,"
         " author_id, is_bot, content, message_id, priority)"
         " VALUES (?, 'interrupt', ?, 'local', ?, '0', 0, ?, ?, ?)",
         (shard, channel_id, author, message, message_id, steering.INTERRUPT_PRIORITY))
-    await state.db.commit()
     msgqueue.notify(shard)
     out = {"message_id": message_id, "interrupted": False, "mode": "queued"}
 
@@ -1014,7 +1044,7 @@ async def _bounce(state: ServerState, shard: str) -> None:
     await state.kill_agent_subprocess(shard)
     state.pushback.pop(shard, None)
     await state.start_agent_subprocess(shard)
-    asyncio.create_task(drain_shard(state, shard))
+    spawn(state, drain_shard(state, shard))
 
 
 async def _drain_stale_self_turn(state: ServerState, shard: str) -> list:
@@ -1200,7 +1230,8 @@ async def finish_turn(state: ServerState, shard: str, result: TurnResult):
 
     # Mark complete
     if all_ids:
-        await state.db.execute(
+        await msgqueue.write_commit(
+            state.db,
             f"""
             UPDATE message_queue
             SET processed = ?, response = ?, discord_response_id = ?, processed_at = CURRENT_TIMESTAMP
@@ -1208,7 +1239,6 @@ async def finish_turn(state: ServerState, shard: str, result: TurnResult):
             """,
             (final_status, response_text, discord_msg_id, *all_ids)
         )
-        await state.db.commit()
 
     state.log.info(f"{agent} processed {len(all_ids)} messages")
 
@@ -1234,7 +1264,7 @@ async def finish_turn(state: ServerState, shard: str, result: TurnResult):
         row = await cursor.fetchone()
     if row and row["count"]:
         state.log.info(f"{agent} has {row['count']} messages still queued — draining again")
-        asyncio.create_task(drain_shard(state, shard))
+        spawn(state, drain_shard(state, shard))
     elif _stealing_on(state, shard):
         # This shard is about to be free with nothing of its own: a busy
         # sibling's waiting rows may be stolen (drain_shard decides).
@@ -1249,7 +1279,7 @@ async def maybe_steal_idle(state: ServerState, shard: str) -> None:
         return
     depths = await msgqueue.queued_depths(state.db, mine)
     if any(depths[sid] for sid in mine if sid != shard):
-        asyncio.create_task(drain_shard(state, shard))
+        spawn(state, drain_shard(state, shard))
 
 
 async def _coalesce(state: ServerState, shard: str) -> None:
@@ -1313,7 +1343,7 @@ async def drain_shard(state: ServerState, shard: str):
             state.enqueued_at.pop(shard, None)
             if batch.origin == "queue" and _stealing_on(state, shard):
                 # Backlog behind this (possibly long) turn: an idle sibling may take it.
-                asyncio.create_task(maybe_steal_wake(state, shard, busy=shard))
+                spawn(state, maybe_steal_wake(state, shard, busy=shard))
 
             await state.hooks.fire("on_turn_start", shard, batch)
             result = await run_turn(state, shard, batch)
@@ -1338,9 +1368,9 @@ def notify_enqueued(state: ServerState, shard: str, channel_id: str) -> None:
     st = state.agent_states.get(shard)
     state.enqueued_at.setdefault(shard, time.time())
     if st == "IDLE":
-        asyncio.create_task(drain_shard(state, shard))
+        spawn(state, drain_shard(state, shard))
     elif st in ("PROCESSING", "ERROR_RECOVERY") and _stealing_on(state, shard):
-        asyncio.create_task(maybe_steal_wake(state, shard))
+        spawn(state, maybe_steal_wake(state, shard))
     if st == "PROCESSING":
         # Agent is mid-turn in another channel. Without this, a message
         # landing behind a busy turn shows no typing indicator and no ack
@@ -1357,4 +1387,4 @@ def notify_enqueued(state: ServerState, shard: str, channel_id: str) -> None:
         # the indicator would spin until the process restarts.
         asyncio.create_task(state.start_typing(shard, channel_id))
         if steering_on(state, shard):
-            asyncio.create_task(_steer_task(state, shard, channel_id))
+            spawn(state, _steer_task(state, shard, channel_id))

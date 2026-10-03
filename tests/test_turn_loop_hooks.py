@@ -116,6 +116,9 @@ def test_suppress_post_skips_discord_but_completes(harness):
             h.script(default={"text": "routed elsewhere"})
             await h.send("a", "x", channel_id="3")
             await h.wait_idle("a")
+            # Followups run after the shard lock is released, i.e. just after
+            # the shard reads IDLE: wait for it rather than race it.
+            await h.wait_for(lambda: seen)
             return seen
 
     seen = run(scenario())

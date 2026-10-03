@@ -334,3 +334,47 @@ def test_claim_steerable_concurrent_partition(ags):
         claimed = [r["id"] for rows in results for r in rows]
         assert len(claimed) == len(set(claimed)) == 40
     with_db(ags, body)
+
+
+# -- db lock discipline (2.5 revision) -----------------------------------------
+
+def test_write_commit_holds_no_lock_after_one_hop(tmp_path):
+    """A write and its commit are one hop: the moment the await returns another
+    connection can write at once (no pending transaction, no lock)."""
+    import sqlite3
+
+    async def scenario():
+        path = str(tmp_path / "q.db")
+        db = await aiosqlite.connect(path)
+        db.row_factory = aiosqlite.Row
+        await db.execute("CREATE TABLE message_queue (id INTEGER PRIMARY KEY, v TEXT)")
+        await db.commit()
+        rows, n = await msgqueue.write_commit(
+            db, "INSERT INTO message_queue (v) VALUES ('x') RETURNING *", fetch=True)
+        assert n == 1 and rows[0]["v"] == "x"
+        assert not db.in_transaction
+        other = sqlite3.connect(path, timeout=0.05)
+        other.execute("INSERT INTO message_queue (v) VALUES ('y')")
+        other.commit()
+        other.close()
+        await db.close()
+
+    run(scenario())
+
+
+def test_cancel_background_awaits_tasks_and_refuses_new():
+    async def scenario():
+        state = SimpleNamespace(bg_tasks=set(), steal_timers={}, closing=False)
+        started = asyncio.Event()
+
+        async def forever():
+            started.set()
+            await asyncio.sleep(60)
+
+        task = turn_loop.spawn(state, forever())
+        await started.wait()
+        await turn_loop.cancel_background(state)
+        assert task.cancelled() and not state.bg_tasks
+        assert turn_loop.spawn(state, forever()) is None
+
+    run(scenario())
