@@ -81,7 +81,7 @@ def write_agents_config(workspace: Path, agents, shards=None) -> None:
 
 class Harness:
     def __init__(self, tmp_workspace, agents=["a", "b"], shards=None, write_config=True,
-                 work_stealing=None):
+                 work_stealing=None, steering=None):
         from conftest import import_script  # tests/ is on sys.path under pytest
         self.workspace = Path(tmp_workspace)
         self.agents = list(agents)
@@ -98,6 +98,13 @@ class Harness:
             if not isinstance(agents, dict):
                 agents = {name: {} for name in agents}
             agents = {n: {**(e or {}), "work_stealing": dict(work_stealing)}
+                      for n, e in agents.items()}
+        if steering is not None:
+            # Merged into every agent's steering block (step 2.5); an agent's own
+            # block wins key by key.
+            if not isinstance(agents, dict):
+                agents = {name: {} for name in agents}
+            agents = {n: {**(e or {}), "steering": {**steering, **((e or {}).get("steering") or {})}}
                       for n, e in agents.items()}
         if write_config:
             write_agents_config(self.workspace, agents, self.shards)
@@ -279,6 +286,25 @@ class Harness:
             return json.loads(path.read_text()).get("findings", [])
         except (OSError, ValueError):
             return []
+
+    def stdin_events(self, shard):
+        """Every stdin line the fake recorded for the shard's current session,
+        control requests included: [{"t", "event"}] with seconds since the fake
+        started (its <session>.io.jsonl, direction "in")."""
+        return [{"t": r["t"], "event": r["event"]} for r in self.io(shard)
+                if r.get("dir") == "in" and "event" in r]
+
+    def results(self, shard):
+        """The `result` events the server read for this shard (its stream log),
+        oldest first."""
+        return [e for e in self.stream_events(shard) if e.get("type") == "result"]
+
+    def row_status(self, shard, id):
+        """processed status of one row, by row id or message_id (None if absent)."""
+        for r in self.queue_rows(shard):
+            if r["id"] == id or r["message_id"] == id:
+                return r["processed"]
+        return None
 
     def queue_rows(self, shard):
         return self._query(

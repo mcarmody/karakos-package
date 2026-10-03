@@ -52,7 +52,8 @@ def test_usage_context_tokens(harness):
 # -- turn behaviour ---------------------------------------------------------
 
 def test_last_call_not_sum(harness):
-    h = harness(agents=["a"])
+    # Scripted per-tool usage is a classic-fake feature: steering (queued mode) off.
+    h = harness(agents=["a"], steering={"enabled": False})
     tools = [{"name": "Bash", "usage": U()} for _ in range(7)]
     summed = {k: v * 8 for k, v in U().items()}
 
@@ -115,7 +116,8 @@ async def read_events(mod, agent, events):
 
 
 def test_sidechain_ignored(harness):
-    h = harness(agents=["a"])
+    # Scripted per-tool usage is a classic-fake feature: steering (queued mode) off.
+    h = harness(agents=["a"], steering={"enabled": False})
     main_last = U(inp=1, cc=0, cr=61000)
     side = U(inp=1, cc=0, cr=5000)
     tools = [

@@ -582,7 +582,28 @@ def test_restart_abandons_queued_call_and_reply_rows(harness, tmp_workspace):
 # -- steering and stealing exclusions (2.5 / 2.4) -------------------------------------------
 
 def test_call_rows_are_not_steered_into(harness):
-    pytest.skip("2.5 (steering) is not merged: nothing to exclude call rows from yet")
+    """A call turn in flight takes no steered line, and a call row is never
+    steered into someone else's turn (step 2.5)."""
+    h = harness(agents=["a", "b"], shards=SHARDS, steering={"coalesce_ms": 0})
+
+    async def scenario():
+        async with h:
+            h.script(default={"text": "ok"}, rules=[
+                rule("hive call from", {"text": "42", "delay_ms": 800}, shard="^b$"),
+                rule("GO", {"mcp": [tool("hive_call", to="b", question="meaning?")],
+                            "text": "answer={{mcp:0.answer}}"}, shard="^a$")])
+            await h.send("a", "GO")
+            await h.wait_for(lambda: call_rows(h, "b") and call_rows(h, "b")[0]["processed"] == 1)
+            await asyncio.sleep(0.2)
+            await h.send("b", "ordinary")        # b is mid call turn
+            await asyncio.sleep(0.3)
+            ordinary = [r for r in h.queue_rows("b") if r["content"] == "ordinary"][0]
+            assert ordinary["processed"] == 0     # QUEUED: not merged into the call turn
+            await settle(h, "a", "b")
+            sent = h.sent_to("b")
+            assert len(sent) == 2 and "ordinary" not in sent[0] and "hive call" not in sent[1]
+
+    run(scenario())
 
 
 def test_call_rows_are_not_stealable(harness):

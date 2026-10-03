@@ -112,6 +112,27 @@ async def claim_batch(db, shard, limit, now=None) -> list:
     return sorted(rows, key=lambda r: (-(r["priority"] or 0), r["created_at"], r["id"]))
 
 
+async def claim_steerable(db, shard, channel_id, limit, now=None) -> list:
+    """Claim up to `limit` queued rows of `shard` that may be written into the
+    turn already in flight (step 2.5): the claim_batch shape, plus no call or
+    reply row, priority 0, and the in-flight turn's channel. Never claims an
+    expired row. Returns exactly the rows this caller now owns, in dispatch
+    order."""
+    await expire(db, shard, now)
+    rows = await db.execute_fetchall(
+        "UPDATE message_queue SET processed = ?, claimed_by = ?,"
+        " processing_started_at = CURRENT_TIMESTAMP"
+        " WHERE id IN (SELECT id FROM message_queue WHERE agent = ? AND processed = ?"
+        "  AND call_id IS NULL AND reply_to_agent IS NULL AND priority = 0"
+        f" AND channel != '{INTERNAL_CHANNEL}'"
+        f" AND channel_id = ? ORDER BY {_ORDER} LIMIT ?)"
+        " AND processed = ? RETURNING *",
+        (STATUS_IN_PROGRESS, shard, shard, STATUS_QUEUED, str(channel_id),
+         int(limit), STATUS_QUEUED))
+    await db.commit()
+    return sorted(rows, key=lambda r: (r["created_at"], r["id"]))
+
+
 # Rows a thief may take: plain human/bot rows, never addressed to one shard.
 def _stealable(a=""):
     return (f"{a}call_id IS NULL AND {a}reply_to_agent IS NULL"

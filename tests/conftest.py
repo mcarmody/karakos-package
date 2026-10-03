@@ -182,9 +182,9 @@ def harness(tmp_workspace):
     """
     from harness import Harness
 
-    def make(agents=("a", "b"), shards=None, work_stealing=None):
+    def make(agents=("a", "b"), shards=None, work_stealing=None, steering=None):
         return Harness(tmp_workspace, agents=agents if isinstance(agents, dict) else list(agents),
-                       shards=shards, work_stealing=work_stealing)
+                       shards=shards, work_stealing=work_stealing, steering=steering)
 
     return make
 

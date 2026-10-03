@@ -143,7 +143,8 @@ def test_error_step_fails_turn_without_crashing_server(harness):
 
 
 def test_tool_events_usage_sidechain_and_duplicate_ids(harness):
-    h = harness(agents=["a"])
+    # Per-tool message ids and usage are classic-fake features: steering (queued mode) off.
+    h = harness(agents=["a"], steering={"enabled": False})
     tools = [
         {"name": "Read", "input": {"file_path": "/x"}, "message_id": "m1",
          "usage": {"input_tokens": 1, "cache_creation_input_tokens": 0,

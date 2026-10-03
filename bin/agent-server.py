@@ -838,6 +838,13 @@ async def start_agent_subprocess(shard: str):
     if persona_content:
         cmd.extend(["--append-system-prompt", persona_content])
 
+    # Steering (2.5): the CLI replays each user line it consumes, which is the
+    # server's only signal of which steered lines the model has seen.
+    if turn_loop.steering_on(STATE, shard):
+        cmd.append("--replay-user-messages")
+    STATE.pushback.pop(shard, None)
+    STATE.replay_seen.pop(shard, None)
+
     # Add disallowed tools
     disallowed = config.get("disallowed_tools", [])
     for pattern in disallowed:
@@ -981,6 +988,10 @@ async def kill_agent_subprocess(shard: str):
         log.info(f"{label_of(shard)} subprocess already gone at kill time")
 
     agent_processes.pop(shard, None)
+    # Lines the dead process never replayed go back to the queue (2.5).
+    STATE.pushback.pop(shard, None)
+    STATE.replay_seen.pop(shard, None)
+    await turn_loop.release_pending(STATE, shard, "kill")
 
     # Whatever the tool calls left running (dev servers, nohup/setsid children).
     try:
@@ -1078,6 +1089,7 @@ async def respawn_watcher(shard: str, proc: asyncio.subprocess.Process):
         # A call row the dead process was answering will never get a reply, and
         # a dead caller cannot be waiting on a call.
         await hive_cancel_caller(shard)
+        await turn_loop.release_pending(STATE, shard, "exit")
         try:
             await db.execute(
                 "UPDATE message_queue SET processed = ? WHERE agent = ? AND processed = ?"
@@ -1112,6 +1124,9 @@ async def respawn_watcher(shard: str, proc: asyncio.subprocess.Process):
 
         log.warning(f"{label_of(shard)} subprocess exited unexpectedly (code {returncode}), respawning")
         await start_agent_subprocess(shard)
+        if turn_loop.steering_on(STATE, shard):
+            # Released steered rows are queued again: deliver them to the new process.
+            asyncio.create_task(turn_loop.drain_shard(STATE, shard))
 
     await notify_respawn(shard, f"the subprocess exited unexpectedly (code {returncode})")
 
@@ -1957,7 +1972,7 @@ async def stop_typing(channel_id: str):
 
 async def send_to_agent(agent: str, content: str, message_ids: List[str]):
     """Send message to agent subprocess"""
-    await turn_loop.write_user_line(STATE, agent, content, message_ids)
+    return await turn_loop.write_user_line(STATE, agent, content, message_ids)
 
 async def write_streaming_response(message_ids: List[str], text: str) -> None:
     """Push partial response text into message_queue so SSE polling sees it.
@@ -2519,6 +2534,8 @@ async def handle_agents(request):
                 "last_channel": agent_last_channel.get(sp.id),
                 "paused": _paused_entry(sp.id),
                 "stolen_total": STATE.stolen_total.get(sp.id, 0),
+                "steer_pending": len(STATE.steer[sp.id].entries) if sp.id in STATE.steer else 0,
+                "steered_total": STATE.steered_total.get(sp.id, 0),
             })
         agents_list.append({
             "name": agent,
@@ -2574,6 +2591,11 @@ async def sync_shards(new_specs, old_specs=None) -> Dict[str, List[str]]:
     for sp in diff.removed:
         sid = sp.id
         await kill_agent_subprocess(sid)
+        await turn_loop.release_pending(STATE, sid, "shard removed")
+        for d in (STATE.steer, STATE.steer_lock, STATE.steer_unmatched, STATE.steered_total,
+                  STATE.turn_seq, STATE.enqueued_at, STATE.pushback, STATE.bg_seen,
+                  STATE.replay_seen):
+            d.pop(sid, None)
         for d in (agent_locks, agent_states, response_buffers, agent_last_cost,
                   agent_sessions, agent_last_channel, agent_turn_context,
                   agent_wall_strikes, respawn_history, _last_beacon_write):
@@ -2694,6 +2716,31 @@ async def handle_agent_interrupt(request):
     targets = _resolve_request_targets(request)
     if not targets:
         return web.json_response({"error": "Unknown agent"}, status=404)
+
+    # Optional body {"message", "channel_id", "author"} (2.5): interrupt and
+    # follow with a message that runs first. No body keeps today's behaviour.
+    body_in = {}
+    if request.can_read_body:
+        try:
+            parsed = await request.json()
+            body_in = parsed if isinstance(parsed, dict) else {}
+        except ValueError:
+            body_in = {}
+    message = body_in.get("message")
+    if isinstance(message, str) and message.strip():
+        if len(targets) > 1:
+            return web.json_response({"error": "shard required"}, status=400)
+        out = await turn_loop.interrupt_with_message(
+            STATE, targets[0], message,
+            channel_id=str(body_in.get("channel_id") or "0"),
+            author=str(body_in.get("author") or "interrupt"),
+            fallback=interrupt_agent)
+        return web.json_response({
+            "status": "interrupted" if out["interrupted"] else "queued",
+            "interrupted": out["interrupted"],
+            "message_id": out["message_id"],
+            "mode": out["mode"],
+        })
 
     # interrupt_agent is a no-op for a shard that is not PROCESSING, so an
     # agent id interrupts only the busy ones.
