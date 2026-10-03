@@ -192,7 +192,7 @@ def harness(tmp_workspace):
 @pytest.fixture
 def real_template_workspace(tmp_workspace):
     """tmp_workspace with the shipped templates and a registry written by
-    `registry.py init` (primary "Jarvis", id jarvis; monitor relay), so tests
+    `registry.py init` (primary "Jarvis", id jarvis; monitor monitor), so tests
     exercise the real prompt. The registry also carries model/env overrides so
     the harness's fake `claude` works; use `Harness(ws, agents=["jarvis"],
     write_config=False)`."""
@@ -215,9 +215,9 @@ def real_template_workspace(tmp_workspace):
                 tmp_workspace / "agents" / "jarvis" / "SYSTEM_PROMPT.md")
     shutil.copy(PACKAGE_ROOT / "agents" / "templates" / "onboarding.md",
                 tmp_workspace / "agents" / "jarvis" / "onboarding.md")
-    (tmp_workspace / "agents" / "relay").mkdir(exist_ok=True)
-    shutil.copy(PACKAGE_ROOT / "agents" / "templates" / "relay.md",
-                tmp_workspace / "agents" / "relay" / "SYSTEM_PROMPT.md")
+    (tmp_workspace / "agents" / "monitor").mkdir(exist_ok=True)
+    shutil.copy(PACKAGE_ROOT / "agents" / "templates" / "monitor.md",
+                tmp_workspace / "agents" / "monitor" / "SYSTEM_PROMPT.md")
 
     # Harness knobs: fake model and the fake-claude env passthrough.
     from harness import FAKE_ENV_KEYS

@@ -155,7 +155,7 @@ def test_onboarding_primary_with_persona_is_empty(server):
 def test_onboarding_non_primary_is_empty(server, role):
     ws, mod = server
     if role == "monitor":
-        aid = "relay"
+        aid = "monitor"
     else:
         aid = f"x-{role}"
         registry.write_agent(ws, aid, {"name": aid, "role": role})

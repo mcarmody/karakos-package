@@ -102,13 +102,14 @@ def run_wedge_check():
     """Check for agents that are alive but stuck.
 
     Runs every minute, unlike the daily health sweep, because the failure it
-    catches has a user waiting on the other end of it. Exit 1 means "wedged
-    and alerted", which is a finding rather than an error, so it is not
+    catches has a user waiting on the other end of it. The monitor tick pages
+    (finding stall:<shard>), so this run only diagnoses.
+    Exit 1 means "wedged", a finding rather than an error, so it is not
     checked as a subprocess failure.
     """
     try:
         result = subprocess.run(
-            ["python3", f"{WORKSPACE_ROOT}/bin/wedge-check.py"],
+            ["python3", f"{WORKSPACE_ROOT}/bin/wedge-check.py", "--no-alert"],
             capture_output=True,
             text=True
         )

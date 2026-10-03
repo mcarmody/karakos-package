@@ -167,7 +167,7 @@ def test_shipped_templates_compose_cleanly(tmp_path):
     agents_dir.mkdir()
     for name in ("CORE.md", "HOUSE_STYLE.md"):
         (agents_dir / name).write_text((PACKAGE_ROOT / "agents" / name).read_text())
-    for tpl in ("primary", "relay"):
+    for tpl in ("primary", "monitor"):
         text = (PACKAGE_ROOT / "agents" / "templates" / f"{tpl}.md").read_text()
         assert text.count(SPLICE) == 1
         put(ws, f"agents/{tpl}/SYSTEM_PROMPT.md", text)

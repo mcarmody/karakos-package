@@ -11,7 +11,8 @@ Environment:
                        "agent": re (optional), "step": Step}]}. Re-read every
                        turn so a test can change the script between messages.
 
-Step keys (all optional): text, tools [{name, input, usage, message_id,
+Step keys (all optional): spawn_child {argv, seconds} (starts a real child process
+under the fake, step 3.2b), text, tools [{name, input, usage, message_id,
 parent_tool_use_id}], usage, cost, delay_ms, is_error, exit, hang,
 parent_tool_use_id (for the text event), rate_limit {status, type,
 resets_at, windows: {type: {utilization, resets_at}}} (emits a recorded-shape
@@ -92,6 +93,15 @@ def rate_limit_event(sid, spec):
             for k, v in spec["windows"].items()}
     return {"type": "rate_limit_event", "rate_limit_info": info,
             "uuid": str(uuid.uuid4()), "session_id": sid}
+
+
+def spawn_child(spec):
+    """Step key `spawn_child: {"argv": [...], "seconds": n}` (step 3.2b): start a real
+    child process (default `sleep <seconds>`) under this process, so a tool process
+    exists for the monitor to find. Not waited for."""
+    argv = list((spec or {}).get("argv") or ["sleep", str((spec or {}).get("seconds", 30))])
+    return subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
 
 
 def emit(event):
@@ -453,6 +463,8 @@ class Queued:
         mid = f"msg_{self.sid[:8]}_{n}"
         tools = step.get("tools") or []
         queued_text = ""
+        if step.get("spawn_child"):
+            spawn_child(step["spawn_child"])
         try:
             if step.get("delay_ms"):
                 self.sleep(step["delay_ms"] / 1000.0)
@@ -582,6 +594,8 @@ def main():
         if step.get("hang"):
             while True:
                 time.sleep(3600)
+        if step.get("spawn_child"):
+            spawn_child(step["spawn_child"])
         if step.get("delay_ms"):
             time.sleep(step["delay_ms"] / 1000.0)
 

@@ -293,6 +293,27 @@ main() {
     PRIMARY_AGENT_NAME=$(printf '%s' "$PRIMARY_AGENT_NAME" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
     PRIMARY_AGENT_ID=$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import registry; print(registry.slugify_id(sys.argv[2]))' "${SCRIPT_DIR}/lib" "$PRIMARY_AGENT_NAME")
 
+    # Monitoring agent name. The id is the same slug rule as the primary's, and must
+    # not name a system component (lib/registry.py refuses relay, scheduler,
+    # mcp-tools, server) or collide with the primary.
+    while :; do
+        if [ -z "$(get_state monitor_agent_name)" ]; then
+            prompt "Name for your monitoring agent" MONITOR_AGENT_NAME "monitor"
+            save_state monitor_agent_name "$MONITOR_AGENT_NAME"
+        else
+            MONITOR_AGENT_NAME=$(get_state monitor_agent_name)
+        fi
+        MONITOR_AGENT_NAME=$(printf '%s' "$MONITOR_AGENT_NAME" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+        MONITOR_AGENT_ID=$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import registry; print(registry.slugify_id(sys.argv[2]))' "${SCRIPT_DIR}/lib" "$MONITOR_AGENT_NAME")
+        case "$MONITOR_AGENT_ID" in
+            relay|scheduler|mcp-tools|server|"$PRIMARY_AGENT_ID")
+                error "'$MONITOR_AGENT_NAME' cannot be the monitoring agent's name (reserved, or the same as the primary); choose another"
+                save_state monitor_agent_name ""
+                ;;
+            *) break ;;
+        esac
+    done
+
     # Step 4: Anthropic authentication
     echo
     log "Step 4: Anthropic Login"
@@ -443,6 +464,8 @@ EOF
     else
         python3 "${SCRIPT_DIR}/lib/registry.py" init --workspace "${SCRIPT_DIR}" \
             --primary-id "${PRIMARY_AGENT_ID}" --primary-name "${PRIMARY_AGENT_NAME}" \
+            --monitor-id "${MONITOR_AGENT_ID}" --monitor-name "${MONITOR_AGENT_NAME}" \
+            --monitor-template agents/templates/monitor.md \
             --channel general
     fi
 
@@ -467,7 +490,7 @@ EOF
     # Generate agent directories and system prompts
     log "Creating agent directories..."
 
-    for agent in "${PRIMARY_AGENT_ID}" "relay"; do
+    for agent in "${PRIMARY_AGENT_ID}" "${MONITOR_AGENT_ID}"; do
         mkdir -p "agents/${agent}/persona"
         mkdir -p "agents/${agent}/inbox"
         mkdir -p "agents/${agent}/journal"
@@ -479,7 +502,7 @@ EOF
             # First-boot onboarding: the primary only.
             cp "agents/templates/onboarding.md" "agents/${agent}/onboarding.md"
         else
-            template="agents/templates/${agent}.md"
+            template="agents/templates/monitor.md"
         fi
         cp "$template" "agents/${agent}/SYSTEM_PROMPT.md"
     done
