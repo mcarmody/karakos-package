@@ -37,6 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 # lib/ is a package root for lib.migrate (the schema-stamp guard).
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import ask_handler  # noqa: E402
+import discord_ux  # noqa: E402
 import hive as hive_lib  # noqa: E402
 import msgqueue  # noqa: E402
 import outbox as outbox_lib  # noqa: E402
@@ -192,6 +193,13 @@ agent_config: Dict[str, Dict[str, Any]] = {}
 shard_specs: List[shards_lib.ShardSpec] = []
 shard_owner: Dict[str, str] = {}
 channels_config: Dict[str, Any] = {}
+# Optional Discord behaviours (6.2): thread id -> parent channel id (in memory,
+# LRU), the parsed channels.json "ux" blocks (keyed by the config object they
+# came from) and the last time a thread-creation failure was warned per channel.
+ux_threads = discord_ux.LruMap(256)
+_ux_parsed: Dict[str, Any] = {"src": None, "cfg": None}
+_ux_warned: Dict[str, float] = {}
+UX_WARN_EVERY_S = 3600
 agent_processes: Dict[str, asyncio.subprocess.Process] = {}
 agent_locks: Dict[str, asyncio.Lock] = {}
 agent_states: Dict[str, str] = {}
@@ -459,6 +467,19 @@ async def load_config():
         channels_config = {}
 
     _rebuild_token_maps()
+
+
+def reload_channels_config():
+    """Re-read channels.json (the 6.2 "ux" switches live there). A missing or
+    unreadable file keeps the running config."""
+    global channels_config
+    if not CHANNELS_CONFIG_PATH.exists():
+        return
+    try:
+        with open(CHANNELS_CONFIG_PATH) as f:
+            channels_config = json.load(f)
+    except Exception as e:
+        log.error(f"channels.json unreadable on reload, keeping previous: {e}")
 
 
 def _set_shard_specs(specs):
@@ -1649,7 +1670,7 @@ def split_discord_message_visible(text: str) -> List[str]:
 
 
 async def _post_direct(agent: str, token: str, channel_id: str, content: str,
-                       reply_to: Optional[str] = None) -> Optional[str]:
+                       reply_to: Optional[str] = None, flags: int = 0) -> Optional[str]:
     """Direct, in-turn delivery: retried POST_MAX_ATTEMPTS times per chunk.
 
     Used for incidental posts (tool lines, notices) and as the fallback when
@@ -1671,6 +1692,8 @@ async def _post_direct(agent: str, token: str, channel_id: str, content: str,
 
     for idx, chunk in enumerate(chunks):
         payload = {"content": chunk}
+        if flags:
+            payload["flags"] = flags
         # Only reply-reference the first chunk
         if reply_to and last_msg_id is None:
             payload["message_reference"] = {"message_id": reply_to}
@@ -1909,6 +1932,88 @@ async def outbox_loop() -> None:
             await asyncio.sleep(5)
 
 
+# -- Optional Discord behaviours (6.2) ---------------------------------------
+
+def ux_config() -> "discord_ux.UxConfig":
+    """The parsed "ux" blocks of channels_config, re-parsed whenever the config
+    object is replaced (load_config, the reload route). Warnings log once."""
+    if _ux_parsed["src"] is not channels_config or _ux_parsed["cfg"] is None:
+        cfg, warnings = discord_ux.parse_ux(channels_config)
+        for w in warnings:
+            log.warning(f"channels.json ux: {w}")
+        _ux_parsed["src"], _ux_parsed["cfg"] = channels_config, cfg
+    return _ux_parsed["cfg"]
+
+
+def _listed_channel_name(channel_id) -> Optional[str]:
+    cid = str(channel_id)
+    for name, cfg in (channels_config.get("channels") or {}).items():
+        if isinstance(cfg, dict) and str(cfg.get("id")) == cid:
+            return name
+    return None
+
+
+def ux_for_channel_id(channel_id) -> "discord_ux.ChannelUx":
+    """Switches for a channel id; a registered bot thread inherits its parent's."""
+    name = _listed_channel_name(channel_id)
+    if name is None:
+        parent = ux_threads.get(channel_id)
+        if parent is not None:
+            name = _listed_channel_name(parent)
+    return ux_config().for_channel(name)
+
+
+def ux_thread_cfg(channel_id) -> Optional["discord_ux.ThreadCfg"]:
+    """Thread settings for a turn in `channel_id`, or None. A thread cannot be
+    created inside a thread or a DM, so only a channel listed in channels.json
+    under this very id qualifies."""
+    name = _listed_channel_name(channel_id)
+    if name is None:
+        return None
+    return ux_config().for_channel(name).threads
+
+
+def _ux_now() -> float:
+    return time.time()
+
+
+async def ux_create_thread(agent: str, channel_id: str, message_id: Optional[str],
+                           name: str) -> Optional[str]:
+    """Create a public thread on a message. Returns its id, or None (never
+    raises): the caller then keeps posting in the channel."""
+    if not message_id:
+        return None
+    token = AGENT_TOKENS.get(agent) or next(iter(AGENT_TOKENS.values()), None)
+    if not token:
+        return None
+    url = f"https://discord.com/api/v10/channels/{channel_id}/messages/{message_id}/threads"
+    headers = {"Authorization": f"Bot {token}", "Content-Type": "application/json"}
+    try:
+        async with http_session.post(url, headers=headers, json={
+                "name": name, "auto_archive_duration": 60}) as resp:
+            if resp.status in (200, 201):
+                data = await resp.json()
+                thread_id = str(data.get("id") or "")
+                if thread_id:
+                    ux_threads[thread_id] = str(channel_id)
+                    return thread_id
+                return None
+            if resp.status in (400, 403):
+                now = _ux_now()
+                last = _ux_warned.get(str(channel_id))
+                if last is None or now - last >= UX_WARN_EVERY_S:
+                    _ux_warned[str(channel_id)] = now
+                    log.warning(
+                        f"cannot create thread in channel {channel_id} (HTTP {resp.status}); "
+                        f"needs Create Public Threads and Send Messages in Threads. "
+                        f"Tool lines stay in the channel")
+            else:
+                log.info(f"thread creation in {channel_id} failed: HTTP {resp.status}")
+    except Exception as e:
+        log.info(f"thread creation in {channel_id} failed: {type(e).__name__}: {e}")
+    return None
+
+
 async def post_to_discord(agent: str, channel_id: str, content: str,
                           reply_to: Optional[str] = None,
                           dead_letter: bool = False,
@@ -1966,12 +2071,16 @@ async def post_to_discord(agent: str, channel_id: str, content: str,
         log.info(f"skip post (empty) agent={agent} channel={channel_id}")
         return None
 
+    # Suppress-embeds (6.2): text posts only; post_discord_payload never sets it.
+    flags = discord_ux.SUPPRESS_EMBEDS if ux_for_channel_id(channel_id).suppress_embeds else 0
+
     if dead_letter:
         conn = _outbox_store()
         if conn is not None:
             try:
                 rid, claimed = outbox_lib.enqueue(
-                    conn, agent, channel_id, rendered, reply_to=reply_to, claimed=True,
+                    conn, agent, channel_id, rendered, reply_to=reply_to, flags=flags,
+                    claimed=True,
                     now=_outbox_now(), content_sha=outbox_lib.content_sha(content),
                     chunks_total=len(chunks),
                     queue_message_id=queue_message_id)
@@ -1991,7 +2100,7 @@ async def post_to_discord(agent: str, channel_id: str, content: str,
                     _outbox_broken("inline send", e)
                     return None
 
-    return await _post_direct(agent, token, channel_id, rendered, reply_to)
+    return await _post_direct(agent, token, channel_id, rendered, reply_to, flags)
 
 
 def gateway_agent() -> Optional[str]:
@@ -2616,6 +2725,9 @@ async def handle_message(request):
     attachments = data.get("attachments") or []
     if not isinstance(attachments, list):
         return web.json_response({"error": "attachments must be a list"}, status=400)
+    thread_parent_id = data.get("thread_parent_id")
+    if thread_parent_id:
+        ux_threads[str(channel_id)] = str(thread_parent_id)
 
     # The relay sends the shard it routed to (2.2). An agent id alone selects
     # the agent's first shard. An unknown shard with a valid agent falls back to
@@ -2691,6 +2803,102 @@ async def handle_message(request):
     turn_loop.notify_enqueued(STATE, agent, channel_id)
 
     return web.json_response({"status": "queued", "message_id": message_id}, status=202)
+
+
+async def handle_message_edit(request):
+    """POST /message/edit - A person edited a message the relay already sent.
+
+    Decided by discord_ux.edit_decision: update a still-queued row in place, or
+    queue a follow-up row (same agent column, so the same shard) telling the
+    agent what changed. Additive; /message is untouched."""
+    if not _authorized(request):
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    data = await request.json()
+    server = data.get("server", "discord")
+    message_id = str(data.get("message_id") or "")
+    author_id = str(data.get("author_id") or "")
+    content = data.get("content")
+    if not message_id or not isinstance(content, str) or not content.strip():
+        return web.json_response({"error": "message_id and content required"}, status=400)
+
+    async def load():
+        async with db.execute(
+            "SELECT *, CAST(strftime('%s', created_at) AS INTEGER) AS created_at_ts"
+            " FROM message_queue WHERE server = ? AND message_id = ?",
+            (server, message_id)
+        ) as cur:
+            r = await cur.fetchone()
+        prefix = f"edit:{message_id}:"
+        async with db.execute(
+            "SELECT message_id, processed, content FROM message_queue"
+            " WHERE server = ? AND substr(message_id, 1, ?) = ? ORDER BY id",
+            (server, len(prefix), prefix)
+        ) as cur:
+            f = [dict(x) for x in await cur.fetchall()]
+        return (dict(r) if r else None), f
+
+    row, followups = await load()
+    if row is None:
+        return web.json_response({"status": "unknown", "message_id": message_id})
+    cfg = ux_config().for_channel(row["channel"]).edit_reroute
+    if cfg is None:
+        return web.json_response({"status": "disabled", "message_id": message_id})
+
+    decision = None
+    for _ in range(2):
+        decision = discord_ux.edit_decision(
+            row, _ux_now(), cfg.window_s, cfg.max_followups, followups,
+            author_id=author_id, new_text=content)
+        if decision.action != "update":
+            break
+        cur = await db.execute(
+            "UPDATE message_queue SET content = ? WHERE message_id = ? AND processed = 0",
+            (content, message_id))
+        await db.commit()
+        if cur.rowcount:
+            return web.json_response({"status": "updated", "message_id": message_id})
+        # The claim won the race: decide again against the claimed row.
+        row, followups = await load()
+    if decision.action == "update":
+        return web.json_response({"status": "unchanged", "message_id": message_id})
+
+    if decision.action in ("followup", "update_followup"):
+        text = discord_ux.edit_followup_text(
+            row["author"], row["content"], content, decision.phase)
+        if decision.action == "update_followup":
+            cur = await db.execute(
+                "UPDATE message_queue SET content = ? WHERE message_id = ? AND processed = 0",
+                (text, decision.followup_id))
+            await db.commit()
+            if cur.rowcount:
+                return web.json_response({"status": "updated", "message_id": message_id})
+            # Claimed meanwhile: it is now a turn in flight; fall through to a new row
+            # unless that would exceed the cap.
+            if len(followups) >= cfg.max_followups:
+                return web.json_response({"status": "refused", "message_id": message_id})
+        n = len(followups) + 1
+        agent = row["agent"]
+        try:
+            await db.execute(
+                """
+                INSERT INTO message_queue
+                (agent, channel, channel_id, server, author, author_id, is_bot, content,
+                 message_id, mentions_agent, priority)
+                VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, 0)
+                """,
+                (agent, row["channel"], row["channel_id"], server, row["author"],
+                 row["author_id"], text, f"edit:{message_id}:{n}",
+                 int(row["mentions_agent"] or 0)))
+            await db.commit()
+        except aiosqlite.IntegrityError:
+            return web.json_response({"status": "duplicate", "message_id": message_id})
+        msgqueue.notify(agent)
+        turn_loop.notify_enqueued(STATE, agent, row["channel_id"])
+        return web.json_response({"status": "followup", "message_id": message_id,
+                                  "followup_id": f"edit:{message_id}:{n}"})
+
+    return web.json_response({"status": decision.status, "message_id": message_id})
+
 
 def outbox_health() -> Dict[str, Any]:
     zero = {"pending": 0, "sending": 0, "dead": 0, "oldest_pending_age_s": None}
@@ -3024,6 +3232,7 @@ async def handle_agent_reload(request):
             status=400,
         )
     agent_config = reg.legacy_view()["agents"]
+    reload_channels_config()
     changes = await sync_shards(shards_lib.plan_shards(reg))
     if changes["added"] or changes["removed"]:
         # A shard-topology change is applied on its own: kept shards are not
@@ -4515,6 +4724,7 @@ def create_app(with_lifecycle: bool = True) -> web.Application:
     app = web.Application()
 
     app.router.add_post("/message", handle_message)
+    app.router.add_post("/message/edit", handle_message_edit)
     app.router.add_get("/health", handle_health)
     app.router.add_get("/outbox", handle_outbox_list)
     app.router.add_get("/outbox/{id}", handle_outbox_get)

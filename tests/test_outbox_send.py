@@ -723,6 +723,10 @@ def test_only_guarded_functions_post_channel_messages():
                 src = ast.get_source_segment(path.read_text(), func)
                 if "/messages" not in src:
                     continue   # not a channel-messages URL (e.g. an interaction callback)
+                if func.name == "ux_create_thread":
+                    # 6.2: creates a thread on a message; carries no content.
+                    assert '/threads"' in src and '"content"' not in src
+                    continue
                 assert func.name in allowed, f"{path.name}:{func.name} posts to channel messages unguarded"
                 seen.add(func.name)
                 if func.name == "post_discord_payload":

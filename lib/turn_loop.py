@@ -18,6 +18,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+import discord_ux
 import hive
 import msgqueue
 import post_guard
@@ -33,13 +34,14 @@ _SERVER_NAMES = (
     "agent_last_cost", "agent_sessions", "agent_turn_context",
     "agent_last_channel", "interrupted_agents", "typing_tasks",
     "agent_wall_strikes", "agent_hold_tasks", "agent_config",
-    "db", "log", "ask_registry",
+    "db", "log", "ask_registry", "ux_threads",
     # collaborators
     "post_to_discord", "start_typing", "stop_typing", "write_agent_beacon",
     "post_cost_update", "update_session_tokens", "update_session_context",
     "hold_batch", "agent_hold_until", "schedule_hold_wake", "classify_wall",
     "wall_not_before", "format_attachments", "redact_for_log",
     "send_to_agent", "read_agent_response",
+    "ux_thread_cfg", "ux_create_thread",
     # used by the stream reader
     "write_stream_log", "record_rate_limit_event", "write_turn_event",
     "describe_tool_call", "should_post_tool_line", "summarize_tool_call",
@@ -48,6 +50,7 @@ _SERVER_NAMES = (
     # constants
     "STATUS_QUEUED", "STATUS_IN_PROGRESS", "STATUS_COMPLETE", "STATUS_CRASHED",
     "STATUS_SKIPPED", "AUTOMATED_TRAFFIC_SENTINEL", "GENERIC_TURN_ERROR",
+    "TOOL_EVENT_MIN_INTERVAL", "TOOL_EVENT_MAX_PER_TURN",
 )
 
 
@@ -359,6 +362,27 @@ async def read_events(
     tool_lines_posted = 0
     last_tool_line_at: Optional[float] = None
 
+    # Long-turn threads (6.2): None unless the switch is on for this channel,
+    # in which case the tool-line branch below takes the LongTurn path and
+    # the code for a channel without it is unchanged.
+    long_turn: Optional[discord_ux.LongTurn] = None
+    if tool_streaming and channel_id != "0":
+        try:
+            thread_cfg = state.ux_thread_cfg(channel_id)
+        except Exception as e:   # a UX lookup must never cost the turn
+            state.log.warning(f"ux thread lookup failed, threads off for this turn: {e}")
+            thread_cfg = None
+        if thread_cfg is not None:
+            batch = state.active_turns.get(shard)
+            first_text = ""
+            for r in (batch.rows if batch else []):
+                first_text = r["content"] or ""
+                if first_text:
+                    break
+            long_turn = discord_ux.LongTurn(
+                thread_cfg, channel_id, time.monotonic(), first_text,
+                state.TOOL_EVENT_MIN_INTERVAL, state.TOOL_EVENT_MAX_PER_TURN)
+
     final_text = ""
     metadata = {}
     last_posted_chunk = ""
@@ -481,7 +505,27 @@ async def read_events(
                             msg_ids, event_seq, "tool",
                             state.describe_tool_call(tool_name, block.get("input")),
                         )
-                        if tool_streaming and channel_id != "0":
+                        if long_turn is not None:
+                            now = time.monotonic()
+                            plan = long_turn.plan(now, tool_lines_posted, last_tool_line_at)
+                            if plan == "thread":
+                                thread_id = await state.ux_create_thread(
+                                    shard, channel_id, long_turn.anchor, long_turn.name)
+                                if thread_id:
+                                    long_turn.thread_created(thread_id)
+                                else:
+                                    long_turn.thread_failed()
+                                    plan = long_turn.plan(now, tool_lines_posted,
+                                                          last_tool_line_at)
+                            if plan != "skip":
+                                tool_lines_posted += 1
+                                last_tool_line_at = now
+                                posted_id = await state.post_to_discord(
+                                    shard, long_turn.target,
+                                    state.summarize_tool_call(tool_name, block.get("input")),
+                                )
+                                long_turn.note_post(posted_id)
+                        elif tool_streaming and channel_id != "0":
                             now = time.monotonic()
                             if state.should_post_tool_line(tool_lines_posted,
                                                      last_tool_line_at, now):
