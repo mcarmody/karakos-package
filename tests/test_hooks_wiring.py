@@ -155,3 +155,45 @@ def test_real_claude_dispatch_fires_user_prompt_submit_hook(tmp_workspace):
     assert log_path.exists(), "UserPromptSubmit hook never fired: hook-events.log was never created"
     lines = log_path.read_text().splitlines()
     assert len(lines) == 1, f"expected exactly one hook-fired line, got: {lines!r}"
+
+
+def test_spawn_argv_settings_carry_new_hooks(tmp_workspace, monkeypatch):
+    """After hooks-sync, the settings file the harness is pointed at wires the
+    safety rails and not the removed sleep-poll hook."""
+    settings_path = tmp_workspace / "config" / "claude-settings.json"
+    shutil.copy(SETTINGS_PATH, settings_path)
+    import_script("hooks-sync").sync(tmp_workspace)
+
+    agent_dir = tmp_workspace / "agents" / "test-agent"
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    (agent_dir / "SYSTEM_PROMPT.md").write_text("You are a test agent.")
+    monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_workspace))
+    agent_server = import_script("agent-server")
+    captured = {}
+
+    class FakeStderr:
+        async def readline(self):
+            return b""
+
+    class FakeProc:
+        pid = 4242
+        stderr = FakeStderr()
+
+    async def fake_exec(*args, **kwargs):
+        captured["cmd"] = list(args)
+        return FakeProc()
+
+    monkeypatch.setattr(agent_server.asyncio, "create_subprocess_exec", fake_exec)
+
+    async def run():
+        await agent_server.init_db()
+        await agent_server.load_config()
+        await agent_server.start_agent_subprocess("test-agent")
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+    cmd = captured["cmd"]
+    used = json.loads(open(cmd[cmd.index("--settings") + 1]).read())
+    text = json.dumps(used["hooks"])
+    assert "bash-safety-rails.py" in text and "block-bare-ssh.py" in text
+    assert "sleep-poll" not in text

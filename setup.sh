@@ -478,6 +478,9 @@ EOF
     # docker-compose.yml lives in config/ (shipped with the repo).
     # No generation needed — install.sh runs docker compose from config/.
 
+    # Generate the hooks section of config/claude-settings.json from config/hooks.json.
+    python3 "${SCRIPT_DIR}/bin/hooks-sync.py" "${SCRIPT_DIR}" || warn "hooks-sync failed; safety hooks not wired"
+
     # Update .gitignore
     if ! grep -q "config/.env" .gitignore 2>/dev/null; then
         echo "config/.env" >> .gitignore

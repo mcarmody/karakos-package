@@ -35,7 +35,11 @@
         "hooks": [
           {
             "type": "command",
-            "command": "$WORKSPACE_ROOT/system/hooks/rewrite-sleep-poll.py"
+            "command": "$WORKSPACE_ROOT/system/hooks/bash-safety-rails.py"
+          },
+          {
+            "type": "command",
+            "command": "$WORKSPACE_ROOT/system/hooks/block-bare-ssh.py"
           }
         ]
       }

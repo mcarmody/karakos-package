@@ -20,3 +20,6 @@ fi
 
 # Run protected paths checker
 "$PYTHON" "$WORKSPACE_ROOT/system/check-protected-paths.py" --staged
+
+# Secrets check (forbidden paths + content scan). KARAKOS_SECRET_SCAN=off skips content only.
+"$PYTHON" "$WORKSPACE_ROOT/system/check-secrets.py" --staged

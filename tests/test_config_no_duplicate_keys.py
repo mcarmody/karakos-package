@@ -87,11 +87,13 @@ def test_claude_settings_declares_each_hook_event_once():
         for entry in entries
         for hook in entry["hooks"]
     ]
-    # Every hook script the package ships is wired exactly once.
+    # Every hook script the package ships is wired exactly once, except the
+    # opt-in ones (wired by bin/hooks-sync.py only when config/hooks.json asks).
+    opt_in = {"block-heavy-build.py"}
     shipped = sorted(
         p.name
         for p in (PACKAGE_ROOT / "system" / "hooks").iterdir()
-        if p.is_file() and p.suffix in {".py", ".sh"}
+        if p.is_file() and p.suffix in {".py", ".sh"} and p.name not in opt_in
     )
     assert sorted(commands) == shipped, (
         f"wired hooks {sorted(commands)} != shipped hook scripts {shipped}"

@@ -16,6 +16,7 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Safety hooks (`bash-safety-rails.py`, `block-bare-ssh.py`, opt-in `block-heavy-build.py`) wired by `bin/hooks-sync.py` from `config/hooks.json`, and a secrets pre-commit (`system/check-secrets.py`). Removed the `rewrite-sleep-poll.py` hook (`bin/wait-for.sh` stays).
 - `agent-server.py`: load stored facts from `memory.db` (and candidate facts from `data/memory-candidates/`) and routing-table `MEMORY.md` into `--append-system-prompt` at startup and session resume, closing the durable memory retrieval loop.
 
 ### Fixed
