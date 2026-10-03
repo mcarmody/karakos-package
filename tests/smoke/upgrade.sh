@@ -45,7 +45,7 @@ DC=(docker compose -f config/docker-compose.yml -f config/docker-compose.smoke.y
 EXTRA_PROJECTS=()
 
 open_perms() {   # the container user is not the runner's uid; let it write the bind mounts
-  chmod -R a+rwX "$OLD" "$HOME" 2>/dev/null || true
+  chmod -R a+rwX "$OLD" "$HOME" "$BACKUPS" 2>/dev/null || true
 }
 
 cleanup() {
@@ -253,6 +253,7 @@ docker run --rm -v "$DATA_VOL:/from:ro" -v "$REFUSE_VOL:/to" --user 0 --entrypoi
 # ---- dry run -------------------------------------------------------------------
 step "dry run (documented command), writes a report, changes nothing"
 BEFORE="$(vol_hash "$DATA_VOL")"
+open_perms   # the migrator runs as the container user and writes into $BACKUPS
 bin/karakos migrate --dry-run --report-to /backups/migration-plan.md --backup-to "$BACKUPS"
 [ -s "$BACKUPS/migration-plan.md" ] || { echo "FAIL: the dry run wrote no report" >&2; exit 1; }
 assert_eq "$(vol_hash "$DATA_VOL")" "$BEFORE" "volume hash after the dry run"
@@ -260,6 +261,7 @@ assert_eq "$BEFORE" "$SEED_HASH" "volume hash before vs after stop"
 
 # ---- the real run --------------------------------------------------------------
 step "real run (documented command)"
+open_perms
 bin/karakos migrate --auto --backup-to "$BACKUPS" > "$SMOKE_WORK/migrate.out" 2>&1 || { cat "$SMOKE_WORK/migrate.out" >&2; echo "FAIL: migrate exited non-zero" >&2; exit 1; }
 cat "$SMOKE_WORK/migrate.out"
 BACKUP="$(ls -1d "$BACKUPS"/pre-2.0-* | tail -1)"
