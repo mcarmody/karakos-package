@@ -37,6 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import ask_handler  # noqa: E402
 import registry as agent_registry  # noqa: E402
+import prompt_compose  # noqa: E402
 import tengwar  # noqa: E402
 from lib.migrate.guard import require_stamp  # noqa: E402
 
@@ -645,19 +646,11 @@ async def start_agent_subprocess(agent: str):
         return
 
     session_id = await get_or_create_session(agent)
-    system_prompt_path = WORKSPACE_ROOT / config.get("system_prompt", "")
-
-    if not system_prompt_path.exists():
-        log.error(f"System prompt not found for {agent}: {system_prompt_path}")
-        return
-
-    # The CLI's --system-prompt flag takes the prompt string, not a file
-    # path. Read the file contents here.
-    try:
-        system_prompt_text = system_prompt_path.read_text()
-    except Exception as e:
-        log.error(f"Failed to read system prompt for {agent}: {e}")
-        return
+    # Core + agent section + shard text + house style, composed at spawn so a
+    # fleet-wide rule is one edit. Never fails the spawn over a prompt file.
+    system_prompt_text = prompt_compose.compose_system_prompt(
+        WORKSPACE_ROOT, agent, config=config)
+    prompt_compose.write_generated(WORKSPACE_ROOT, agent, system_prompt_text)
 
     # Load persona
     persona_content = load_persona_files(agent)

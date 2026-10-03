@@ -39,6 +39,7 @@ _DEFAULTS = {
     "context_budget_tokens": None,
     "handoff_on_reset": False,
     "system_prompt": None,
+    "prompt": None,
     "tool_streaming": True,
     "stream_to_channel": False,
     "dashboard_chat": True,
@@ -51,7 +52,7 @@ _KNOWN_KEYS = {"name", "role", "shards", "discord"} | set(_DEFAULTS)
 
 # Keys copied verbatim into legacy_view() when explicitly set.
 _LEGACY_PASSTHROUGH = (
-    "system_prompt", "model", "max_turns", "timeout", "tool_streaming",
+    "system_prompt", "prompt", "model", "max_turns", "timeout", "tool_streaming",
     "stream_to_channel", "dashboard_chat", "allowed_tools", "disallowed_tools", "env",
     "label",
 )
@@ -121,6 +122,17 @@ def _check_type(aid, key, val, errors):
         errors.append(f"{p} must be true or false")
     elif key in ("system_prompt", "label") and val is not None and not isinstance(val, str):
         errors.append(f"{p} must be a path string")
+    elif key == "prompt" and val is not None:
+        if not isinstance(val, dict):
+            errors.append(f"{p} must be a mapping (section, core, house_style)")
+        else:
+            for k, v in val.items():
+                if k == "section" and not (v is None or isinstance(v, str)):
+                    errors.append(f"{p}.section must be a path string")
+                elif k in ("core", "house_style") and not isinstance(v, bool):
+                    errors.append(f"{p}.{k} must be true or false")
+                elif k not in ("section", "core", "house_style"):
+                    errors.append(f"{p}: unknown key '{k}'")
     elif key in ("allowed_tools", "disallowed_tools") and not _is_str_list(val):
         errors.append(f"{p} must be a list of strings")
     elif key == "env" and not (isinstance(val, dict)
