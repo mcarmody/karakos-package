@@ -16,6 +16,7 @@ import glob
 import json
 import os
 import sqlite3
+import sys
 import time
 from pathlib import Path
 
@@ -29,20 +30,40 @@ _ENV_KEYS = ("PATH", "WORKSPACE_ROOT", "AGENT_SERVER_TOKEN", "FAKE_CLAUDE_LOG_DI
 
 
 def write_agents_config(workspace: Path, agents) -> None:
-    """The one place the harness writes agent config (1.1a swaps this to
-    agents.yaml). `agents` is a list of ids or {id: config-overrides}."""
+    """The one place the harness writes agent config. Emits config/agents.yaml
+    (validated through lib/registry.py) and, because the server's readers move
+    in 1.1b, the legacy agents.json derived from the registry's legacy_view().
+    `agents` is a list of ids or {id: registry-schema overrides}; the first is
+    the primary, the rest `custom`. A registry needs a monitor, so one is added
+    to the yaml when none is given (it is not written to agents.json)."""
+    import yaml
+    sys.path.insert(0, str(PACKAGE_ROOT / "lib"))
+    try:
+        import registry
+    finally:
+        sys.path.pop(0)
     if not isinstance(agents, dict):
         agents = {name: {} for name in agents}
     entries = {}
-    for name, extra in agents.items():
+    for i, (name, extra) in enumerate(agents.items()):
         prompt_dir = workspace / "agents" / name
         prompt_dir.mkdir(parents=True, exist_ok=True)
         (prompt_dir / "SYSTEM_PROMPT.md").write_text(f"You are harness agent {name}.")
-        entries[name] = {"system_prompt": f"agents/{name}/SYSTEM_PROMPT.md",
+        entries[name] = {"name": name, "role": "primary" if i == 0 else "custom",
+                         "system_prompt": f"agents/{name}/SYSTEM_PROMPT.md",
                          "model": "fake-model", **(extra or {})}
-    (workspace / "config").mkdir(parents=True, exist_ok=True)
-    (workspace / "config" / "agents.json").write_text(json.dumps({"agents": entries}))
-    (workspace / "config" / "claude-settings.json").write_text(
+    if not any(e["role"] == "monitor" for e in entries.values()):
+        entries["monitor"] = {"name": "monitor", "role": "monitor", "model": "fake-model"}
+    config = workspace / "config"
+    config.mkdir(parents=True, exist_ok=True)
+    (config / "agents.yaml").write_text(
+        yaml.safe_dump({"version": registry.REGISTRY_VERSION, "agents": entries},
+                       sort_keys=False))
+    reg = registry.load_registry(workspace)  # fails loudly on a bad harness config
+    legacy = reg.legacy_view()["agents"]
+    (config / "agents.json").write_text(
+        json.dumps({"agents": {n: legacy[n] for n in agents}}))
+    (config / "claude-settings.json").write_text(
         json.dumps({"permissions": {"allow": [], "deny": []}}))
 
 
