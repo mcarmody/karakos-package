@@ -20,6 +20,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import hive
 import msgqueue
+import post_guard
 import stealing
 
 HOOK_NAMES = ("before_claim", "on_turn_start", "on_event", "on_turn_end")
@@ -468,7 +469,7 @@ async def read_events(
                             # dashboard chat page dedupes an interstitial
                             # against the final body it matches.
                             stripped = text.strip()
-                            if stripped and stripped.upper() != "PASS":
+                            if stripped and not post_guard.is_pass(stripped):
                                 event_seq += 1
                                 await state.write_turn_event(msg_ids, event_seq, "interstitial", stripped)
                     elif btype == "tool_use":

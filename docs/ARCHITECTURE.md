@@ -550,7 +550,7 @@ data/                                  # named volume
 │   ├── claude-cli.json                # known-good CLI version
 │   └── wedge-check-state.json
 ├── taskboard.json
-├── discord-dead-letter.jsonl          # replies Discord refused
+├── outbox/outbox.db                   # durable Discord replies: retry + audit (6.1)
 ├── handoff/<shard>.md                 # note for the next fresh session (rotated)
 └── stop-hook-extensions.json
 

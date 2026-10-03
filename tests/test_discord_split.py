@@ -94,7 +94,7 @@ def test_post_to_discord_reports_a_failed_chunk():
     """
     src = (PACKAGE_ROOT / "bin" / "agent-server.py").read_text()
     ast.parse(src)
-    body = src[src.index("async def post_to_discord") : src.index("async def start_typing")]
+    body = src[src.index("async def _post_direct") : src.index("def _discord_error_detail")]
     assert "failed += 1" in body
     assert "message is incomplete" in body
     assert "return None" in body.split("if failed:")[1]
@@ -114,4 +114,4 @@ def test_long_code_block_is_split_with_balanced_fences(script):
 def test_post_to_discord_renders_tables_before_splitting():
     src = (PACKAGE_ROOT / "bin" / "agent-server.py").read_text()
     body = src[src.index("async def post_to_discord") : src.index("async def post_discord_payload")]
-    assert body.index("tengwar.render_for_discord") < body.index("split_discord_message(content)")
+    assert body.index("tengwar.render_for_discord") < body.index("split_discord_message_visible(rendered)")
