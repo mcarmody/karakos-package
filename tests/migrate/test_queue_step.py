@@ -17,7 +17,7 @@ OLD = """CREATE TABLE message_queue (
  message_id TEXT UNIQUE NOT NULL, mentions_agent INTEGER DEFAULT 0, attachments TEXT,
  processed INTEGER DEFAULT 0, response TEXT, discord_response_id TEXT,
  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, processing_started_at TIMESTAMP,
- processed_at TIMESTAMP, not_before INTEGER);
+ processed_at TIMESTAMP);
 """
 
 

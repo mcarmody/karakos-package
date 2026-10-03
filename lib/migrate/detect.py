@@ -1,5 +1,6 @@
 """Read-only fingerprinting of a 1.x install. Never writes, never raises."""
 import json
+import re
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -7,7 +8,7 @@ from pathlib import Path
 
 @dataclass
 class Detected:
-    version: str            # "1.0" | "1.1" | "1.3" | "1.5" | "2.0" | "unknown"
+    version: str            # "1.0" | "1.3" | "1.5" | "2.0" | "unknown"
     layout: str
     evidence: list = field(default_factory=list)
 
@@ -89,15 +90,38 @@ def _detect(data: Path, config: Path, ev: list) -> Detected:
             ev.append("no 1.x fingerprints found")
         return Detected("unknown", "unknown", ev)
 
-    sessions = (agent_db or {}).get("sessions")
-    queue = (agent_db or {}).get("message_queue")
-    if sessions is not None:
-        ev.append("sessions table present")
-        return Detected("1.5", "agents.json+sessions", ev)
+    # Buckets from docs/migration-inventory.md (tags with identical mounts,
+    # volumes and tables collapse): 1.0 = v1.0.0..v1.2 (compose bind-mounts the
+    # whole checkout), 1.3 = v1.3..v1.4.1 (config/agents bind + logs/inbox
+    # volumes), 1.5 = v1.5.0 (adds rate_limit_state / turn_events). `.karakos/`
+    # is tracked in every tag, so it fingerprints nothing.
+    tables = agent_db or {}
+    if "rate_limit_state" in tables or "turn_events" in tables:
+        ev.append("rate_limit_state/turn_events table present")
+        return Detected("1.5", "agents.json+rate_limit_state", ev)
     if has_yaml:
         return Detected("1.5", "agents.yaml", ev)
-    if dot_karakos:
-        return Detected("1.3" if queue is not None else "1.1", ".karakos", ev)
+    compose = _compose_text(config)
+    if compose is not None:
+        if re.search(r"^\s*-\s*\.\.:/workspace\s*$", compose, re.M):
+            ev.append("compose bind-mounts the whole checkout (..:/workspace)")
+            return Detected("1.0", "checkout-bind", ev)
+        if "/workspace/config" in compose:
+            ev.append("compose bind-mounts config and agents separately")
+            return Detected("1.3", "split-volumes", ev)
     if agents_json is not None or agent_db is not None:
-        return Detected("1.0", "agents.json", ev)
+        # no compose file to read: fall back on the data shape
+        return Detected("1.3" if dot_karakos else "1.0",
+                        "split-volumes" if dot_karakos else "checkout-bind", ev)
     return Detected("unknown", "unknown", ev)
+
+
+def _compose_text(config: Path):
+    for name in ("docker-compose.yml", "docker-compose.yml.pre-2.0"):
+        f = config / name
+        if f.is_file():
+            try:
+                return f.read_text()
+            except OSError:
+                return None
+    return None
