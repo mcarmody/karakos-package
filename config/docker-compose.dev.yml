@@ -7,9 +7,22 @@
 # Python/Node dependencies and want to test changes before publishing a release.
 # Regular users should use docker-compose.yml on its own (docker compose pull).
 
+#
+# The dashboard is built from karakos-dashboard at the ref in dashboard.ref. The
+# build does no fetch of its own: put the verified source in vendor/ first,
+# then build (optionally for another ref):
+#   GH_TOKEN=... bin/fetch-dashboard.sh --ref <sha>
+#   docker compose -f config/docker-compose.yml -f config/docker-compose.dev.yml \
+#     build --build-arg DASHBOARD_REF=<sha>
+# or `export DASHBOARD_REF=<sha>` (empty means the pinned ref). Without a token,
+# download a release bundle (karakos-dashboard-bundle-<sha12>.tar.gz + .sha256)
+# into vendor/ instead.
+
 services:
   karakos:
     build:
       context: ..
       dockerfile: Dockerfile
+      args:
+        DASHBOARD_REF: ${DASHBOARD_REF:-}
     image: karakos-dev:local

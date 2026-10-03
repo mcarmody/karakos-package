@@ -1,9 +1,13 @@
-.PHONY: install preflight up down ps logs shell pull help
+.PHONY: install preflight up down ps logs shell pull help vendor-dashboard
 
 # The compose file lives in config/, not at the repo root, and its env file
 # sits beside it. Every target goes through these two flags so that `make`
 # works from the repo root — a bare `docker compose` there finds no file.
 COMPOSE := docker compose -f config/docker-compose.yml --env-file config/.env
+
+## vendor-dashboard: Fetch the pinned dashboard source into vendor/ (needs GH_TOKEN with read access to karakos-dashboard).
+vendor-dashboard:
+	./bin/fetch-dashboard.sh
 
 ## install: Run preflight checks, then pull and start the container.
 install:

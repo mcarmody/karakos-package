@@ -33,7 +33,6 @@ exclude:
   - agents/
   - bin/
   - config/
-  - dashboard/
   - docs/
   - installer/
   - mcp/
