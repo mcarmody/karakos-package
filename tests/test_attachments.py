@@ -275,7 +275,12 @@ def _write_pre_upgrade_database(ags):
             discord_response_id TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             processing_started_at TIMESTAMP,
-            processed_at TIMESTAMP
+            processed_at TIMESTAMP,
+            -- schema-2.0 columns arrive via the 20_queue migrator step, not boot;
+            -- this test covers the older attachments/not_before boot migration.
+            call_id TEXT, reply_to_agent TEXT, priority INTEGER DEFAULT 0,
+            expires_at TEXT, depth INTEGER DEFAULT 0, partial_response TEXT,
+            restart_count INTEGER DEFAULT 0, claimed_by TEXT, owner_agent TEXT
         )
     """)
     con.commit()

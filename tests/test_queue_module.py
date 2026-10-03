@@ -1,0 +1,196 @@
+"""lib/msgqueue.py (spec 1.2): ordering, expiry, call rows, double claim, wake-up."""
+import asyncio
+import importlib.util
+import json
+import os
+import sys
+from pathlib import Path
+
+import pytest
+
+aiosqlite = pytest.importorskip("aiosqlite")
+pytest.importorskip("aiohttp")
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "lib"))
+import msgqueue  # noqa: E402
+
+
+def _load(workspace):
+    prev = os.environ.get("WORKSPACE_ROOT")
+    os.environ["WORKSPACE_ROOT"] = str(workspace)
+    try:
+        spec = importlib.util.spec_from_file_location("ags_queue_module", ROOT / "bin" / "agent-server.py")
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["ags_queue_module"] = mod
+        spec.loader.exec_module(mod)
+    finally:
+        if prev is None:
+            os.environ.pop("WORKSPACE_ROOT", None)
+        else:
+            os.environ["WORKSPACE_ROOT"] = prev
+    return mod
+
+
+@pytest.fixture
+def ags(tmp_path):
+    return _load(tmp_path)
+
+
+def run(coro):
+    return asyncio.run(coro)
+
+
+async def add(db, shard, n, priority=0, call_id=None, reply_to=None, expires=None, created=None):
+    await db.execute(
+        "INSERT INTO message_queue (agent, channel, channel_id, author, content, message_id,"
+        " priority, call_id, reply_to_agent, expires_at, created_at)"
+        " VALUES (?, 'c', '0', 'u', 'x', ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))",
+        (shard, f"m{shard}{n}", priority, call_id, reply_to, expires, created))
+    await db.commit()
+
+
+def test_priority_then_age_then_id(ags):
+    async def go():
+        await ags.init_db()
+        db = ags.db
+        await add(db, "a", 1, created="2026-01-01 00:00:01")
+        await add(db, "a", 2, priority=5, created="2026-01-01 00:00:09")
+        await add(db, "a", 3, created="2026-01-01 00:00:01")
+        await add(db, "a", 4, priority=5, created="2026-01-01 00:00:02")
+        rows = await msgqueue.claim_batch(db, "a", 20, "2026-06-01T00:00:00Z")
+        assert [r["message_id"] for r in rows] == ["ma4", "ma2", "ma1", "ma3"]
+        assert all(r["claimed_by"] == "a" and r["processed"] == 1 for r in rows)
+        assert await msgqueue.claim_batch(db, "a", 20) == []
+        await db.close()
+    run(go())
+
+
+def test_limit_and_other_shard_untouched(ags):
+    async def go():
+        await ags.init_db()
+        db = ags.db
+        for i in range(25):
+            await add(db, "a", i)
+        await add(db, "b", 0)
+        assert len(await msgqueue.claim_batch(db, "a", 20)) == 20
+        assert len(await msgqueue.claim_batch(db, "a", 20)) == 5
+        assert len(await msgqueue.claim_batch(db, "b", 20)) == 1
+        await db.close()
+    run(go())
+
+
+def test_expiry_skips_and_ordinary_row_has_no_reply(ags):
+    async def go():
+        await ags.init_db()
+        db = ags.db
+        await add(db, "a", 1, expires="2026-01-01T00:00:00Z")
+        await add(db, "a", 2, expires="2999-01-01T00:00:00Z")
+        rows = await msgqueue.claim_batch(db, "a", 20, "2026-06-01T00:00:00Z")
+        assert [r["message_id"] for r in rows] == ["ma2"]
+        async with db.execute("SELECT processed, response FROM message_queue WHERE message_id='ma1'") as c:
+            r = await c.fetchone()
+        assert (r["processed"], r["response"]) == (msgqueue.STATUS_SKIPPED, "expired")
+        async with db.execute("SELECT COUNT(*) n FROM message_queue") as c:
+            assert (await c.fetchone())["n"] == 2          # no reply row
+        await db.close()
+    run(go())
+
+
+def test_call_row_claimed_alone_and_expired_call_replies(ags):
+    async def go():
+        await ags.init_db()
+        db = ags.db
+        await add(db, "a", 1, priority=9, call_id="c1", reply_to="caller")
+        await add(db, "a", 2)
+        await add(db, "a", 3)
+        first = await msgqueue.claim_batch(db, "a", 20)
+        assert [r["call_id"] for r in first] == ["c1"]
+        second = await msgqueue.claim_batch(db, "a", 20)
+        assert [r["message_id"] for r in second] == ["ma2", "ma3"]
+        # a call row behind ordinary rows is not swept into their batch
+        await add(db, "a", 4)
+        await add(db, "a", 5, call_id="c2", reply_to="caller")
+        batch = await msgqueue.claim_batch(db, "a", 20)
+        assert [r["message_id"] for r in batch] == ["ma4"]
+        await db.close()
+    run(go())
+
+    async def go2():
+        a2 = _load(ags.WORKSPACE_ROOT / "second")
+        await a2.init_db()
+        db = a2.db
+        await add(db, "a", 1, call_id="c9", reply_to="caller", expires="2026-01-01T00:00:00Z")
+        assert await msgqueue.expire(db, "a", "2026-06-01T00:00:00Z") == 1
+        async with db.execute("SELECT * FROM message_queue WHERE agent='caller'") as c:
+            reply = await c.fetchone()
+        assert reply["call_id"] == "c9" and reply["processed"] == 0
+        assert json.loads(reply["content"]) == {"error": "expired", "call_id": "c9"}
+        # idempotent: a second expire pass writes nothing more
+        assert await msgqueue.expire(db, "a", "2026-06-01T00:00:00Z") == 0
+        async with db.execute("SELECT COUNT(*) n FROM message_queue") as c:
+            assert (await c.fetchone())["n"] == 2
+        await db.close()
+    run(go2())
+
+
+def test_release_and_partial(ags):
+    async def go():
+        await ags.init_db()
+        db = ags.db
+        await add(db, "a", 1)
+        [row] = await msgqueue.claim_batch(db, "a", 5)
+        await msgqueue.set_partial(db, row["id"], "half")
+        assert await msgqueue.release(db, [row["id"]]) == 1
+        again = await msgqueue.claim_batch(db, "a", 5)
+        assert again[0]["partial_response"] == "half" and again[0]["id"] == row["id"]
+        await db.close()
+    run(go())
+
+
+def test_double_claim_partitions_200_iterations(ags):
+    async def go():
+        await ags.init_db()
+        db = ags.db
+        await db.execute("PRAGMA synchronous = OFF")
+        for it in range(200):
+            for i in range(6):
+                await add(db, "a", f"{it}-{i}")
+            r1, r2 = await asyncio.gather(
+                msgqueue.claim_batch(db, "a", 4), msgqueue.claim_batch(db, "a", 4))
+            ids1, ids2 = {r["id"] for r in r1}, {r["id"] for r in r2}
+            assert not ids1 & ids2
+            assert len(ids1) + len(ids2) == 6
+        await db.close()
+    run(go())
+
+
+def test_wait_for_work():
+    async def go():
+        async def poke(shard, delay):
+            await asyncio.sleep(delay)
+            msgqueue.notify(shard)
+        t = asyncio.create_task(poke("a", 0.05))
+        assert await msgqueue.wait_for_work("a", 2) is True
+        await t
+        assert not await msgqueue.wait_for_work("a", 0.1)
+        # a row for shard B does not wake a waiter on shard A
+        t = asyncio.create_task(poke("b", 0.05))
+        assert not await msgqueue.wait_for_work("a", 0.3)
+        await t
+    run(go())
+
+
+def test_boot_refuses_unmigrated_queue(ags):
+    import sqlite3
+    ags.DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(ags.DB_PATH)
+    con.execute("CREATE TABLE message_queue (id INTEGER PRIMARY KEY AUTOINCREMENT, agent TEXT NOT NULL,"
+                " channel TEXT NOT NULL, channel_id TEXT NOT NULL, author TEXT NOT NULL,"
+                " content TEXT NOT NULL, message_id TEXT UNIQUE NOT NULL, processed INTEGER DEFAULT 0,"
+                " created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+    con.commit()
+    con.close()
+    with pytest.raises(SystemExit) as e:
+        run(ags.init_db())
+    assert "karakos migrate" in str(e.value)
