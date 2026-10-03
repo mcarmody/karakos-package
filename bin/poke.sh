@@ -15,7 +15,8 @@ WORKSPACE_ROOT="${WORKSPACE_ROOT:-/workspace}"
 AGENT_SERVER_TOKEN="${AGENT_SERVER_TOKEN:-}"
 AGENT_SERVER_PORT="${AGENT_SERVER_PORT:-18791}"
 CHANNELS_CONFIG="${WORKSPACE_ROOT}/config/channels.json"
-AGENTS_CONFIG="${WORKSPACE_ROOT}/config/agents.json"
+AGENTS_CONFIG="${WORKSPACE_ROOT}/config/agents.yaml"
+REGISTRY_PY="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib" && pwd)/registry.py"
 
 # Defaults
 AGENT=""
@@ -63,7 +64,7 @@ if [ -z "$AGENT" ]; then
         echo "Error: Agents config not found: $AGENTS_CONFIG" >&2
         exit 1
     fi
-    AGENT=$(jq -r '.agents | keys[0]' "$AGENTS_CONFIG")
+    AGENT=$(python3 "$REGISTRY_PY" --workspace "$WORKSPACE_ROOT" role primary | head -1)
 fi
 
 # Get channel ID

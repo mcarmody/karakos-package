@@ -211,13 +211,15 @@ def _write_agent(tmp_workspace, name, extra_config=None):
     agent_dir.mkdir(parents=True, exist_ok=True)
     (agent_dir / "SYSTEM_PROMPT.md").write_text("You are a test agent.")
 
-    agents_json_path = tmp_workspace / "config" / "agents.json"
-    cfg = json.loads(agents_json_path.read_text())
-    entry = {"system_prompt": f"agents/{name}/SYSTEM_PROMPT.md"}
+    import yaml
+    path = tmp_workspace / "config" / "agents.yaml"
+    cfg = yaml.safe_load(path.read_text())
+    entry = {"name": name, "role": "custom",
+             "system_prompt": f"agents/{name}/SYSTEM_PROMPT.md"}
     if extra_config:
         entry.update(extra_config)
     cfg["agents"][name] = entry
-    agents_json_path.write_text(json.dumps(cfg))
+    path.write_text(yaml.safe_dump(cfg, sort_keys=False))
 
 
 def _spawn_and_capture(monkeypatch, tmp_workspace, agent_name):

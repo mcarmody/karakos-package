@@ -133,6 +133,12 @@ def adapter(relay, monkeypatch):
     """A DiscordAdapter with no Discord connection, recording what it routes."""
     monkeypatch.setattr(relay, "channels_config", CHANNELS)
     monkeypatch.setattr(relay, "agent_config", {"amos": {}, "kothar": {}})
+    import registry
+    monkeypatch.setattr(relay, "registry_obj", registry.parse_registry({
+        "version": 2, "agents": {
+            "amos": {"name": "amos", "role": "primary", "shards": [
+                {"id": "amos", "channels": ["kitchen", "general", "agent-chat"]}]},
+            "kothar": {"name": "kothar", "role": "monitor"}}}))
     monkeypatch.setattr(relay, "discord_id_to_agent",
                         {AMOS_BOT_ID: "amos", KOTHAR_BOT_ID: "kothar"})
 

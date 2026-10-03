@@ -5,7 +5,7 @@
     reg = load_registry(workspace)        # raises RegistryError listing every problem
     reg.primary(); reg.monitor(); reg.shards(); reg.legacy_view()
 
-CLI:  python3 lib/registry.py [--workspace DIR] ids | field <id> <key> | role <role> | validate
+CLI:  python3 lib/registry.py [--workspace DIR] ids | field <id> <key> | role <role> | legacy | validate
 
 Keying rule: a shard ``id`` is the runtime key everywhere (queue, sessions, cost
 rows, states, locks). The default shard of agent ``X`` has id ``X``. Account-level
@@ -45,6 +45,7 @@ _DEFAULTS = {
     "allowed_tools": [],
     "disallowed_tools": [],
     "env": {},
+    "label": None,
 }
 _KNOWN_KEYS = {"name", "role", "shards", "discord"} | set(_DEFAULTS)
 
@@ -52,6 +53,7 @@ _KNOWN_KEYS = {"name", "role", "shards", "discord"} | set(_DEFAULTS)
 _LEGACY_PASSTHROUGH = (
     "system_prompt", "model", "max_turns", "timeout", "tool_streaming",
     "stream_to_channel", "dashboard_chat", "allowed_tools", "disallowed_tools", "env",
+    "label",
 )
 
 
@@ -117,7 +119,7 @@ def _check_type(aid, key, val, errors):
     elif key in ("handoff_on_reset", "tool_streaming", "stream_to_channel",
                  "dashboard_chat") and not isinstance(val, bool):
         errors.append(f"{p} must be true or false")
-    elif key == "system_prompt" and val is not None and not isinstance(val, str):
+    elif key in ("system_prompt", "label") and val is not None and not isinstance(val, str):
         errors.append(f"{p} must be a path string")
     elif key in ("allowed_tools", "disallowed_tools") and not _is_str_list(val):
         errors.append(f"{p} must be a list of strings")
@@ -380,6 +382,97 @@ def write_agent(workspace, agent_id, body):
 
 
 # --------------------------------------------------------------------------
+# legacy migration (called only by lib/migrate/steps/10_registry.py)
+# --------------------------------------------------------------------------
+
+LEGACY_BACKUP_SUFFIX = ".pre-2.0"
+_DEFAULT_MONITOR = {"name": "relay", "role": "monitor", "model": "haiku",
+                    "dashboard_chat": False}
+
+
+def legacy_to_registry_dict(old, channels=None):
+    """Convert a parsed 1.x agents.json dict (and channels.json dict) into a
+    schema-2 mapping. Pure. Raises RegistryError when the input is unusable."""
+    raw = old.get("agents") if isinstance(old, dict) else None
+    if not isinstance(raw, dict) or not raw:
+        raise RegistryError(["agents.json has no agents to migrate"])
+    ids = list(raw)
+    roles = {}
+    for i, aid in enumerate(ids):
+        body = raw[aid] if isinstance(raw[aid], dict) else {}
+        prompt = str(body.get("system_prompt") or "")
+        if i == 0:
+            roles[aid] = "primary"
+        elif aid == "relay":
+            roles[aid] = "monitor"
+        elif ("builder" in aid or "builder" in prompt) and "builder" not in roles.values():
+            roles[aid] = "builder"
+        elif ("reviewer" in aid or "reviewer" in prompt) and "reviewer" not in roles.values():
+            roles[aid] = "reviewer"
+        else:
+            roles[aid] = "custom"
+    agents = {}
+    for aid in ids:
+        body = raw[aid] if isinstance(raw[aid], dict) else {}
+        entry = {"name": aid, "role": roles[aid]}
+        for k, v in body.items():
+            if k == "discord_bot_token_env":
+                entry.setdefault("discord", {})["token_env"] = v
+            elif k == "discord_bot_id_env":
+                entry.setdefault("discord", {})["bot_id_env"] = v
+            else:
+                entry[k] = v
+        agents[aid] = entry
+    if "monitor" not in roles.values():
+        mid = "relay" if "relay" not in agents else "monitor"
+        agents[mid] = {**_DEFAULT_MONITOR, "name": mid}
+    chans = (channels or {}).get("channels") if isinstance(channels, dict) else None
+    if isinstance(chans, dict):
+        owned = {}
+        for cname, info in chans.items():
+            target = info.get("default_agent") if isinstance(info, dict) else None
+            if target in agents:
+                owned.setdefault(target, []).append(cname)
+        for aid, names in owned.items():
+            agents[aid]["shards"] = [{"id": aid, "channels": names}]
+    return {"version": REGISTRY_VERSION, "agents": agents}
+
+
+def migrate_legacy(workspace):
+    """Convert config/agents.json (+ channels.json default_agent) into
+    config/agents.yaml and keep a copy of the original as agents.json.pre-2.0.
+    Idempotent: a no-op (returns False) when agents.yaml already exists.
+    The original agents.json is left in place."""
+    cfg = Path(workspace) / "config"
+    legacy, target = cfg / "agents.json", cfg / "agents.yaml"
+    if target.exists() or not legacy.exists():
+        return False
+    try:
+        old = json.loads(legacy.read_text())
+    except (OSError, ValueError) as exc:
+        raise RegistryError([f"config/agents.json unreadable: {exc}"])
+    channels = None
+    chan_path = cfg / "channels.json"
+    if chan_path.exists():
+        try:
+            channels = json.loads(chan_path.read_text())
+        except (OSError, ValueError):
+            channels = None
+    doc = legacy_to_registry_dict(old, channels)
+    names, _ = _channel_names(workspace)
+    parse_registry(doc, names)                      # refuse before writing anything
+    text = ("# Karakos agent registry (schema 2). Migrated from agents.json.\n"
+            + yaml.safe_dump(doc, sort_keys=False, default_flow_style=False))
+    pre = cfg / ("agents.json" + LEGACY_BACKUP_SUFFIX)
+    if not pre.exists():
+        pre.write_text(legacy.read_text())
+    tmp = target.with_name(target.name + ".tmp")
+    tmp.write_text(text)
+    os.replace(tmp, target)
+    return True
+
+
+# --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
 
@@ -398,7 +491,7 @@ def main(argv=None):
     ws = os.environ.get("WORKSPACE_ROOT") or str(Path(__file__).resolve().parent.parent)
     if argv[:1] == ["--workspace"] and len(argv) >= 2:
         ws, argv = argv[1], argv[2:]
-    usage = "usage: registry.py [--workspace DIR] ids | field <id> <key> | role <role> | validate"
+    usage = "usage: registry.py [--workspace DIR] ids | field <id> <key> | role <role> | legacy | validate"
     if not argv:
         print(usage, file=sys.stderr)
         return 2
@@ -412,6 +505,9 @@ def main(argv=None):
         print(f"warning: {w}", file=sys.stderr)
     if cmd == "validate" and not args:
         print("ok")
+        return 0
+    if cmd == "legacy" and not args:
+        print(json.dumps(reg.legacy_view()))
         return 0
     if cmd == "ids" and not args:
         print("\n".join(reg.ids()))

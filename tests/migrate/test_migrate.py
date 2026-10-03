@@ -140,7 +140,7 @@ def test_detect_corrupt_db_reported_not_raised(tmp_path):
 
 def make_install(root: Path):
     (root / "config").mkdir(parents=True)
-    (root / "config" / "agents.json").write_text('{"agents": {}}')
+    (root / "config" / "agents.json").write_text('{"agents": {"a": {}}}')
     (root / ".env").write_text("TOKEN=abc\n")
     (root / "agents" / "a").mkdir(parents=True)
     (root / "agents" / "a" / "SYSTEM_PROMPT.md").write_text("hi")
@@ -270,7 +270,7 @@ def test_unknown_schema_refused_without_force(tmp_path):
 
 
 def test_default_step_chain_loads():
-    assert [s.name for s in runner.load_steps()] == ["00_noop"]
+    assert [s.name for s in runner.load_steps()] == ["00_noop", "10_registry"]
 
 
 def test_cli_exit_codes(tmp_path):

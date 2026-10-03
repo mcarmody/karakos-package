@@ -28,7 +28,9 @@ TICK_SECONDS = int(os.environ.get("SCHEDULER_TICK_SECONDS", "15"))
 
 # bin/ is not a package; import the oneshot primitive from this script's dir.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import oneshot  # noqa: E402
+import registry as agent_registry  # noqa: E402
 
 # Logging
 log = logging.getLogger("scheduler")
@@ -231,26 +233,23 @@ def main():
     """Main scheduler loop"""
     log.info("Scheduler starting")
 
-    # Load agents config to get agent names
-    agents_config_path = WORKSPACE_ROOT / "config" / "agents.json"
-    if agents_config_path.exists():
-        with open(agents_config_path) as f:
-            config = json.load(f)
-            agents = list(config.get("agents", {}).keys())
-    else:
-        agents = []
-        log.warning("No agents config found")
+    # Load the registry: the primary gets the heartbeat, and so does the monitor
+    try:
+        reg = agent_registry.load_registry(WORKSPACE_ROOT)
+        primary_agent = reg.primary().id
+        monitor_agent = reg.monitor().id
+    except agent_registry.RegistryError as e:
+        primary_agent = monitor_agent = None
+        log.warning(f"No usable agent registry: {e}")
 
     # Schedule heartbeats for each agent (staggered by 15 minutes)
-    if agents:
-        primary_agent = agents[0]
+    if primary_agent:
         schedule.every(30).minutes.do(lambda: run_heartbeat(primary_agent))
         log.info(f"Scheduled heartbeat for primary agent: {primary_agent}")
 
-        # Schedule relay agent if exists
-        if "relay" in agents:
-            schedule.every(30).minutes.at(":15").do(lambda: run_heartbeat("relay"))
-            log.info("Scheduled heartbeat for relay agent")
+        # The monitor (the old "relay" agent) heartbeats offset by 15 minutes
+        schedule.every(30).minutes.at(":15").do(lambda: run_heartbeat(monitor_agent))
+        log.info(f"Scheduled heartbeat for monitor agent: {monitor_agent}")
 
     # Schedule maintenance tasks
     schedule.every().day.at("03:00").do(run_memory_maintenance)

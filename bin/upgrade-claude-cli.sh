@@ -71,24 +71,26 @@ usage() {
 # would fail the probe and revert a perfectly good upgrade, and the model the
 # agents actually use is the one whose breakage matters.
 verify_model() {
-    local cfg="$WORKSPACE_ROOT/config/agents.json"
+    local cfg="$WORKSPACE_ROOT/config/agents.yaml"
+    local reg_py
+    reg_py="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib" && pwd)/registry.py"
     if [[ -n "${CLI_VERIFY_MODEL:-}" ]]; then
         printf '%s' "$CLI_VERIFY_MODEL"
         return 0
     fi
     if [[ -f "$cfg" ]]; then
         local m
-        m=$(python3 -c '
+        m=$(python3 "$reg_py" --workspace "$WORKSPACE_ROOT" legacy 2>/dev/null | python3 -c '
 import json, sys
 try:
-    agents = json.load(open(sys.argv[1])).get("agents") or {}
+    agents = json.load(sys.stdin).get("agents") or {}
 except Exception:
     sys.exit(0)
 for _, info in agents.items():
     if isinstance(info, dict) and info.get("model"):
         print(info["model"])
         break
-' "$cfg" 2>/dev/null || true)
+' 2>/dev/null || true)
         if [[ -n "$m" ]]; then
             printf '%s' "$m"
             return 0

@@ -822,10 +822,12 @@ def handle_core_tool(tool_name: str, args: dict) -> dict:
                 "workspace": str(WORKSPACE),
             }
         elif action == "agents":
-            agents_path = WORKSPACE / "config" / "agents.json"
-            if agents_path.exists():
-                return json.loads(agents_path.read_text())
-            return {"agents": {}}
+            sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+            import registry as agent_registry
+            try:
+                return agent_registry.load_registry(WORKSPACE).legacy_view()
+            except agent_registry.RegistryError as e:
+                return {"agents": {}, "error": str(e)}
         elif action == "config":
             config_path = WORKSPACE / ".karakos" / "config.json"
             if config_path.exists():

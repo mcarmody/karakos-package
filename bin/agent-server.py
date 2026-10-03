@@ -36,6 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 # lib/ is a package root for lib.migrate (the schema-stamp guard).
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import ask_handler  # noqa: E402
+import registry as agent_registry  # noqa: E402
 import tengwar  # noqa: E402
 from lib.migrate.guard import require_stamp  # noqa: E402
 
@@ -46,7 +47,7 @@ from lib.migrate.guard import require_stamp  # noqa: E402
 WORKSPACE_ROOT = Path(os.environ.get("WORKSPACE_ROOT", "/workspace"))
 PORT = int(os.environ.get("AGENT_SERVER_PORT", "18791"))
 DB_PATH = WORKSPACE_ROOT / "data" / "memory" / "agent-server.db"
-AGENTS_CONFIG_PATH = WORKSPACE_ROOT / "config" / "agents.json"
+AGENTS_CONFIG_PATH = WORKSPACE_ROOT / "config" / "agents.yaml"
 CHANNELS_CONFIG_PATH = WORKSPACE_ROOT / "config" / "channels.json"
 CLAUDE_SETTINGS_PATH = WORKSPACE_ROOT / "config" / "claude-settings.json"
 STREAM_LOG_DIR = WORKSPACE_ROOT / "logs" / "agent-streams"
@@ -348,15 +349,20 @@ async def load_config():
     """Load agent and channel configuration from JSON files"""
     global agent_config, channels_config, AGENT_TOKENS, DISCORD_ID_TO_AGENT
 
-    # Load agents config
-    if AGENTS_CONFIG_PATH.exists():
-        with open(AGENTS_CONFIG_PATH) as f:
-            config_data = json.load(f)
-            agent_config = config_data.get("agents", {})
-            log.info(f"Loaded configuration for {len(agent_config)} agents")
+    # Load agents config (config/agents.yaml via the registry). A missing or
+    # invalid registry is an error: there is no legacy-config fallback, since the
+    # migrator owns the 1.x conversion.
+    try:
+        reg = agent_registry.load_registry(WORKSPACE_ROOT)
+    except agent_registry.RegistryError as e:
+        # Keep whatever is already loaded (empty on first boot); never wipe a
+        # running config because of a bad edit.
+        log.error(f"Agent registry unusable: {e}")
     else:
-        log.error(f"Agents config not found: {AGENTS_CONFIG_PATH}")
-        agent_config = {}
+        for w in reg.warnings:
+            log.warning(f"registry: {w}")
+        agent_config = reg.legacy_view()["agents"]
+        log.info(f"Loaded configuration for {len(agent_config)} agents")
 
     # Load channels config
     if CHANNELS_CONFIG_PATH.exists():
@@ -367,7 +373,13 @@ async def load_config():
         log.warning(f"Channels config not found: {CHANNELS_CONFIG_PATH}")
         channels_config = {}
 
-    # Build Discord token map
+    _rebuild_token_maps()
+
+
+def _rebuild_token_maps():
+    """Rebuild AGENT_TOKENS / DISCORD_ID_TO_AGENT from agent_config."""
+    AGENT_TOKENS.clear()
+    DISCORD_ID_TO_AGENT.clear()
     for agent_name, config in agent_config.items():
         token_env_var = config.get("discord_bot_token_env")
         if token_env_var:
@@ -691,7 +703,7 @@ async def start_agent_subprocess(agent: str):
     if allowed:
         cmd.extend(["--allowedTools", ",".join(allowed)])
 
-    # Per-agent environment (#99) — agents.json's `env` dict is layered onto
+    # Per-agent environment (#99) — the registry's `env` dict is layered onto
     # the server's own environment rather than replacing it, so the agent
     # still inherits API keys, WORKSPACE_ROOT, etc. Per-agent entries win on
     # collision, which is the point: an operator scoping one agent to a
@@ -1542,7 +1554,7 @@ def gateway_agent() -> Optional[str]:
     This matters for #101 and only for #101. A button click is delivered over
     the gateway to the application that posted the message, and the relay
     holds exactly one gateway connection — opened with the first agent in
-    agents.json that has a token (bin/relay.py::main). A question posted
+    agents.yaml that has a token (bin/relay.py::main). A question posted
     under any other agent's token renders fine and is then simply
     unclickable: Discord has nowhere to deliver the interaction. So the ask
     embed goes out under this token regardless of which agent asked, and the
@@ -1861,7 +1873,7 @@ async def read_agent_response(
     # tool_use branch below could not fire on any install. The issue's
     # acceptance test requires the lines to appear, and an opt-in nobody
     # knows about does not answer "is it broken?" for the people asking.
-    # Set "tool_streaming": false in agents.json to go back to silence.
+    # Set "tool_streaming": false in agents.yaml to go back to silence.
     tool_streaming = config.get("tool_streaming", True)
     stream_to_channel = config.get("stream_to_channel", False)
     msg_ids = message_ids or []
@@ -2602,7 +2614,7 @@ async def handle_agents(request):
             # Chat-picker hygiene: not every configured agent is meant to be
             # talked to directly from the dashboard (a low-capability relay
             # exists to route, not converse). Defaults true so existing
-            # agents.json files with no opinion keep showing up. "label" is
+            # agents.yaml files with no opinion keep showing up. "label" is
             # a human-friendly display name, defaulting to the raw agent key.
             "dashboard_chat": config.get("dashboard_chat", True),
             "label": config.get("label", agent),
@@ -2627,6 +2639,7 @@ async def handle_agent_reset(request):
 
 async def handle_agent_reload(request):
     """POST /agents/{name}/reload - Bounce subprocess, preserve session."""
+    global agent_config
     auth_header = request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer ") or auth_header[7:] != AGENT_SERVER_TOKEN:
         return web.json_response({"error": "Unauthorized"}, status=401)
@@ -2634,6 +2647,19 @@ async def handle_agent_reload(request):
     agent = request.match_info.get("name")
     if agent not in agent_config:
         return web.json_response({"error": "Unknown agent"}, status=404)
+
+    # B19: re-read the registry so edits to agents.yaml take effect. An invalid
+    # edit keeps the running config and reports every problem.
+    try:
+        reg = agent_registry.load_registry(WORKSPACE_ROOT)
+    except agent_registry.RegistryError as e:
+        return web.json_response(
+            {"error": "invalid agents.yaml; keeping previous config",
+             "problems": e.problems},
+            status=400,
+        )
+    agent_config = reg.legacy_view()["agents"]
+    _rebuild_token_maps()
 
     await reload_agent(agent)
     return web.json_response({"status": "reloaded"})
@@ -2794,10 +2820,10 @@ _AGENT_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 async def handle_agent_register(request):
     """POST /agents/{name}/register - Hot-load a newly-created agent.
 
-    bin/create-agent.sh writes the new agent into config/agents.json and
+    bin/create-agent.sh writes the new agent into config/agents.yaml and
     then POSTs here so the running server picks it up without a full
     restart. This endpoint:
-      1. re-reads agents.json (and channels.json) via load_config()
+      1. re-reads agents.yaml (and channels.json) via load_config()
       2. confirms the new agent now appears in agent_config
       3. starts its subprocess (the same code path startup() uses)
 
@@ -2819,7 +2845,7 @@ async def handle_agent_register(request):
             status=409,
         )
 
-    # Re-read agents.json + channels.json so the new entry, its Discord
+    # Re-read agents.yaml + channels.json so the new entry, its Discord
     # token mapping, and any new channel routing all become visible to
     # the running server.
     await load_config()
@@ -2829,7 +2855,7 @@ async def handle_agent_register(request):
             {
                 "error": (
                     f"Agent '{agent}' not found in config after reload — "
-                    "verify it was written to config/agents.json"
+                    "verify it was written to config/agents.yaml"
                 )
             },
             status=404,
