@@ -20,5 +20,5 @@ SCRIPT = Path(__file__).parent / "smoke" / "fresh_install.sh"
 def test_fresh_install_comes_up_and_answers():
     require_docker()
     proc = subprocess.run(["bash", str(SCRIPT)], capture_output=True, text=True, timeout=900)
-    assert proc.returncode == 0, f"{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}"
+    assert proc.returncode == 0, f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
     assert "fresh-install smoke: PASS" in proc.stdout

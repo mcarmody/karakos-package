@@ -1,0 +1,62 @@
+/**
+ * Design-token seam — the custom-property contract. Placeholder values only: they mirror the current dashboard look
+ * (app/globals.css) so importing this file changes nothing visually. A custom
+ * visual design replaces the *values* here; the property names are the
+ * contract other work (the chat-first shell, etc.) is allowed to depend on.
+ *
+ * Do not consume these in existing pages — nothing here restyles anything.
+ * Imported ABOVE globals.css in the root layout so any future page opting
+ * into these tokens can still be overridden by a more specific globals.css
+ * rule during the transition.
+ */
+
+:root,
+[data-theme="dark"] {
+  --ground: #030712; /* == --bg-base */
+  --panel: #111827; /* == --bg-surface */
+  --ink: #f9fafb; /* == --text-primary */
+  --ink-soft: #9ca3af; /* == --text-secondary */
+  --line: #1f2937; /* == --border */
+  --accent: #3b82f6;
+  --accent-ink: #ffffff;
+  --bubble-agent: #1f2937; /* == --bg-elevated */
+  --bubble-user: #3b82f6; /* == --accent */
+  --bubble-user-ink: #ffffff;
+  --good: #22c55e;
+  --warn: #f59e0b;
+  --crit: #ef4444;
+}
+
+[data-theme="light"] {
+  --ground: #f9fafb;
+  --panel: #ffffff;
+  --ink: #111827;
+  --ink-soft: #6b7280;
+  --line: #e5e7eb;
+  --accent: #3b82f6;
+  --accent-ink: #ffffff;
+  --bubble-agent: #f3f4f6;
+  --bubble-user: #3b82f6;
+  --bubble-user-ink: #ffffff;
+  --good: #22c55e;
+  --warn: #f59e0b;
+  --crit: #ef4444;
+}
+
+/* Font stack is theme-independent — not something dark/light should flip. */
+:root {
+  --font-display: ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-body: ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-utility: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+  /*
+   * iOS safe-area seam (item 5, viewport-fit=cover in app/layout.tsx makes
+   * the app draw under the notch/home-indicator, so these are how content
+   * pulls back in). env() falls back to 0px on browsers without the
+   * safe-area-inset-* support, so this is inert everywhere but iOS PWAs.
+   */
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-right: env(safe-area-inset-right, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-left: env(safe-area-inset-left, 0px);
+}

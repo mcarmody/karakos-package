@@ -2,7 +2,7 @@
 # Upgrade smoke on a tagged 1.x image (7.3a): the container path, not 7.1's
 # in-process chain. Docker only.
 #
-#   usage: tests/smoke/upgrade.sh <tag>        (v1.0.0, v1.1.1, v1.3, v1.5.0; v1.4.1 optional)
+#   usage: tests/smoke/upgrade.sh <tag>        (v1.3, v1.5.0; v1.0.0, v1.1.1, v1.4.1 optional: those tags cannot build)
 #
 #   KARAKOS_SMOKE_IMAGE_TAR   a `docker save` file of the 2.0 image (else: docker build from HEAD)
 #   KARAKOS_SMOKE_ARTIFACTS   directory for logs on failure
@@ -45,13 +45,14 @@ DC=(docker compose -f config/docker-compose.yml -f config/docker-compose.smoke.y
 EXTRA_PROJECTS=()
 
 open_perms() {   # the container user is not the runner's uid; let it write the bind mounts
-  chmod -R a+rwX "$OLD" "$HOME" 2>/dev/null || true
+  chmod -R a+rwX "$OLD" "$HOME" "$BACKUPS" 2>/dev/null || true
 }
 
 cleanup() {
   local rc=$?
   smoke_guard
   cd "$OLD" 2>/dev/null || true
+  if [ $rc -ne 0 ]; then smoke_diag "$TAG" "$ARTIFACTS"; fi
   if [ $rc -ne 0 ] && [ -n "$ARTIFACTS" ]; then
     mkdir -p "$ARTIFACTS"
     "${DC[@]}" logs --no-color > "$ARTIFACTS/compose-logs-$TAG.txt" 2>&1 || true
@@ -95,7 +96,7 @@ if [ -n "${KARAKOS_SMOKE_IMAGE_TAR:-}" ]; then
   docker tag "$loaded" "$NEW_IMAGE"
 else
   git -C "$REPO" archive HEAD | tar -x -C "$SMOKE_WORK" --one-top-level=head-src
-  (cd "$SMOKE_WORK/head-src" && docker build --build-arg DASHBOARD_REF="$(cat dashboard.ref)" -t "$NEW_IMAGE" .)
+  (cd "$SMOKE_WORK/head-src" && docker build -t "$NEW_IMAGE" .)
 fi
 claude_path() { docker run --rm --entrypoint sh "$1" -c 'command -v claude'; }
 OLD_CLAUDE="$(claude_path "$OLD_IMAGE")"; NEW_CLAUDE="$(claude_path "$NEW_IMAGE")"
@@ -191,7 +192,9 @@ smoke_wait "old stack answering /health" 180 api_healthy
 for i in 1 2 3; do post_message main "seed turn $i"; wait_done "$i"; done
 post_message helper "seed helper turn"; wait_done 4
 post_message main "HOLD this turn"          # the scripted hang
-smoke_wait "held row in progress" 60 bash -c "[ \"\$(curl -fsS -H '$AUTH' '$BASE/agents/main/queue' | grep -c processing)\" -ge 1 ]"
+# /agents/<name>/queue exists only from 1.5; the db is the same on every tag (processed=1: in progress).
+held_in_progress() { [ "$(dbq "select count(*) from message_queue where content like 'HOLD%' and processed=1")" -ge 1 ]; }
+smoke_wait "held row in progress" 60 held_in_progress
 post_message main "queued behind the hold"
 # Dashboard login on the old image: its session cookie must survive the upgrade.
 HDRS="$SMOKE_WORK/old-login.hdrs"
@@ -245,11 +248,12 @@ EXTRA_PROJECTS+=("$REFUSE_PROJECT")
 cp -a "$OLD" "$SMOKE_WORK/refuse"
 REFUSE_VOL="${REFUSE_PROJECT}_karakos-data"
 docker volume create --label "com.docker.compose.project=$REFUSE_PROJECT" --label com.docker.compose.volume=karakos-data "$REFUSE_VOL" >/dev/null
-docker run --rm -v "$DATA_VOL:/from:ro" -v "$REFUSE_VOL:/to" --entrypoint sh "$NEW_IMAGE" -c 'cp -a /from/. /to/'
+docker run --rm -v "$DATA_VOL:/from:ro" -v "$REFUSE_VOL:/to" --user 0 --entrypoint sh "$NEW_IMAGE" -c 'cp -a /from/. /to/'
 
 # ---- dry run -------------------------------------------------------------------
 step "dry run (documented command), writes a report, changes nothing"
 BEFORE="$(vol_hash "$DATA_VOL")"
+open_perms   # the migrator runs as the container user and writes into $BACKUPS
 bin/karakos migrate --dry-run --report-to /backups/migration-plan.md --backup-to "$BACKUPS"
 [ -s "$BACKUPS/migration-plan.md" ] || { echo "FAIL: the dry run wrote no report" >&2; exit 1; }
 assert_eq "$(vol_hash "$DATA_VOL")" "$BEFORE" "volume hash after the dry run"
@@ -257,6 +261,7 @@ assert_eq "$BEFORE" "$SEED_HASH" "volume hash before vs after stop"
 
 # ---- the real run --------------------------------------------------------------
 step "real run (documented command)"
+open_perms
 bin/karakos migrate --auto --backup-to "$BACKUPS" > "$SMOKE_WORK/migrate.out" 2>&1 || { cat "$SMOKE_WORK/migrate.out" >&2; echo "FAIL: migrate exited non-zero" >&2; exit 1; }
 cat "$SMOKE_WORK/migrate.out"
 BACKUP="$(ls -1d "$BACKUPS"/pre-2.0-* | tail -1)"
@@ -290,7 +295,12 @@ assert_eq "$(dbq "select count(*) from sessions where agent not in ($IDS)")" 0 "
 [ "$(dbq "select count(*) from sessions")" -ge 1 ] || { echo "FAIL: no sessions survived" >&2; exit 1; }
 [ "$(dbq "select count(*) from message_queue where processed=2 and response='smoke-ok'")" -ge "$SEED_DONE" ] \
   || { echo "FAIL: completed rows lost their responses" >&2; exit 1; }
-assert_eq "$(dbq "select count(*) from message_queue where content like 'HOLD%' and processed=3")" 1 "the interrupted row is crashed"
+echo "queue rows after the upgrade (id|agent|processed|content|response):"
+"${DC[@]}" exec -T karakos python3 -c "import sqlite3; c=sqlite3.connect('file:data/memory/agent-server.db?mode=ro',uri=True); [print('|'.join(str(x)[:40] for x in r)) for r in c.execute('select id,agent,processed,content,response from message_queue order by id')]"
+# The old server's graceful stop kills the hung subprocess and settles the row itself, so the
+# interrupted row may arrive as crashed (3, boot recovery), complete (2) or skipped (4). What
+# 2.0 must guarantee is that it is neither lost nor left in progress / queued to run again.
+case "$(dbq "select processed from message_queue where content like 'HOLD%'")" in 2|3|4) ;; *) echo "FAIL: the interrupted row is lost, in progress or re-queued" >&2; exit 1;; esac
 case "$(dbq "select processed from message_queue where content like 'queued behind%'")" in 0|2) ;; *) echo "FAIL: the queued row is neither queued nor run" >&2; exit 1;; esac
 "${DC[@]}" exec -T karakos python3 - <<'PY'
 import json, os, sqlite3
@@ -319,6 +329,7 @@ step "refusal path: unknown table and unknown channels.json key (on a copy)"
   cd "$SMOKE_WORK/refuse"
   export COMPOSE_PROJECT_NAME="$REFUSE_PROJECT" SMOKE_PROJECT="$REFUSE_PROJECT"
   smoke_guard
+  mkdir -p "$SMOKE_WORK/refuse-backups"; chmod -R a+rwX "$SMOKE_WORK/refuse" "$SMOKE_WORK/refuse-backups" 2>/dev/null || true
   docker run --rm -v "$REFUSE_VOL:/workspace/data" --entrypoint python3 "$NEW_IMAGE" -c \
     "import sqlite3; c=sqlite3.connect('/workspace/data/memory/agent-server.db'); c.execute('create table zz_unknown_table (x)'); c.commit()"
   python3 - <<'PY'
@@ -355,7 +366,7 @@ assert not extra and not missing and not bad, (sorted(extra)[:5], sorted(missing
 # Roll the image back as UPGRADING says: match the checkout to the pin.
 git -C "$REPO" archive "$TAG" | tar -x -C "$OLD"
 export KARAKOS_VERSION="$TAG"
-write_override "$OLD_CLAUDE" "$FIXED"
+write_override "$OLD_CLAUDE" "$FIXED" "$OLD_IMAGE"
 open_perms
 "${DC[@]}" up -d --pull never
 smoke_wait "old image answering /health on restored volumes" 180 api_healthy

@@ -3,35 +3,36 @@
 # the second by construction. Both bases are Debian bookworm (same glibc).
 ARG NODE_MAJOR=22
 
-# The dashboard is karakos-dashboard at the ref pinned in dashboard.ref. Its
-# source is private and never committed here: bin/fetch-dashboard.sh (token)
-# puts the verified source tarball in vendor/, or a release bundle
-# (karakos-dashboard-bundle-<sha12>.tar.gz, no token) is dropped there. This
-# stage does no network fetch of the dashboard. See bin/dashboard-stage.sh.
+# The dashboard source is dashboard/ in this repo. This stage installs its
+# dependencies from the lockfile (npm ci), builds it (next build) and keeps
+# only what `next start` needs. Native modules (better-sqlite3, sqlite3) build
+# here and load in the runtime image.
 FROM node:${NODE_MAJOR}-bookworm-slim AS dashboard-build
-# Empty means "the ref in dashboard.ref". When set, the input must be that commit.
-ARG DASHBOARD_REF=
 # Compiler toolchain for native modules when no prebuild matches; this stage is
 # discarded, nothing here reaches the runtime image.
-RUN apt-get update && apt-get install -y --no-install-recommends python3 make g++ git \
+RUN apt-get update && apt-get install -y --no-install-recommends python3 make g++ \
     && rm -rf /var/lib/apt/lists/*
-# `vendor*` may match nothing (no tarball): the stage script then fails with a clear message.
-COPY dashboard.ref dashboard.ref.sha256 dashboard.bundle.sha256 vendor* /in/
-COPY bin/dashboard-stage.sh /usr/local/bin/dashboard-stage.sh
-RUN DASHBOARD_REF="${DASHBOARD_REF}" sh /usr/local/bin/dashboard-stage.sh /in /out
+WORKDIR /app
+COPY dashboard/package.json dashboard/package-lock.json ./
+RUN npm ci
+COPY dashboard/ ./
+RUN npm run build \
+    && rm -rf .next/cache \
+    && npm prune --omit=dev
+# Fail the stage if a source map or a native module is missing from the output.
+RUN [ -z "$(find .next -name '*.map' -print -quit)" ] \
+    && node -e "require('better-sqlite3'); require('sqlite3'); console.log('native ok')"
 
-# The package's own files, minus the dashboard inputs: keeps the (private)
-# source tarball and bundle out of the runtime image's layers.
+# The package's own files, minus the dashboard source: the runtime image gets
+# the built dashboard from the stage above, not the raw tree.
 FROM node:${NODE_MAJOR}-bookworm-slim AS workspace-src
 COPY . /src
-RUN rm -rf /src/vendor /src/dashboard.ref /src/dashboard.ref.sha256 /src/dashboard.bundle.sha256
+RUN rm -rf /src/dashboard
 
 FROM python:3.11-slim-bookworm
 
 # Re-declare (an ARG before the first FROM is not visible inside a stage).
 ARG NODE_MAJOR
-ARG DASHBOARD_REF=
-LABEL org.karakos.dashboard-ref="${DASHBOARD_REF}"
 
 # Install runtime tools (tini for PID 1, git/curl/jq for runtime use)
 # build-essential is needed because some Python deps (PyStemmer via fastembed)
@@ -87,26 +88,26 @@ RUN chown karakos:karakos /workspace
 
 # Use --chown on COPY rather than a post-hoc `chown -R` so the workspace's
 # millions of node_modules files don't have to be rewritten in a new layer.
-COPY --chown=karakos:karakos --from=dashboard-build /out/.next dashboard/.next
-COPY --chown=karakos:karakos --from=dashboard-build /out/node_modules dashboard/node_modules
-COPY --chown=karakos:karakos --from=dashboard-build /out/public dashboard/public
-COPY --chown=karakos:karakos --from=dashboard-build /out/package.json dashboard/package.json
-COPY --chown=karakos:karakos --from=dashboard-build /out/.dashboard-ref dashboard/.dashboard-ref
-# next.config.{mjs,js,ts}: whichever the build stage kept (next start reads it).
-COPY --chown=karakos:karakos --from=dashboard-build /out/next.config.* dashboard/
+COPY --chown=karakos:karakos --from=dashboard-build /app/.next dashboard/.next
+COPY --chown=karakos:karakos --from=dashboard-build /app/node_modules dashboard/node_modules
+COPY --chown=karakos:karakos --from=dashboard-build /app/public dashboard/public
+COPY --chown=karakos:karakos --from=dashboard-build /app/package.json dashboard/package.json
+COPY --chown=karakos:karakos --from=dashboard-build /app/next.config.mjs dashboard/next.config.mjs
 COPY --chown=karakos:karakos --from=workspace-src /src/ ./
 
-# Dashboard runtime config (names fixed in the dashboard's package-env-mapping).
+# Dashboard runtime config (variables documented in dashboard/README.md).
 # The dashboard shares this container and reads agent-server.db from the data volume.
-ENV KARAKOS_PROFILE=package \
-    KARAKOS_REGISTRY_PATH=/workspace/config/agents.yaml \
+ENV KARAKOS_REGISTRY_PATH=/workspace/config/agents.yaml \
     AGENT_SERVER_DB_PATH=/workspace/data/memory/agent-server.db \
     WORKSPACE_ROOT=/workspace
 
 # Create data directories owned by karakos so volume mounts get the right
-# ownership when first created.
+# ownership when first created. data/ gets NO subdirectories here: Docker copies
+# an image directory's contents into a new named volume, and a non-empty data/
+# looks like an unstamped 1.x install to the schema guard (exit 78 loop). The
+# entrypoint creates data/messages, memory and health after the stamp check.
 RUN install -d -o karakos -g karakos \
-        data data/messages data/memory data/health \
+        data \
         logs logs/agent-streams logs/session-summaries \
         inbox
 

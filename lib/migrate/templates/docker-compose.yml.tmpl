@@ -10,7 +10,7 @@
       # is visible to the container and survives image rebuilds. The rest of
       # /workspace stays baked into the image — bind-mounting the entire tree
       # would shadow the dashboard (dashboard/.next, node_modules), which the
-      # image build stage produces from the pinned karakos-dashboard ref.
+      # image build stage produces from dashboard/.
       - ../config:/workspace/config
       - ../agents:/workspace/agents
       # Stays in 2.0: `.karakos/config.json` (written by setup.sh) is still read

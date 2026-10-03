@@ -49,3 +49,4 @@ exclude:
   - pytest.ini
   - requirements.txt
   - vendor/
+  - dashboard/

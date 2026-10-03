@@ -63,59 +63,65 @@ jobs:
       - name: Run unit tests
         run: pytest tests/ -v -m "not slow" --tb=short
 
-  # Docker build smoke test — catches Dockerfile and build issues.
-  # karakos-dashboard is private: the pinned source is fetched with a read-only
-  # token (repo secret DASHBOARD_FETCH_TOKEN). Fork PRs have no secret, so the
-  # image build is skipped there (the structural tests still run elsewhere).
-  docker-smoke:
+  # The dashboard (dashboard/): unit tests and a production build, with the
+  # lockfile as the only input. No secret, no network fetch beyond npm.
+  dashboard:
     runs-on: ubuntu-latest
-    env:
-      HAS_DASHBOARD_TOKEN: ${{ secrets.DASHBOARD_FETCH_TOKEN != '' }}
+    defaults:
+      run:
+        working-directory: dashboard
     steps:
       - uses: actions/checkout@v4
 
-      - name: No dashboard token, skipping
-        if: env.HAS_DASHBOARD_TOKEN != 'true'
-        run: echo "no dashboard token (DASHBOARD_FETCH_TOKEN unavailable, e.g. a forked PR), skipping the image build"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
 
-      - name: Fetch pinned dashboard source
-        if: env.HAS_DASHBOARD_TOKEN == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.DASHBOARD_FETCH_TOKEN }}
-        run: bin/fetch-dashboard.sh
+      - run: npm ci
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+  # Docker build smoke test — catches Dockerfile and build issues. The image
+  # builds the dashboard from dashboard/ in this repo, so this job needs no
+  # secret and runs for fork PRs too.
+  docker-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
-        if: env.HAS_DASHBOARD_TOKEN == 'true'
         uses: docker/setup-buildx-action@v3
 
       - name: Build Docker image
-        if: env.HAS_DASHBOARD_TOKEN == 'true'
-        run: docker build --build-arg DASHBOARD_REF="$(cat dashboard.ref)" -t karakos-test:smoke .
+        run: docker build -t karakos-test:smoke .
 
       # The image's ENTRYPOINT (bin/entrypoint.sh) requires DASHBOARD_PORT and
       # AGENT_SERVER_TOKEN to be set — those are runtime concerns, not build-
       # artifact checks. Override --entrypoint so each smoke test runs against
       # the image without going through the production startup path.
 
-      - name: Verify dashboard built from the pinned ref
-        if: env.HAS_DASHBOARD_TOKEN == 'true'
-        run: |
-          docker run --rm --entrypoint test karakos-test:smoke -f /workspace/dashboard/.dashboard-ref
-          test "$(docker run --rm --entrypoint cat karakos-test:smoke /workspace/dashboard/.dashboard-ref)" = "$(cat dashboard.ref)"
+      - name: Verify the dashboard was built into the image
+        run: docker run --rm --entrypoint test karakos-test:smoke -f /workspace/dashboard/.next/BUILD_ID
 
       # Proves the native modules load in the RUNTIME image: this is the check
       # that catches a Node ABI or libc mismatch with the build stage.
       - name: Verify dashboard native modules load
-        if: env.HAS_DASHBOARD_TOKEN == 'true'
         run: >
           docker run --rm --entrypoint node karakos-test:smoke -e
           "require('/workspace/dashboard/node_modules/better-sqlite3');
           require('/workspace/dashboard/node_modules/sqlite3');
           console.log('native ok')"
 
-      # Profile gate (5.1): login is served, a household-only route (/system) is 404, the API is closed.
-      - name: Verify dashboard serves the package login page
-        if: env.HAS_DASHBOARD_TOKEN == 'true'
+      # Login is served, a route the dashboard does not have is 404 (checked
+      # with a session: without one every page answers 307 to /login), and the
+      # API is closed to an unauthenticated caller.
+      - name: Verify dashboard serves the login page and keeps its API closed
         run: |
           docker run -d --name dash --entrypoint bash -p 3000:3000 \
             -e DASHBOARD_PASSWORD=ci-only -e SESSION_SECRET=ci-only-ci-only-ci-only-ci-only \
@@ -125,16 +131,16 @@ jobs:
             curl -s -o /dev/null http://localhost:3000/login && break || sleep 2
           done
           test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:3000/login)" = 200
-          test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:3000/system)" = 404
           test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:3000/api/agents)" = 401
+          curl -s -o /dev/null -c jar -H 'Content-Type: application/json' \
+            -d '{"username":"admin","password":"ci-only"}' http://localhost:3000/api/auth
+          test "$(curl -s -o /dev/null -w '%{http_code}' -b jar http://localhost:3000/system)" = 404
           docker rm -f dash
 
       - name: Verify Python dependencies
-        if: env.HAS_DASHBOARD_TOKEN == 'true'
         run: docker run --rm --entrypoint python3 karakos-test:smoke -c "import aiohttp, aiosqlite, discord; print('ok')"
 
       - name: Verify Node.js installed
-        if: env.HAS_DASHBOARD_TOKEN == 'true'
         run: docker run --rm --entrypoint node karakos-test:smoke --version
 
   # Daily real-CLI canary (7.3a). The fake `claude` replays what step 0.4 recorded

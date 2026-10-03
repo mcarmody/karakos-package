@@ -1,8 +1,8 @@
 # Package backend contract
 
-What the dashboard may call on the Karakos package backend (`bin/agent-server.py`) when it runs with `KARAKOS_PROFILE=package`, and what it reads from disk. Written against `mcarmody/karakos-package` `release/2.0` (steps 1.1a/1.1b registry, 1.5 `context_tokens`, 2.1 shard rows, 2.3 hive call log, 2.7 usage sections). The package copy of this file lives in that repo's `docs/`; this repo's copy is the source.
+What the dashboard (`dashboard/`) may call on the Karakos package backend (`bin/agent-server.py`), and what it reads from disk. Written against `release/2.0` (steps 1.1a/1.1b registry, 1.5 `context_tokens`, 2.1 shard rows, 2.3 hive call log, 2.7 usage sections). Paths below that start with `app/` or `lib/` are relative to `dashboard/`.
 
-The dashboard never talks to a queue broker, `shards.json`, ssh, systemd or tmux under this profile. Those are household-only (see `docs/package-profile-inventory.md`).
+The dashboard never talks to a queue broker, ssh, systemd or tmux: every call goes through `agentFetch` to the agent server.
 
 ## Connection and auth
 
@@ -261,19 +261,11 @@ A missing or too-new graph is `503 {"error": "graph_not_initialised", ...}`; the
 |---|---|---|---|
 | G1 | Shard rows: per-shard state, queue depth, spawn status and channels in `/agents` | **Closed by 2.1** (rows in `/agents`) and consumed by 5.4 (`normalizeShards`, shard table). The adapter still lays the registry's `channels` over rows that report none | - |
 | G2 | Hive call log: which agent called which, when, outcome | **Closed by 2.3** (`GET /hive/calls`) and consumed by 5.4 (`/api/hive/calls`, hive call log on `/fleet`) | - |
-| G3 | Per-agent last message, `messages_processed`, session age and compaction count for the roster | Not in `/agents` or `/health`; the roster shows blanks/zeros under this profile | Unowned; propose adding to `/agents` alongside 2.1 |
-| G4 | A cost endpoint the dashboard can use instead of opening the sqlite file | `GET /cost` exists, but `app/api/cost` (and `finance/usage-timeseries`, `conversations/metrics`, `chat/history|result|stream`, `history/*`) read `agent-server.db` directly via `AGENT_SERVER_DB_PATH`, which needs the file mounted into the dashboard container and the sqlite drivers | 5.3 (image build) decides: mount the DB, or 5.1 re-points these routes at HTTP. Time series and chat history have no HTTP endpoint at all |
+| G3 | Per-agent last message, `messages_processed`, session age and compaction count for the roster | Not in `/agents` or `/health`; the roster shows blanks/zeros | Unowned; propose adding to `/agents` alongside 2.1 |
+| G4 | A cost endpoint the dashboard can use instead of opening the sqlite file | `GET /cost` exists, but `app/api/cost` (and `conversations/metrics`, `chat/history|result|stream`, `history/*`) read `agent-server.db` directly via `AGENT_SERVER_DB_PATH`, which needs the file mounted into the dashboard container and the sqlite drivers | Decided: the dashboard shares the container with the agent server and opens the file read-only (`AGENT_SERVER_DB_PATH` in the image). Chat history has no HTTP endpoint |
 | G5 | Server-side session/transcript replay for `chat/stream` | Read from the sqlite file only | Same decision as G4 |
 | G6 | Memory browser data | **Closed by 5.5**: `GET /graph/*` (package 5.5a) consumed by `/memory` and `/api/memory/*` | - |
 
-## Existing dashboard calls that do not match this server
+## Contract test
 
-These already exist in the household dashboard and are not changed by 5.0. They are household-era paths the package server does not serve; 5.1 either gates the route or moves it to the path above.
-
-| Dashboard calls | Package server has |
-|---|---|
-| `POST /interrupt` with `{agent, reason}` (`app/api/agents/[name]/interrupt`, household profile only; under package the route calls `POST /agents/{name}/interrupt`, 5.4) | `POST /agents/{name}/interrupt` |
-| `GET /queue/{name}`, `DELETE /queue/{name}/{id}` (`app/api/agents/[name]/queue`) | `GET /agents/{name}/queue`, `DELETE /agents/{name}/queue/{queue_id}` |
-| `GET /status` (`app/api/sys`) | `/health` and `/agents` |
-| `POST /flush` (`app/api/sys`) | `POST /agents/{name}/flush` |
-| `GET /reviews` (`app/api/reviews`) | none |
+`tests/test_agent_server_routes.py` reads every `agentFetch(...)` path in `dashboard/` and checks it against the routes `create_app()` in `bin/agent-server.py` registers (method and path shape). A dashboard route that calls a path the server does not serve fails that test instead of rendering a 404 body as data.

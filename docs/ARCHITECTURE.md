@@ -397,13 +397,14 @@ name, duration and outcome.
 
 ## Dashboard
 
-The dashboard is `karakos-dashboard`, built from the commit pinned in
-`dashboard.ref` under `KARAKOS_PROFILE=package`, and served on
-`${DASHBOARD_PORT:-3000}`. This repository carries no dashboard source and does
-not document its pages (that belongs to the dashboard repository); the contract
-between the two is [package-backend-contract.md](package-backend-contract.md):
-the agent-server routes the dashboard may call and the files it reads. Build
-routes and the pin are in [EXTENDING.md](EXTENDING.md#dashboard-build).
+The dashboard is a Next.js app whose source is `dashboard/` in this repository
+(see its [README](../dashboard/README.md)), served on `${DASHBOARD_PORT:-3000}`.
+The contract between it and the agent server is
+[package-backend-contract.md](package-backend-contract.md): the routes the
+dashboard may call and the files it reads. `tests/test_agent_server_routes.py`
+checks every agent-server path the dashboard calls against the routes
+`bin/agent-server.py` registers. The build is in
+[EXTENDING.md](EXTENDING.md#dashboard-build).
 
 **Authentication** is a login form (`DASHBOARD_USER` / `DASHBOARD_PASSWORD`)
 that sets the `karakos_session` cookie, an HMAC token keyed by `SESSION_SECRET`,
@@ -826,9 +827,9 @@ One row per step; every path exists in the checkout (`tests/test_docs.py` checks
 | 4.2 / 4.2b | Memory tools, rewired consumers | `lib/graph/tools.py`, `lib/graph/recall.py`, `mcp/tools-server.py`, `system/hooks/inject-recall.py` |
 | 4.3 | Consolidation job | `lib/graph/consolidate.py`, `lib/monitor_jobs/memory_consolidate.py`, `bin/graph-consolidate.py` |
 | 4.4 | Memory migrator | `lib/migrate/steps/40_memory.py` |
-| 5.0 / 5.4 | Dashboard adapter and fleet pages (dashboard repo) | `docs/package-backend-contract.md` |
-| 5.1 / 5.2 | Profile flag, auth and env (dashboard repo) | `docs/package-backend-contract.md` |
-| 5.3 | Pinned package dashboard build | `dashboard.ref`, `dashboard.ref.sha256`, `bin/fetch-dashboard.sh`, `bin/build-dashboard-bundle.sh`, `bin/dashboard-stage.sh` |
+| 5.0 / 5.4 | Dashboard adapter and fleet pages (`dashboard/`) | `docs/package-backend-contract.md` |
+| 5.1 / 5.2 | Route inventory, auth and env (`dashboard/`) | `docs/package-backend-contract.md` |
+| 5.3b | Dashboard source in this repo, built in the image | `dashboard/`, `Dockerfile` |
 | 5.5 | Memory browser read API | `lib/graph/browse.py`, `docs/graph-browse-api.md` |
 | 6.1 | Discord outbox | `lib/outbox.py`, `lib/migrate/steps/60_outbox.py` |
 | 6.2 | Discord UX switches | `lib/discord_ux.py` |

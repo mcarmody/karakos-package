@@ -352,13 +352,12 @@ def test_create_agent_script_targets_register():
 # builds. They are deliberately general -- they do not enumerate the four
 # known-bad paths, so the fifth one fails here too.
 
-# ANDURIL 5.3: the dashboard source no longer lives in this repo (the image
-# builds karakos-dashboard from a pinned ref). Point KARAKOS_DASHBOARD_SRC at
-# an extracted checkout to run this contract scan; without it these tests skip.
+# The dashboard source is dashboard/ in this repo, so the contract scan always
+# runs. KARAKOS_DASHBOARD_SRC can point it at another tree.
 DASHBOARD_DIR = Path(os.environ.get("KARAKOS_DASHBOARD_SRC") or PACKAGE_ROOT / "dashboard")
 _needs_dashboard_src = pytest.mark.skipif(
     not DASHBOARD_DIR.exists(),
-    reason="no dashboard source (set KARAKOS_DASHBOARD_SRC to a karakos-dashboard checkout)",
+    reason="no dashboard source at KARAKOS_DASHBOARD_SRC",
 )
 # The single chokepoint through which the dashboard talks to agent-server.
 # `test_agent_fetch_is_the_only_door` below is what keeps that true; if it
@@ -451,8 +450,11 @@ def _placeholderize(path):
             out.append(path[i])
             i += 1
     # The query string is not part of the route, and aiohttp never matches on
-    # it -- /cost?period=daily is a request to /cost.
-    return "".join(out).split("?", 1)[0]
+    # it -- /cost?period=daily is a request to /cost. A `${qs}` interpolation
+    # glued to the last literal segment (`/hive/calls${qs}`) is a query string
+    # too, not a path segment.
+    path = "".join(out).split("?", 1)[0]
+    return re.sub(r"(?<=[^/{}])\{\}$", "", path)
 
 
 def _dashboard_sources():
@@ -500,6 +502,22 @@ def _requested_paths():
                         re.DOTALL,
                     ):
                         literals.extend(_path_literals(decl.group(1)))
+
+            if not literals:
+                # `getJson(path)`: the path is a parameter of a small helper
+                # (`async function getJson<T>(path: string)`). Resolve it from
+                # the helper's own call sites in the same file.
+                ident = first.strip()
+                helper = re.search(
+                    r"function\s+(\w+)\s*(?:<[^>]*>)?\(\s*%s\b" % re.escape(ident), text
+                ) if re.fullmatch(r"[A-Za-z_$][\w$]*", ident) else None
+                if helper:
+                    name = helper.group(1)
+                    for call in re.finditer(r"(?<![\w$.])%s\s*(?:<[^>()]*>)?\(" % re.escape(name), text):
+                        if text[max(0, call.start() - 9) : call.start()].strip().endswith("function"):
+                            continue
+                        arg = _split_top_level_commas(_balanced_paren(text, call.end() - 1))[0]
+                        literals.extend(_path_literals(arg))
 
             if not literals:
                 found.append((rel, line, method, None))

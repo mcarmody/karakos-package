@@ -202,7 +202,7 @@ and stop the session past `KARAKOS_REALCLI_BUDGET_USD` (default `0.50`); they ru
 with a temporary `HOME` and `CLAUDE_CONFIG_DIR`. `Harness(..., claude="real")`
 runs the server against the real CLI on `PATH` and passes the credential through
 each agent's `env:`. The smoke scripts run on their own: `tests/smoke/fresh_install.sh`
-and `tests/smoke/upgrade.sh <tag>` (`v1.0.0`, `v1.1.1`, `v1.3`, `v1.5.0`) need a
+and `tests/smoke/upgrade.sh <tag>` (`v1.3`, `v1.5.0`; `v1.0.0`, `v1.1.1` and `v1.4.1` are opt-in, see `tests/test_upgrade_smoke.py`) need a
 Docker daemon, work in a temp directory with a temp `HOME`, and refuse to run
 unless the compose project is named `karakos-smoke-*` or `karakos-up-*`. Set
 `KARAKOS_SMOKE_IMAGE_TAR` to a `docker save` file to skip the image build, and
@@ -368,43 +368,25 @@ only for contributors iterating on the image itself.
 
 ## Dashboard build
 
-The dashboard is `karakos-dashboard` built under `KARAKOS_PROFILE=package`; this
-repo carries no dashboard source. These files pin it:
+The dashboard source is `dashboard/` in this repo: a Next.js app with its own
+`package.json` and `package-lock.json`. Nothing is fetched, pinned or
+vendored; changing the dashboard is an ordinary PR to these files.
 
-| File | Holds |
-|---|---|
-| `dashboard.ref` | full commit sha of `karakos-dashboard` (branch `karakos-2.0`) |
-| `dashboard.ref.sha256` | sha256 of the source tarball for that sha |
-| `dashboard.bundle.sha256` | optional: sha256 to pin a specific prebuilt bundle (empty = verify against the bundle's own `.sha256` only; a rebuilt bundle is not byte-identical) |
-
-Bumping the dashboard is a PR changing `dashboard.ref` and `dashboard.ref.sha256`
-(`GH_TOKEN=... bin/fetch-dashboard.sh --ref <sha>` prints the new hash on
-mismatch; update the file once you have checked the diff).
-
-The Dockerfile does no network fetch of the dashboard. It reads `vendor/`
-(gitignored, never committed) and takes either input: a prebuilt **bundle**
-`vendor/karakos-dashboard-bundle-<sha12>.tar.gz` (used as-is: `npm ci
---omit=dev` for the native modules, no build), or, if no bundle is present, the
-source tarball `vendor/karakos-dashboard.tar.gz` (built in the image stage). Node
-is one `NODE_MAJOR` for the build stage and the runtime image so the native
-modules match.
-
-Three routes to an image:
-
-1. **Prebuilt GHCR image** (`make pull`). No dashboard access needed. The supported default.
-2. **Release bundle, no token.** Download `karakos-dashboard-bundle-<sha12>.tar.gz`
-   and its `.sha256` from the package's GitHub release into `vendor/`, then
-   `docker compose -f config/docker-compose.yml -f config/docker-compose.dev.yml build`.
-   The bundle is compiled output only (no source, no source maps).
-3. **A fork that customises the dashboard** supplies its own bundle or source
-   tarball in `vendor/` (`bin/build-dashboard-bundle.sh --src <tarball>` makes a
-   bundle from a source tarball) and its own `dashboard.ref*` pin.
-
-Maintainers with read access to the private repo: `GH_TOKEN=... make
-vendor-dashboard` (or `bin/fetch-dashboard.sh`) downloads and verifies the pinned
-source. CI needs the repo secret `DASHBOARD_FETCH_TOKEN` (read-only on
-`karakos-dashboard`). The dashboard source is never published: releases attach
-the bundle only.
+- **Develop:** `cd dashboard && npm ci && npm test && npm run build`. See
+  [`dashboard/README.md`](../dashboard/README.md) for the environment it reads.
+- **Image:** the `dashboard-build` stage of the `Dockerfile` runs `npm ci` and
+  `next build` on `dashboard/`, prunes dev dependencies and keeps `.next`,
+  `node_modules`, `public`, `package.json` and `next.config.mjs`; the runtime
+  stage copies those to `/workspace/dashboard`. Node is one `NODE_MAJOR` for the
+  build stage and the runtime image so the native modules (`better-sqlite3`,
+  `sqlite3`) built in the first load in the second, and the stage fails if
+  they do not load or a source map is left in the output.
+- **CI:** the `dashboard` job runs `npm ci`, `npm test` and `npm run build`; the
+  `docker-smoke` job builds the image and checks `/login` answers 200, a route
+  the dashboard does not have answers 404 once logged in, and `/api/agents`
+  answers 401 without a session. Neither job needs a secret.
+- **To run a modified dashboard:** edit `dashboard/` and rebuild the image
+  (`docker compose -f config/docker-compose.yml -f config/docker-compose.dev.yml build`).
 
 ## Configuration
 
@@ -904,7 +886,7 @@ denylist locally. To run it before every push:
 For downstream forks tracking `release/2.0`:
 
 - **Churn expected:** `bin/agent-server.py`, `bin/relay.py`, the `config/`
-  layout, `setup.sh`, the pinned dashboard (`dashboard.ref`).
+  layout, `setup.sh`, the `dashboard/` source.
 - **Stable:** the `/message` and `/agents` HTTP shapes, `config/channels.json`,
   hook file names, MCP tool names.
 - Small portable fixes submitted by forks are welcome on `release/2.0` now;

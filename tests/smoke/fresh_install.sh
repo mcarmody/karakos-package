@@ -46,6 +46,8 @@ open_perms() {   # the container user is not the runner's uid; let it write the 
 cleanup() {
   local rc=$?
   smoke_guard
+  cd "$INSTALL" 2>/dev/null || true
+  if [ $rc -ne 0 ]; then smoke_diag fresh "$ARTIFACTS"; fi
   if [ $rc -ne 0 ] && [ -n "$ARTIFACTS" ]; then
     mkdir -p "$ARTIFACTS"
     "${DC[@]}" logs --no-color > "$ARTIFACTS/compose-logs.txt" 2>&1 || true
@@ -67,7 +69,7 @@ if [ -n "${KARAKOS_SMOKE_IMAGE_TAR:-}" ]; then
   [ -n "$loaded" ] || { echo "no image in $KARAKOS_SMOKE_IMAGE_TAR" >&2; exit 1; }
   docker tag "$loaded" "$IMAGE"
 else
-  docker build --build-arg DASHBOARD_REF="$(cat dashboard.ref)" -t "$IMAGE" .
+  docker build -t "$IMAGE" .
 fi
 
 # The path is resolved per image, not assumed (a Node global CLI usually lands in /usr/bin).

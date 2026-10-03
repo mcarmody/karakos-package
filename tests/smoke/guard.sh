@@ -50,3 +50,29 @@ smoke_assert_clean() {
     return 1
   fi
 }
+
+# On failure: print (stderr) and optionally save (<dir>/diag-<label>.txt) what a
+# failed run needs to be diagnosed. Uses the caller's DC array (compose command)
+# and runs inside the install dir. Never fails.
+smoke_diag() {
+  local label="${1:-smoke}" dir="${2:-}" cid
+  {
+    echo "=================== smoke diagnostics [$label] ==================="
+    echo "--- docker compose ps -a"
+    "${DC[@]}" ps -a 2>&1 || true
+    for cid in $("${DC[@]}" ps -aq 2>/dev/null); do
+      echo "--- container $cid: state"
+      docker inspect --format '{{json .State}}' "$cid" 2>&1 || true
+      echo "--- container $cid: health (status + last check outputs)"
+      docker inspect --format '{{json .State.Health}}' "$cid" 2>&1 || true
+    done
+    echo "--- docker compose logs --tail 200"
+    "${DC[@]}" logs --no-color --tail 200 2>&1 || true
+    echo "=================== end diagnostics [$label] ==================="
+  } > "${SMOKE_WORK:-/tmp}/diag.txt" 2>&1 || true
+  cat "${SMOKE_WORK:-/tmp}/diag.txt" >&2 || true
+  if [ -n "$dir" ]; then
+    mkdir -p "$dir" && cp "${SMOKE_WORK:-/tmp}/diag.txt" "$dir/diag-$label.txt" || true
+  fi
+  return 0
+}

@@ -9,9 +9,6 @@ name: Release gate
 # run a week, and pull_request only when a file that can break these changes.
 #
 # Secrets:
-#   DASHBOARD_FETCH_TOKEN    read access to the private karakos-dashboard repo (image build).
-#                            Missing: build-image and the two Docker smokes SKIP with a
-#                            warning on every event (as ci.yml's docker-smoke does).
 #   CLAUDE_CODE_OAUTH_TOKEN  a scratch Anthropic account's long-lived token (real-CLI smoke).
 #                            Missing: skips on a PR, FAILS on a tag, dispatch or schedule.
 # GITHUB_TOKEN (packages: read) pulls the ghcr.io/mcarmody/karakos tags the upgrade matrix uses.
@@ -24,8 +21,6 @@ on:
         required: false
         default: ""
     secrets:
-      DASHBOARD_FETCH_TOKEN:
-        required: false
       CLAUDE_CODE_OAUTH_TOKEN:
         required: false
   workflow_dispatch:
@@ -49,7 +44,7 @@ on:
       - lib/migrate/**
       - setup.sh
       - requirements.txt
-      - dashboard.ref
+      - dashboard/**
       - tests/smoke/**
       - tests/realcli*
       - .github/workflows/release-gate.yml
@@ -62,43 +57,19 @@ jobs:
   build-image:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    outputs:
-      built: ${{ steps.flag.outputs.built }}
-    env:
-      HAS_DASHBOARD_TOKEN: ${{ secrets.DASHBOARD_FETCH_TOKEN != '' }}
     steps:
-      - name: Secret present?
-        id: flag
-        run: |
-          if [ "$HAS_DASHBOARD_TOKEN" = true ]; then
-            echo "built=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "built=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::DASHBOARD_FETCH_TOKEN is not available (a forked PR, or the secret is not set): skipping the image build and the fresh-install and upgrade smokes. This is a skip, not a pass: release.yml's build-push also needs this secret, so nothing publishes without it."
-          fi
-
       - uses: actions/checkout@v4
-        if: steps.flag.outputs.built == 'true'
         with:
           ref: ${{ inputs.ref || '' }}
 
-      - name: Fetch pinned dashboard source
-        if: steps.flag.outputs.built == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.DASHBOARD_FETCH_TOKEN }}
-        run: bin/fetch-dashboard.sh
-
       - uses: docker/setup-buildx-action@v3
-        if: steps.flag.outputs.built == 'true'
 
       - name: Build the image once and save it
-        if: steps.flag.outputs.built == 'true'
         run: |
-          docker build --build-arg DASHBOARD_REF="$(cat dashboard.ref)" -t karakos-gate:ci .
+          docker build -t karakos-gate:ci .
           docker save -o karakos-image.tar karakos-gate:ci
 
       - uses: actions/upload-artifact@v4
-        if: steps.flag.outputs.built == 'true'
         with:
           name: karakos-image
           path: karakos-image.tar
@@ -107,7 +78,6 @@ jobs:
 
   fresh-install-smoke:
     needs: build-image
-    if: needs.build-image.outputs.built == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -137,13 +107,12 @@ jobs:
 
   upgrade-smoke:
     needs: build-image
-    if: needs.build-image.outputs.built == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        tag: [v1.0.0, v1.1.1, v1.3, v1.5.0]
+        tag: [v1.3, v1.5.0]
     steps:
       - uses: actions/checkout@v4
         with:

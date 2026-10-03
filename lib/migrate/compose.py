@@ -40,10 +40,18 @@ def is_migrated(config_dir) -> bool:
 
 
 def _host_side(entry: str) -> str:
-    """'127.0.0.1:${X:-18791}:18791' -> '127.0.0.1:${X:-18791}'; '3000:3000' -> '3000'."""
+    """'127.0.0.1:${X:-18791}:18791' -> '127.0.0.1:${X:-18791}'; '3000:3000' -> '3000';
+    '${D:-3000}:${D:-3000}' -> '${D:-3000}'."""
     entry = entry.strip().strip('"').strip("'")
-    parts = entry.rsplit(":", 1)
-    return parts[0] if len(parts) == 2 else entry
+    depth, last = 0, -1
+    for i, ch in enumerate(entry):   # the last ':' outside any ${...}, so '${X:-3000}' stays whole
+        if entry.startswith("${", i):
+            depth += 1
+        elif ch == "}" and depth:
+            depth -= 1
+        elif ch == ":" and not depth:
+            last = i
+    return entry[:last] if last >= 0 else entry
 
 
 def read_old(config_dir) -> dict:
