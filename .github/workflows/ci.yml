@@ -137,6 +137,47 @@ jobs:
         if: env.HAS_DASHBOARD_TOKEN == 'true'
         run: docker run --rm --entrypoint node karakos-test:smoke --version
 
+  # Daily real-CLI canary (7.3a). The fake `claude` replays what step 0.4 recorded
+  # from a real CLI; the CLI auto-upgrades inside the image, so recorded behaviour
+  # can drift silently. This runs on the existing daily schedule (no new trigger).
+  # CLAUDE_CODE_OAUTH_TOKEN is a repository secret for a scratch account; with it
+  # missing the job FAILS (it only ever runs on schedule or dispatch, never on a PR).
+  real-cli-smoke:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      HAS_CLAUDE_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Credential present?
+        run: |
+          if [ "$HAS_CLAUDE_TOKEN" != true ]; then
+            echo "::error::CLAUDE_CODE_OAUTH_TOKEN is not set: the daily real-CLI canary cannot run"
+            exit 1
+          fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install the CLI (as the image does) and test dependencies
+        run: |
+          npm install -g @anthropic-ai/claude-code
+          claude --version
+          pip install pytest -r requirements.txt
+
+      - name: Real-CLI smoke
+        env:
+          KARAKOS_REQUIRE_REAL_CLI: "1"
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: python3 -m pytest tests -q -m "slow and realcli"
+
   # Preflight script — tests bin/preflight.sh check logic via Python test suite
   preflight:
     runs-on: ubuntu-latest

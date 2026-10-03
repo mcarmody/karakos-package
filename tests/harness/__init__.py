@@ -83,8 +83,13 @@ ARGV_WAIT_S = 3.0   # argv(): how long to wait for the fake CLI's argv file
 
 class Harness:
     def __init__(self, tmp_workspace, agents=["a", "b"], shards=None, write_config=True,
-                 work_stealing=None, steering=None):
+                 work_stealing=None, steering=None, claude="fake"):
         from conftest import import_script  # tests/ is on sys.path under pytest
+        if claude not in ("fake", "real"):
+            raise ValueError(f"claude must be 'fake' or 'real', got {claude!r}")
+        # 7.3a: "real" runs the server against the real `claude` on PATH (no fake
+        # prepended) and hands the credential to each agent as a ${NAME} reference.
+        self.claude = claude
         self.workspace = Path(tmp_workspace)
         self.agents = list(agents)
         self.log_dir = self.workspace / "fake-claude-logs"
@@ -108,6 +113,15 @@ class Harness:
                 agents = {name: {} for name in agents}
             agents = {n: {**(e or {}), "steering": {**steering, **((e or {}).get("steering") or {})}}
                       for n, e in agents.items()}
+        if claude == "real":
+            cred = [k for k in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY")
+                    if os.environ.get(k)]
+            if not isinstance(agents, dict):
+                agents = {name: {} for name in agents}
+            agents = {n: {"model": "haiku", **(e or {}),
+                          "env": {**{k: "${%s}" % k for k in cred},
+                                  **((e or {}).get("env") or {})}}
+                      for n, e in agents.items()}
         if write_config:
             write_agents_config(self.workspace, agents, self.shards)
         # A 2.0 workspace is stamped; the server refuses to boot otherwise.
@@ -120,7 +134,8 @@ class Harness:
     async def start(self):
         from aiohttp.test_utils import TestClient, TestServer
         self._saved_env = {k: os.environ.get(k) for k in _ENV_KEYS}
-        os.environ["PATH"] = f"{FAKE_BIN_DIR}{os.pathsep}{os.environ.get('PATH', '')}"
+        if self.claude == "fake":
+            os.environ["PATH"] = f"{FAKE_BIN_DIR}{os.pathsep}{os.environ.get('PATH', '')}"
         os.environ["WORKSPACE_ROOT"] = str(self.workspace)
         os.environ["AGENT_SERVER_TOKEN"] = DEFAULT_TOKEN
         os.environ["FAKE_CLAUDE_LOG_DIR"] = str(self.log_dir)

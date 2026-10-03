@@ -215,3 +215,7 @@ def real_template_workspace(tmp_workspace):
     (tmp_workspace / "config" / "claude-settings.json").write_text(
         json.dumps({"permissions": {"allow": [], "deny": []}}))
     return tmp_workspace
+
+
+# 7.3a: the real-CLI fixture (skips locally, fails under KARAKOS_REQUIRE_REAL_CLI=1).
+from realcli_support import real_cli  # noqa: E402,F401
