@@ -13,7 +13,8 @@ Environment:
 
 Step keys (all optional): text, tools [{name, input, usage, message_id,
 parent_tool_use_id}], usage, cost, delay_ms, is_error, exit, hang,
-parent_tool_use_id (for the text event). Templates in `text`: {{text}} echoes
+parent_tool_use_id (for the text event), result_usage (the closing
+result's usage; defaults to `usage`, as the real CLI sums across calls). Templates in `text`: {{text}} echoes
 the user's input, {{env:NAME}} reads an environment variable.
 
 Queued-stdin mode (step 0.3b) -- on only with `--replay-user-messages` or
@@ -487,7 +488,7 @@ def main():
         is_error = bool(step.get("is_error"))
         emit({"type": "result", "subtype": "error" if is_error else "success",
               "session_id": sid, "is_error": is_error, "result": reply,
-              "usage": usage,
+              "usage": step.get("result_usage") or usage,
               "total_cost_usd": (step["cost"] if "cost" in step
                                  else DEFAULT_COST * n_msg),
               "duration_ms": int((time.time() - started) * 1000)})

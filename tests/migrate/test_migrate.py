@@ -270,7 +270,7 @@ def test_unknown_schema_refused_without_force(tmp_path):
 
 
 def test_default_step_chain_loads():
-    assert [s.name for s in runner.load_steps()] == ["00_noop", "10_registry"]
+    assert [s.name for s in runner.load_steps()] == ["00_noop", "10_registry", "30_sessions"]
 
 
 def test_cli_exit_codes(tmp_path):

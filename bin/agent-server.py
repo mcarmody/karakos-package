@@ -273,7 +273,9 @@ async def init_db():
             session_id TEXT NOT NULL,
             input_tokens INTEGER DEFAULT 0,
             compaction_count INTEGER DEFAULT 0,
-            last_compacted TIMESTAMP
+            last_compacted TIMESTAMP,
+            context_tokens INTEGER DEFAULT 0,
+            context_updated_at TIMESTAMP
         )
     """)
 
@@ -439,11 +441,13 @@ async def clear_session(agent: str):
     session_id = str(uuid.uuid4())
     await db.execute(
         """
-        INSERT INTO sessions (agent, session_id, input_tokens, compaction_count)
-        VALUES (?, ?, 0, 0)
+        INSERT INTO sessions (agent, session_id, input_tokens, compaction_count,
+                              context_tokens)
+        VALUES (?, ?, 0, 0, 0)
         ON CONFLICT(agent) DO UPDATE SET
             session_id = ?,
             input_tokens = 0,
+            context_tokens = 0,
             compaction_count = 0,
             last_compacted = CURRENT_TIMESTAMP
         """,
@@ -454,12 +458,41 @@ async def clear_session(agent: str):
     log.info(f"Cleared session for {agent}, new ID: {session_id}")
 
 async def update_session_tokens(agent: str, input_tokens: int):
-    """Update session token count"""
+    """Update session token count. `input_tokens` is the turn's uncached
+    input only (the result event's field); it is NOT context size. See
+    update_session_context."""
     await db.execute(
         "UPDATE sessions SET input_tokens = ? WHERE agent = ?",
         (input_tokens, agent)
     )
     await db.commit()
+
+def usage_context_tokens(usage: Optional[Dict]) -> int:
+    """Context size implied by one API call's usage block:
+    input + cache_creation + cache_read, None as 0. Must be fed the LAST
+    call of a turn, never the turn's summed usage."""
+    if not usage:
+        return 0
+    return sum(usage.get(k) or 0 for k in (
+        "input_tokens", "cache_creation_input_tokens",
+        "cache_read_input_tokens"))
+
+async def update_session_context(shard: str, tokens: int):
+    """Record the session's context size (from the last main-thread API call).
+    Keyed by shard id; a default shard has the agent's id."""
+    await db.execute(
+        "UPDATE sessions SET context_tokens = ?, "
+        "context_updated_at = CURRENT_TIMESTAMP WHERE agent = ?",
+        (tokens, shard)
+    )
+    await db.commit()
+
+async def get_context_tokens() -> Dict[str, int]:
+    """{shard: context_tokens} from the sessions table; 0 means unknown."""
+    async with db.execute(
+        "SELECT agent, context_tokens FROM sessions"
+    ) as cursor:
+        return {r["agent"]: r["context_tokens"] or 0 for r in await cursor.fetchall()}
 
 # =============================================================================
 # Session Persistence (Summary and Restore)
@@ -1888,6 +1921,9 @@ async def read_agent_response(
     metadata = {}
     last_posted_chunk = ""
     rejected_rl_info = None  # last rate_limit_event with status=rejected this turn
+    # usage block of the last main-thread assistant event; its sum is the
+    # session's context size (the result's usage is summed across the turn).
+    last_usage = None
 
     # turn_events sequence number for this turn, and burst-collapse state
     # for content-less thinking blocks. Some builds strip thinking TEXT from
@@ -1951,6 +1987,11 @@ async def read_agent_response(
             # then a single `result` event closes the turn.
             if event_type == "assistant":
                 message = event.get("message", {}) or {}
+                # Subagent (Task) sidechains carry parent_tool_use_id; their
+                # smaller context must not replace the session's.
+                if (event.get("parent_tool_use_id") is None
+                        and isinstance(message.get("usage"), dict)):
+                    last_usage = message["usage"]
                 got_text = False
                 for block in message.get("content", []) or []:
                     btype = block.get("type")
@@ -2021,6 +2062,7 @@ async def read_agent_response(
                     "session_id": event.get("session_id"),
                     "input_tokens": usage.get("input_tokens", 0),
                     "output_tokens": usage.get("output_tokens", 0),
+                    "context_tokens": usage_context_tokens(last_usage),
                     "total_cost_usd": event.get("total_cost_usd", 0.0),
                     "duration_ms": event.get("duration_ms", 0),
                     "is_error": event.get("is_error", False),
@@ -2324,6 +2366,10 @@ async def process_agent_queue(agent: str):
         if metadata:
             await post_cost_update(agent, metadata)
             await update_session_tokens(agent, metadata.get("input_tokens", 0))
+            await update_session_context(agent, metadata.get("context_tokens", 0))
+            log.info(f"{agent} ctx={metadata.get('context_tokens', 0)} "
+                     f"turn_in={metadata.get('input_tokens', 0)} "
+                     f"out={metadata.get('output_tokens', 0)}")
 
         # Usage / model wall: hold the batch instead of consuming it.
         wall = classify_wall(response_text, metadata.get("is_error", False),
@@ -2557,6 +2603,7 @@ async def handle_health(request):
         return web.json_response({"error": "Unauthorized"}, status=401)
 
     agent_status = {}
+    ctx_by_shard = await get_context_tokens()
     for agent in agent_config:
         proc = agent_processes.get(agent)
         queue_depth = 0
@@ -2571,7 +2618,11 @@ async def handle_health(request):
             "state": agent_states.get(agent, "UNKNOWN"),
             "alive": proc is not None and proc.returncode is None,
             "queue_depth": queue_depth,
-            "session_id": agent_sessions.get(agent, "")[:8]
+            "session_id": agent_sessions.get(agent, "")[:8],
+            # Shards of an agent are keyed by shard id; until the registry
+            # has shards the only shard is the agent itself. 0 = unknown.
+            "context_tokens": ctx_by_shard.get(agent, 0),
+            "shards": {agent: {"context_tokens": ctx_by_shard.get(agent, 0)}},
         }
 
     # A non-zero count means replies were generated and never delivered. It is
@@ -2599,9 +2650,13 @@ async def handle_agents(request):
         return web.json_response({"error": "Unauthorized"}, status=401)
 
     agents_list = []
+    ctx_by_shard = await get_context_tokens()
     for agent, config in agent_config.items():
         agents_list.append({
             "name": agent,
+            # Max over the agent's shards; 0 = unknown. Per-shard values below.
+            "context_tokens": ctx_by_shard.get(agent, 0),
+            "shards": {agent: {"context_tokens": ctx_by_shard.get(agent, 0)}},
             "model": config.get("model"),
             # The same defaults the subprocess is actually launched with (see
             # start_agent). Reporting the raw config.get() would show a blank
