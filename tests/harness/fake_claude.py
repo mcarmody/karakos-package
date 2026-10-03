@@ -27,7 +27,7 @@ until the tool answers. Results are available to `text` as {{mcp:0}} (the raw
 tool result text) and {{mcp:0.answer}} (a field of its JSON). Rules may match
 on `agent` and/or `shard` (regexes on KARAKOS_SHARD, else KARAKOS_AGENT).
 
-Step 2.6 keys (default, non-queued mode): `write_file_from_prompt: "<text>"`
+Step 2.6 keys (both modes): `write_file_from_prompt: "<text>"`
 emits a `Write` tool_use for the path found in the user text (the handoff
 prompt carries it alone on a line) and writes that file itself, creating its
 directory; `compact: true` emits a `system` `compact_boundary` event
@@ -51,8 +51,10 @@ held and merged at the next tool boundary (or coalesced into the next turn),
 every turn opens with system/init and ends with one result, and an interrupt
 control_request is answered without exiting. Extra Step keys in this mode:
 tools [{name, input, ms, output}], pre_text (text block sharing the tool_use
-message id), sidechain (bool) / sidechain_text, background_task {ms} with
-after_text. Extra templates: {{queued}} (lines merged mid-turn),
+message id), sidechain (bool) / sidechain_text, background_task {ms, after_ms}
+with after_text (after_ms delays the self-started second turn), exit_in_tool_ms
+(die that long into the first tool, before merging queued lines), no_followon
+(after the turn, stay alive but never start another one). Extra templates: {{queued}} (lines merged mid-turn),
 {{system_prompt}} (the session's original prompt). Extra environment:
 FAKE_CLAUDE_INIT_DELAY_MS, FAKE_CLAUDE_MCP_FAILED=a,b. Everything stdin/stdout
 is also logged to $FAKE_CLAUDE_LOG_DIR/<session-id>.io.jsonl.
@@ -474,6 +476,8 @@ class Queued:
         if step.get("hang"):
             while True:  # unresponsive: never reads again, never answers
                 time.sleep(3600)
+        if step.get("spawn_child"):
+            spawn_child(step["spawn_child"])
         self.open_turn(ts, text)
         usage = step.get("usage") or DEFAULT_USAGE
         mid = f"msg_{self.sid[:8]}_{n}"
@@ -505,6 +509,10 @@ class Queued:
                         "sidechain_text", "PONG")}, usage, ptu=parent)
                 for i, tool in enumerate(tools):
                     self.tool_in_flight = ids[i]
+                    if step.get("exit_in_tool_ms") is not None:
+                        # die while the tool runs, before any queued line is merged
+                        self.sleep(step["exit_in_tool_ms"] / 1000.0)
+                        sys.exit(1)
                     self.sleep(tool.get("ms", 0) / 1000.0, interruptible=True)
                     self.tool_in_flight = None
                     self.tool_result(ids[i], tool.get("output", "ok"))
@@ -522,6 +530,7 @@ class Queued:
             self.finish(step, text, started, "", len(tools), aborted=True)
             return None
         mcp_out = run_mcp(step.get("mcp") or [], self.sid, n, self.out)
+        self.step_2_6(step, text, n, usage)
         reply = render(step.get("text", "ok"), text,
                        {"queued": queued_text, "system_prompt": self.system_prompt,
                         "mcp": mcp_out})
@@ -530,6 +539,24 @@ class Queued:
             sys.exit(1)
         self.finish(step, text, started, reply, len(tools))
         return step
+
+    def step_2_6(self, step, text, n, usage):
+        """`write_file_from_prompt` and `compact` (step 2.6) in queued mode too:
+        steering puts every agent on this path by default."""
+        if step.get("write_file_from_prompt") is not None:
+            m = re.search(r"^(/\S+\.md)$", text, re.M)
+            if m:
+                self.assistant(f"msg_{self.sid[:8]}_{n}_w",
+                               {"type": "tool_use", "id": f"toolu_w_{n}", "name": "Write",
+                                "input": {"file_path": m.group(1),
+                                          "content": step["write_file_from_prompt"]}}, usage)
+                os.makedirs(os.path.dirname(m.group(1)), exist_ok=True)
+                with open(m.group(1), "w") as fh:
+                    fh.write(step["write_file_from_prompt"])
+        if step.get("compact"):
+            self.out(self.base(type="system", subtype="compact_boundary",
+                               pre_tokens=step.get("pre_tokens", 60000),
+                               post_tokens=step.get("post_tokens", 5000)))
 
     def interrupted_events(self):
         tool_id, self.tool_in_flight = self.tool_in_flight, None
@@ -540,6 +567,9 @@ class Queued:
                          "text": "[Request interrupted by user for tool use]"}]}))
 
     def background_second_turn(self, step):
+        delay = (step.get("background_task") or {}).get("after_ms", 0)
+        if delay:
+            self.sleep(delay / 1000.0)
         self.turn_no += 1
         started = time.time()
         self.out(self.init_event())
@@ -562,6 +592,9 @@ class Queued:
                 step = self.run_turn(ts, text)
                 if self.sigint:
                     return 0
+                if step and step.get("no_followon"):
+                    while True:  # alive but never starts another turn
+                        time.sleep(3600)
                 if step and step.get("background_task"):
                     self.background_second_turn(step)
             elif self.eof:

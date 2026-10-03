@@ -12,6 +12,7 @@ call).
 """
 
 import asyncio
+import collections
 import inspect
 import json
 import time
@@ -23,8 +24,15 @@ import hive
 import msgqueue
 import post_guard
 import stealing
+import steering
 
 HOOK_NAMES = ("before_claim", "on_turn_start", "on_event", "on_turn_end")
+
+# Steering (step 2.5). Module constants so a test can patch them.
+STEER_FOLLOWON_TIMEOUT_S = 60   # a CLI-started follow-on turn must begin by then
+SELF_TURN_WINDOW_S = 5          # wait for a self-started turn after a background task
+CONTROL_TIMEOUT_S = 5           # wait for a control_response to an interrupt request
+POST_SELF_TURNS = True          # post a self-started turn's text to the last channel
 
 # Names read from the server module at access time. Dicts/sets are the live
 # runtime state; the callables are looked up late so tests can patch them.
@@ -41,6 +49,7 @@ _SERVER_NAMES = (
     "hold_batch", "agent_hold_until", "schedule_hold_wake", "classify_wall",
     "wall_not_before", "format_attachments", "redact_for_log",
     "send_to_agent", "read_agent_response",
+    "kill_agent_subprocess", "start_agent_subprocess",
     "ux_thread_cfg", "ux_create_thread",
     # used by the stream reader
     "write_stream_log", "record_rate_limit_event", "write_turn_event",
@@ -91,6 +100,13 @@ class TurnHooks:
         return results
 
 
+def _row_get(row, key, default=None):
+    try:
+        return row[key]
+    except (KeyError, IndexError, TypeError):
+        return default
+
+
 @dataclass
 class TurnBatch:
     shard: str
@@ -98,7 +114,28 @@ class TurnBatch:
     message_ids: List[str]
     channel_id: str
     content: str
-    origin: str = "queue"   # "stolen" for a batch taken from a sibling (step 2.4)
+    origin: str = "queue"   # "stolen" (2.4); "followon" or "self" for a turn the CLI started (2.5)
+    # -- steering (2.5) ----------------------------------------------------
+    merged_ids: List[str] = field(default_factory=list)  # message_ids steered into this turn
+    channels: set = field(default_factory=set)
+    call_id: Optional[str] = None       # copied from a call row; steerable() refuses it
+    phase: str = "new"                  # new -> streaming -> closing
+    interrupting: bool = False
+    steered_count: int = 0              # rows steered into this turn (the allowance)
+    result_index: Optional[int] = None
+    subtype: Optional[str] = None
+    terminal_reason: Optional[str] = None
+    saw_bg_task: bool = False           # a backgrounded task started during the turn
+    timed_out: bool = False             # a follow-on turn never began
+    primary_entry: Any = None           # the ledger entry of this turn's own write
+
+    def __post_init__(self):
+        for r in self.rows:
+            cid = _row_get(r, "channel_id")
+            if cid is not None:
+                self.channels.add(cid)
+            if self.call_id is None and _row_get(r, "call_id"):
+                self.call_id = _row_get(r, "call_id")
 
 
 @dataclass
@@ -124,6 +161,20 @@ class ServerState:
         self.hive = hive.HiveState()  # open hive calls (in memory only, step 2.3)
         self.stolen_total: Dict[str, int] = {}     # thief shard -> rows stolen (2.4)
         self.steal_timers: Dict[Tuple[str, str], Any] = {}  # (thief, victim) -> TimerHandle
+        self.bg_tasks: set = set()   # drain/steal/steer tasks; shutdown cancels and awaits them
+        self.closing = False
+        # Steering (2.5), all keyed by shard id.
+        self.steer: Dict[str, steering.Ledger] = {}          # lines the CLI has not replayed
+        self.steer_lock: Dict[str, asyncio.Lock] = {}        # every stdin writer holds it
+        self.steer_unmatched: Dict[str, int] = {}
+        self.steered_total: Dict[str, int] = {}
+        self.control_waiters: Dict[Tuple[str, str], Any] = {}  # (shard, request_id) -> Future
+        self.control_seq: Dict[str, int] = {}
+        self.turn_seq: Dict[str, int] = {}                   # results read so far
+        self.enqueued_at: Dict[str, float] = {}              # first unclaimed arrival (epoch)
+        self.pushback: Dict[str, collections.deque] = {}     # stdout lines read ahead
+        self.bg_seen: Dict[str, bool] = {}                   # a background task may self-start a turn
+        self.replay_seen: Dict[str, bool] = {}               # this process has emitted a replay
 
     def __getattr__(self, name):
         if name in _SERVER_NAMES:
@@ -229,7 +280,7 @@ def _arm_steal_timer(state: ServerState, thief: str, victim: str, delay: float) 
 
     def fire():
         state.steal_timers.pop(key, None)
-        loop.create_task(drain_shard(state, thief))
+        spawn(state, drain_shard(state, thief))
 
     state.steal_timers[key] = loop.call_later(max(delay, 0.0) + 0.05, fire)
 
@@ -307,17 +358,70 @@ async def maybe_steal_wake(state: ServerState, shard: str,
 # Write / read
 # =============================================================================
 
+def spawn(state: ServerState, coro) -> Optional[asyncio.Task]:
+    """create_task for work that touches the db or a shard's process (drain,
+    steal wake, steer). Tracked so `cancel_background` can end it before the db
+    closes; refused (coroutine closed) once shutdown has begun."""
+    if state.closing:
+        coro.close()
+        return None
+    task = asyncio.get_running_loop().create_task(coro)
+    state.bg_tasks.add(task)
+    task.add_done_callback(state.bg_tasks.discard)
+    return task
+
+
+async def cancel_background(state: ServerState) -> None:
+    """Shutdown: stop new spawns and steal timers, cancel every tracked task and
+    wait for them, so none touches the db after it closes."""
+    state.closing = True
+    for handle in list(state.steal_timers.values()):
+        handle.cancel()
+    state.steal_timers.clear()
+    me = asyncio.current_task()
+    tasks = [t for t in state.bg_tasks if t is not me]
+    for t in tasks:
+        t.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def steering_on(state: ServerState, shard: str) -> bool:
+    return steering.steer_config(state.cfg(shard)).enabled
+
+
+def ledger_of(state: ServerState, shard: str) -> steering.Ledger:
+    led = state.steer.get(shard)
+    if led is None:
+        led = state.steer[shard] = steering.Ledger(shard, state.log)
+    return led
+
+
+def lock_of(state: ServerState, shard: str) -> asyncio.Lock:
+    lock = state.steer_lock.get(shard)
+    if lock is None:
+        lock = state.steer_lock[shard] = asyncio.Lock()
+    return lock
+
+
 async def write_user_line(state: ServerState, shard: str, content: str,
-                          message_ids: List[str]):
-    """Send one user message to the shard's subprocess."""
+                          message_ids: List[str], steer: bool = False):
+    """Send one user message to the shard's subprocess. Returns False when the
+    write failed (the primary path has already logged it and flipped the shard
+    to ERROR_RECOVERY). A `steer` write goes into a turn already in flight: it
+    touches no shard state, and raises on failure so the caller can take its
+    ledger entry back."""
     proc = state.agent_processes.get(shard)
     if not proc or not proc.stdin:
         state.log.error(f"No subprocess for {shard}")
-        return
+        if steer:
+            raise RuntimeError(f"no subprocess for {shard}")
+        return False
 
-    state.agent_states[shard] = "PROCESSING"
-    state.write_agent_beacon(shard, "PROCESSING", force=True)
-    state.response_buffers[shard] = ""
+    if not steer:
+        state.agent_states[shard] = "PROCESSING"
+        state.write_agent_beacon(shard, "PROCESSING", force=True)
+        state.response_buffers[shard] = ""
 
     # Send message — Claude Code stream-json input envelope.
     # Format: {"type": "user", "message": {"role": "user", "content": <str>}}
@@ -329,11 +433,72 @@ async def write_user_line(state: ServerState, shard: str, content: str,
     try:
         proc.stdin.write(msg.encode())
         await proc.stdin.drain()
-        state.log.info(f"Sent message to {shard} ({len(message_ids)} queued messages)")
+        if not steer:
+            state.log.info(f"Sent message to {shard} ({len(message_ids)} queued messages)")
     except Exception as e:
         state.log.error(f"Error sending to {shard}: {e}")
+        if steer:
+            raise
         state.agent_states[shard] = "ERROR_RECOVERY"
         state.write_agent_beacon(shard, "ERROR_RECOVERY", force=True)
+        return False
+    return True
+
+
+async def write_control(state: ServerState, shard: str, obj: dict) -> None:
+    """Write one raw JSON line (a control_request) to the shard's stdin."""
+    proc = state.agent_processes.get(shard)
+    if not proc or not proc.stdin:
+        raise RuntimeError(f"no subprocess for {shard}")
+    proc.stdin.write((json.dumps(obj) + "\n").encode())
+    await proc.stdin.drain()
+
+
+async def _next_line(state: ServerState, shard: str, proc, timeout: Optional[float] = None):
+    """The next stdout line: a read-ahead line first, else the pipe. None on
+    timeout; b"" at EOF."""
+    pb = state.pushback.get(shard)
+    if pb:
+        return pb.popleft()
+    if timeout is None:
+        return await proc.stdout.readline()
+    try:
+        return await asyncio.wait_for(proc.stdout.readline(), timeout)
+    except asyncio.TimeoutError:
+        return None
+
+
+def _unread(state: ServerState, shard: str, line: bytes) -> None:
+    state.pushback.setdefault(shard, collections.deque()).appendleft(line)
+
+
+def _is_init(line: bytes) -> bool:
+    try:
+        ev = json.loads(line.decode())
+    except (ValueError, UnicodeDecodeError):
+        return False
+    return ev.get("type") == "system" and ev.get("subtype") == "init"
+
+
+async def await_init(state: ServerState, shard: str, timeout: float) -> bool:
+    """Wait up to `timeout` for the CLI to start a turn by itself. A
+    `system/init` is left to be read by the turn; anything before it is
+    dropped (the stream is still tee'd to the log)."""
+    proc = state.agent_processes.get(shard)
+    if not proc or not proc.stdout:
+        return False
+    deadline = time.monotonic() + timeout
+    while True:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return False
+        line = await _next_line(state, shard, proc, left)
+        if not line:
+            return False
+        state.write_stream_log(shard, line)
+        if _is_init(line):
+            _unread(state, shard, line)
+            return True
 
 
 async def read_events(
@@ -354,7 +519,17 @@ async def read_events(
     # Set "tool_streaming": false in agents.yaml to go back to silence.
     tool_streaming = config.get("tool_streaming", True)
     stream_to_channel = config.get("stream_to_channel", False)
-    msg_ids = message_ids or []
+    # A copy: steered rows join it when the CLI replays them, so the turn's
+    # events reach every row the turn answers.
+    msg_ids = list(message_ids or [])
+    batch = state.active_turns.get(shard)
+    if batch is None:
+        batch = TurnBatch(shard=shard, rows=[], message_ids=msg_ids,
+                          channel_id=channel_id, content="")
+    ledger = state.steer.get(shard)
+    eof = False
+    # A follow-on turn is started by the CLI, not by a write: it must begin soon.
+    awaiting_start = batch.origin == "followon"
 
     # Throttle state is per-turn, not global: each turn starts with its
     # first tool line free so a long turn says something quickly. None, not
@@ -373,9 +548,9 @@ async def read_events(
             state.log.warning(f"ux thread lookup failed, threads off for this turn: {e}")
             thread_cfg = None
         if thread_cfg is not None:
-            batch = state.active_turns.get(shard)
+            active = state.active_turns.get(shard)
             first_text = ""
-            for r in (batch.rows if batch else []):
+            for r in (active.rows if active else []):
                 first_text = r["content"] or ""
                 if first_text:
                     break
@@ -403,8 +578,18 @@ async def read_events(
 
     try:
         while True:
-            line = await proc.stdout.readline()
+            if awaiting_start:
+                line = await _next_line(state, shard, proc, STEER_FOLLOWON_TIMEOUT_S)
+                if line is None:
+                    batch.timed_out = True
+                    state.log.warning(
+                        f"steer shard={shard} follow-on turn did not start within "
+                        f"{STEER_FOLLOWON_TIMEOUT_S}s")
+                    break
+            else:
+                line = await _next_line(state, shard, proc)
             if not line:
+                eof = True
                 break
 
             # Tee before parsing, so a malformed line is still on the record.
@@ -421,6 +606,28 @@ async def read_events(
                 continue
 
             event_type = event.get("type")
+
+            # Steering (2.5). A replay is the CLI saying it has consumed a user
+            # line: not a tool result, no usage, nothing the handlers below may
+            # count. A control_response answers an interrupt request.
+            if event_type == "user" and event.get("isReplay"):
+                awaiting_start = False
+                await _on_replay(state, shard, batch, event, msg_ids)
+                await state.hooks.fire("on_event", shard, event)
+                continue
+            if event_type == "control_response":
+                resp = event.get("response") or {}
+                waiter = state.control_waiters.get((shard, resp.get("request_id")))
+                if waiter is not None and not waiter.done():
+                    waiter.set_result(resp)
+                await state.hooks.fire("on_event", shard, event)
+                continue
+            if event_type == "system":
+                sub = event.get("subtype")
+                if sub == "init":
+                    awaiting_start = False
+                elif sub == "task_started" and event.get("is_backgrounded"):
+                    batch.saw_bg_task = True
 
             # Every event is proof the turn is still moving. This is the whole
             # beacon: a SIGSTOPped claude emits nothing, readline() blocks
@@ -548,6 +755,17 @@ async def read_events(
                         await state.write_partial_response(msg_ids, cleaned)
 
             elif event_type == "result":
+                awaiting_start = False
+                batch.phase = "closing"
+                batch.result_index = event.get("result_index")
+                batch.subtype = event.get("subtype")
+                batch.terminal_reason = event.get("terminal_reason")
+                state.turn_seq[shard] = state.turn_seq.get(shard, 0) + 1
+                if (batch.terminal_reason == "aborted_tools"
+                        and (batch.interrupting or shard in state.interrupted_agents)):
+                    # The CLI's answer to our own interrupt request: not a failed turn.
+                    state.log.info(f"{shard} turn aborted by interrupt request "
+                                   f"(subtype={batch.subtype})")
                 # Extract metadata. Token counts live under `usage`,
                 # cost/duration are top-level. Final text is in `result`
                 # for success, or `error` field for failures.
@@ -594,6 +812,19 @@ async def read_events(
     if decode_errors and metadata:
         metadata["decode_errors"] = decode_errors
 
+    batch.phase = "closing"
+    if eof and ledger is not None and ledger.entries:
+        # The process is gone: lines it never replayed go back to the queue.
+        await release_pending(state, shard, "eof")
+    elif (ledger is not None and batch.primary_entry is not None
+            and not state.replay_seen.get(shard)):
+        # This process has never replayed a line, so the entry cannot be waiting
+        # on one (an old CLI, a stub): it must not linger as a phantom follow-on.
+        # Once replays are seen, an unconsumed primary stays pending: the CLI
+        # started a turn of its own (a self turn) ahead of it, and the line is
+        # read as a follow-on.
+        ledger.remove(batch.primary_entry)
+
     # Strip any inline thinking blocks (defense in depth)
     final_text = state.THINKING_BLOCK_RE.sub("", final_text).strip()
 
@@ -606,16 +837,288 @@ async def read_events(
         state.log.info(f"{shard} turn discarded (interrupted)")
         final_text, metadata = "", {}
 
+    if (steering_on(state, shard) and not eof
+            and (batch.saw_bg_task or (ledger is not None and ledger.entries))):
+        # More of this process's work is coming (a queued line, a self-started
+        # turn): the shard stays PROCESSING until settle() says otherwise.
+        return final_text, metadata
     state.agent_states[shard] = "IDLE"
     state.write_agent_beacon(shard, "IDLE", force=True)
     return final_text, metadata
 
 # =============================================================================
+# Steering (step 2.5)
+# =============================================================================
+
+async def _on_replay(state: ServerState, shard: str, batch: TurnBatch, event: dict,
+                     msg_ids: List[str]) -> None:
+    """The CLI consumed a user line. Match it against the ledger; rows of any
+    steered entry it covers belong to the turn this replay appears in. They
+    stay in progress until that turn's `result`."""
+    ledger = ledger_of(state, shard)
+    state.replay_seen[shard] = True
+    message = event.get("message") or {}
+    content = message.get("content", "")
+    if isinstance(content, list):
+        content = "".join(b.get("text", "") for b in content if isinstance(b, dict))
+    before = ledger.unmatched
+    taken = ledger.match_replay(content)
+    if ledger.unmatched != before:
+        state.steer_unmatched[shard] = ledger.unmatched
+    rows = 0
+    for entry in taken:
+        if entry.kind != steering.STEER:
+            continue
+        for mid in entry.message_ids:
+            if mid not in batch.merged_ids:
+                batch.merged_ids.append(mid)
+            msg_ids.append(mid)
+        rows += len(entry.row_ids)
+    if rows:
+        state.log.info(f"steer shard={shard} rows={rows} "
+                       f"turn={state.turn_seq.get(shard, 0)} replayed")
+
+
+async def release_pending(state: ServerState, shard: str, reason: str = "") -> int:
+    """Return every steered line the CLI never replayed to the queue (they keep
+    created_at, so their place). Primary entries are dropped: their rows follow
+    today's in-flight crash handling. Returns the number of rows released."""
+    ledger = state.steer.get(shard)
+    if ledger is None or not ledger.entries:
+        return 0
+    entries = ledger.drain_all()
+    ids = [i for e in entries if e.kind == steering.STEER for i in e.row_ids]
+    if not ids:
+        return 0
+    n = await msgqueue.release(state.db, ids)
+    state.log.info(f"steer shard={shard} released {n} unreplayed rows ({reason})")
+    return n
+
+
+async def steer_enqueued(state: ServerState, shard: str, channel_id: str) -> None:
+    """A row arrived while `shard` is mid-turn: write it into the running turn
+    if it may be, else leave it QUEUED for after the turn."""
+    sc = steering.steer_config(state.cfg(shard))
+    if not sc.enabled:
+        return
+    async with lock_of(state, shard):
+        batch = state.active_turns.get(shard)
+        if batch is None or batch.phase != "streaming":
+            return
+        head = await msgqueue.peek_claimable(state.db, shard, 1)
+        if not head or not steering.steerable(state, shard, head[0]):
+            return
+        # A steered write bypasses the drain, so the gate is asked here too.
+        if any(v for v in await state.hooks.fire("before_claim", shard)):
+            return
+        rows = await msgqueue.claim_steerable(
+            state.db, shard, batch.channel_id, steering.allowance(state, shard))
+        if not rows:
+            return
+        ids = [r["id"] for r in rows]
+        # The claim awaited: the turn may have closed meanwhile.
+        if (state.active_turns.get(shard) is not batch
+                or not steering.steerable(state, shard, rows[0])):
+            await msgqueue.release(state.db, ids)
+            spawn(state, drain_shard(state, shard))
+            return
+        text = format_batch(rows, state.format_attachments,
+                            state.AUTOMATED_TRAFFIC_SENTINEL)
+        entry = steering.SteerLine(
+            row_ids=ids, text=text, channel_id=batch.channel_id,
+            written_at=time.time(), kind=steering.STEER,
+            message_ids=[r["message_id"] for r in rows])
+        ledger = ledger_of(state, shard)
+        ledger.append(entry)
+        batch.steered_count += len(rows)
+        try:
+            await write_user_line(state, shard, text, entry.message_ids, steer=True)
+        except Exception as e:
+            ledger.remove(entry)
+            batch.steered_count -= len(rows)
+            await msgqueue.release(state.db, ids)
+            state.log.error(f"steer write to {shard} failed: {type(e).__name__}: {e}")
+            return
+        state.steered_total[shard] = state.steered_total.get(shard, 0) + len(rows)
+        state.log.info(f"steer shard={shard} rows={len(rows)} "
+                       f"turn={state.turn_seq.get(shard, 0)}")
+
+
+async def _steer_task(state: ServerState, shard: str, channel_id: str) -> None:
+    try:
+        await steer_enqueued(state, shard, channel_id)
+    except Exception as e:  # noqa: BLE001 — never lose a row's wake-up to a bug here
+        state.log.error(f"steer_enqueued failed for {shard}: {type(e).__name__}: {e}")
+
+
+async def interrupt_with_message(state: ServerState, shard: str, message: str,
+                                 channel_id: str = "0", author: str = "interrupt",
+                                 fallback: Optional[Callable] = None) -> dict:
+    """Queue `message` at INTERRUPT_PRIORITY and, if the shard is mid-turn, end
+    that turn with a control_request (the process stays alive and the priority
+    row runs next). A missing or failed control_response falls back to
+    `fallback(shard)` (today's kill-and-respawn interrupt)."""
+    import uuid
+    message_id = f"interrupt-{uuid.uuid4()}"
+    await msgqueue.write_commit(
+        state.db,
+        "INSERT INTO message_queue (agent, channel, channel_id, server, author,"
+        " author_id, is_bot, content, message_id, priority)"
+        " VALUES (?, 'interrupt', ?, 'local', ?, '0', 0, ?, ?, ?)",
+        (shard, channel_id, author, message, message_id, steering.INTERRUPT_PRIORITY))
+    msgqueue.notify(shard)
+    out = {"message_id": message_id, "interrupted": False, "mode": "queued"}
+
+    batch = state.active_turns.get(shard)
+    if state.agent_states.get(shard) != "PROCESSING":
+        # IDLE: the normal drain runs it.
+        notify_enqueued(state, shard, channel_id)
+        return out
+    if not steering_on(state, shard):
+        # No control-request path (2.0 behaviour): today's interrupt, then the
+        # priority row is first in line on the respawned process.
+        interrupted = bool(fallback is not None and await fallback(shard))
+        out.update(interrupted=interrupted, mode="kill" if interrupted else "queued")
+        return out
+    if batch is None or batch.phase != "streaming":
+        # The turn is starting or already closing: first in line when it ends.
+        notify_enqueued(state, shard, channel_id)
+        return out
+
+    state.control_seq[shard] = n = state.control_seq.get(shard, 0) + 1
+    rid = f"int-{shard}-{n}"
+    waiter = asyncio.get_running_loop().create_future()
+    state.control_waiters[(shard, rid)] = waiter
+    batch.interrupting = True                 # steering stops
+    state.interrupted_agents.add(shard)       # finish_turn treats it as interrupted
+    ok = False
+    try:
+        try:
+            async with lock_of(state, shard):
+                await write_control(state, shard, {
+                    "type": "control_request", "request_id": rid,
+                    "request": {"subtype": "interrupt"}})
+            resp = await asyncio.wait_for(waiter, CONTROL_TIMEOUT_S)
+            ok = resp.get("subtype") == "success"
+        except (asyncio.TimeoutError, OSError, RuntimeError) as e:
+            state.log.warning(f"interrupt request to {shard} got no answer "
+                              f"({type(e).__name__}); falling back")
+    finally:
+        state.control_waiters.pop((shard, rid), None)
+    if ok:
+        out.update(interrupted=True, mode="control")
+        return out
+    if fallback is not None:
+        out["interrupted"] = bool(await fallback(shard))
+        out["mode"] = "kill"
+    return out
+
+
+async def settle(state: ServerState, shard: str, last: Optional[TurnBatch] = None,
+                 ready: bool = False) -> Optional[TurnBatch]:
+    """After a turn's `result`: is there more of this process's work to read?
+    A turn is framed from system/init to result; nothing equates one stdin line
+    with one result.
+
+    - ledger entries remain (lines the CLI queued after the last tool
+      boundary): the shard stays PROCESSING and a read-only follow-on batch is
+      returned;
+    - a backgrounded task started in the turn: wait up to SELF_TURN_WINDOW_S
+      for the CLI to start a turn by itself (`ready`: its init is already
+      read ahead) and return a self batch;
+    - else None (the shard may go IDLE)."""
+    if not steering_on(state, shard):
+        return None
+    proc = state.agent_processes.get(shard)
+    if proc is None or getattr(proc, "returncode", None) is not None:
+        return None
+    nxt = await _settle_next(state, shard, last, ready)
+    if nxt is None and state.agent_states.get(shard) == "PROCESSING":
+        state.agent_states[shard] = "IDLE"
+        state.write_agent_beacon(shard, "IDLE", force=True)
+    return nxt
+
+
+async def _settle_next(state: ServerState, shard: str, last: Optional[TurnBatch],
+                       ready: bool) -> Optional[TurnBatch]:
+    ledger = ledger_of(state, shard)
+    async with lock_of(state, shard):
+        pending = ledger.pending()
+    if pending:
+        state.agent_states[shard] = "PROCESSING"
+        state.write_agent_beacon(shard, "PROCESSING", force=True)
+        return TurnBatch(shard=shard, rows=[], message_ids=[],
+                         channel_id=pending[0].channel_id, content="",
+                         origin="followon")
+    if ready or (last is not None and last.saw_bg_task and not last.timed_out):
+        if ready or await await_init(state, shard, SELF_TURN_WINDOW_S):
+            state.agent_states[shard] = "PROCESSING"
+            state.write_agent_beacon(shard, "PROCESSING", force=True)
+            return TurnBatch(shard=shard, rows=[], message_ids=[],
+                             channel_id=state.agent_last_channel.get(shard, "0"),
+                             content="", origin="self")
+    return None
+
+
+async def _settle_loop(state: ServerState, shard: str, last: Optional[TurnBatch],
+                       ready: bool = False) -> list:
+    """Read follow-on and self-started turns until nothing more is pending.
+    Returns the hook followups those turns produced (run after the lock is
+    released, like the first turn's)."""
+    followups: list = []
+    while True:
+        nxt = await settle(state, shard, last, ready=ready)
+        ready = False
+        if nxt is None:
+            return followups
+        await state.hooks.fire("on_turn_start", shard, nxt)
+        result = await run_turn(state, shard, nxt, write=False)
+        if nxt.timed_out:
+            await _bounce(state, shard)
+            return followups
+        await finish_turn(state, shard, result)
+        followups.extend(result.followups)
+        last = nxt
+
+
+async def _bounce(state: ServerState, shard: str) -> None:
+    """A follow-on turn never started: restart the process through the existing
+    kill-and-respawn path. Kill releases the ledger, and a dead process cannot
+    deliver a line twice."""
+    state.log.warning(f"steer shard={shard} bouncing the process (follow-on never started)")
+    await state.kill_agent_subprocess(shard)
+    state.pushback.pop(shard, None)
+    await state.start_agent_subprocess(shard)
+    spawn(state, drain_shard(state, shard))
+
+
+async def _drain_stale_self_turn(state: ServerState, shard: str) -> list:
+    """A self-started turn that began after the shard went IDLE is read before
+    anything is written, so its events cannot leak into the next reply."""
+    if not state.bg_seen.pop(shard, False) or not steering_on(state, shard):
+        return []
+    proc = state.agent_processes.get(shard)
+    if not proc or not proc.stdout or getattr(proc, "returncode", None) is not None:
+        return []
+    while True:
+        line = await _next_line(state, shard, proc, 0.01)
+        if not line:
+            return []
+        state.write_stream_log(shard, line)
+        if _is_init(line):
+            _unread(state, shard, line)
+            return await _settle_loop(state, shard, None, ready=True)
+
+
+# =============================================================================
 # One turn
 # =============================================================================
 
-async def run_turn(state: ServerState, shard: str, batch: TurnBatch) -> TurnResult:
-    """Run one claimed batch through the subprocess and read its reply."""
+async def run_turn(state: ServerState, shard: str, batch: TurnBatch,
+                   write: bool = True) -> TurnResult:
+    """Run one claimed batch through the subprocess and read its reply. With
+    `write=False` (a follow-on or self-started turn) nothing is written: the
+    CLI started the turn and this only reads it."""
     channel_id = batch.channel_id
     message_ids = batch.message_ids
     messages = batch.rows
@@ -642,9 +1145,28 @@ async def run_turn(state: ServerState, shard: str, batch: TurnBatch) -> TurnResu
         # Start typing indicator
         await state.start_typing(shard, channel_id)
 
-        # Send to agent. Through the server's wrapper, not write_user_line
-        # directly: tests (and a future steering hook) patch it there.
-        await state.send_to_agent(shard, batch.content, message_ids)
+        if not write:
+            batch.phase = "streaming"
+        elif steering_on(state, shard):
+            # Every line the shard writes is matched the same way: the entry goes
+            # in before the write is awaited, under the lock every writer holds.
+            async with lock_of(state, shard):
+                entry = steering.SteerLine(
+                    row_ids=[r["id"] for r in messages if _row_get(r, "id") is not None],
+                    text=batch.content, channel_id=channel_id,
+                    written_at=time.time(), kind=steering.PRIMARY,
+                    message_ids=list(message_ids))
+                ledger_of(state, shard).append(entry)
+                ok = await state.send_to_agent(shard, batch.content, message_ids)
+                if ok is False:
+                    ledger_of(state, shard).remove(entry)
+                else:
+                    batch.primary_entry = entry
+                    batch.phase = "streaming"
+        else:
+            # Send to agent. Through the server's wrapper, not write_user_line
+            # directly: tests patch it there.
+            await state.send_to_agent(shard, batch.content, message_ids)
 
         # Read response
         try:
@@ -669,8 +1191,12 @@ async def run_turn(state: ServerState, shard: str, batch: TurnBatch) -> TurnResu
             # where nothing downstream will ever clear these, and #121
             # turned that from one stuck indicator into one per channel in
             # the batch.
-            for cid in {msg["channel_id"] for msg in messages}:
+            for cid in {msg["channel_id"] for msg in messages} | batch.channels:
                 await state.stop_typing(cid)
+            if not write:
+                await state.stop_typing(channel_id)
+            if batch.saw_bg_task:
+                state.bg_seen[shard] = True
     finally:
         state.active_turns.pop(shard, None)
 
@@ -689,6 +1215,16 @@ async def finish_turn(state: ServerState, shard: str, result: TurnResult):
     batch = result.batch
     channel_id = batch.channel_id
     message_ids = batch.message_ids
+    # Rows steered into this turn are answered by its one reply, and complete
+    # (or fail, or are held) with it.
+    all_ids = list(message_ids) + list(batch.merged_ids)
+    self_turn = batch.origin == "self"
+    if self_turn:
+        # A turn the CLI started by itself answers no row: it speaks where the
+        # shard last spoke.
+        channel_id = state.agent_last_channel.get(shard, "0")
+        if not POST_SELF_TURNS:
+            result.suppress_post = True
     response_text = result.response_text
     metadata = result.metadata
 
@@ -704,13 +1240,13 @@ async def finish_turn(state: ServerState, shard: str, result: TurnResult):
     # Usage / model wall: hold the batch instead of consuming it.
     wall = state.classify_wall(response_text, metadata.get("is_error", False),
                                metadata.get("rate_limit_rejected")) if metadata else None
-    if wall:
+    if wall and all_ids:
         result.wall = wall
         until = state.wall_not_before(wall, response_text,
                                       metadata.get("rate_limit_rejected"),
                                       state.agent_wall_strikes.get(shard, 0))
         state.agent_wall_strikes[shard] = state.agent_wall_strikes.get(shard, 0) + 1
-        await state.hold_batch(agent, channel_id, message_ids, wall, until)
+        await state.hold_batch(agent, channel_id, all_ids, wall, until)
         return
     state.agent_wall_strikes.pop(shard, None)
 
@@ -726,6 +1262,8 @@ async def finish_turn(state: ServerState, shard: str, result: TurnResult):
         response_text = state.GENERIC_TURN_ERROR
         final_status = state.STATUS_CRASHED
         result.response_text = response_text
+        if self_turn:
+            result.suppress_post = True
 
     await state.hooks.fire("on_turn_end", shard, result)
 
@@ -734,20 +1272,21 @@ async def finish_turn(state: ServerState, shard: str, result: TurnResult):
     if response_text and channel_id != "0" and not result.suppress_post:
         discord_msg_id = await state.post_to_discord(agent, channel_id, response_text,
                                                      dead_letter=True,
-                                                     queue_message_id=message_ids[0])
+                                                     queue_message_id=(all_ids[0] if all_ids else None))
 
     # Mark complete
-    await state.db.execute(
-        f"""
-        UPDATE message_queue
-        SET processed = ?, response = ?, discord_response_id = COALESCE(?, discord_response_id), processed_at = CURRENT_TIMESTAMP
-        WHERE message_id IN ({','.join('?' * len(message_ids))})
-        """,
-        (final_status, response_text, discord_msg_id, *message_ids)
-    )
-    await state.db.commit()
+    if all_ids:
+        await msgqueue.write_commit(
+            state.db,
+            f"""
+            UPDATE message_queue
+            SET processed = ?, response = ?, discord_response_id = COALESCE(?, discord_response_id), processed_at = CURRENT_TIMESTAMP
+            WHERE message_id IN ({','.join('?' * len(all_ids))})
+            """,
+            (final_status, response_text, discord_msg_id, *all_ids)
+        )
 
-    state.log.info(f"{agent} processed {len(message_ids)} messages")
+    state.log.info(f"{agent} processed {len(all_ids)} messages")
 
     # Anything that arrived while this turn was running is still QUEUED,
     # and notify_enqueued is the ONLY caller of drain_shard — it fires
@@ -764,14 +1303,13 @@ async def finish_turn(state: ServerState, shard: str, result: TurnResult):
     # with` exits. It cannot spin — every drain moves its batch out of
     # STATUS_QUEUED, so the count strictly decreases, and the `if not
     # batch: return` in drain_shard is the floor.
-    async with state.db.execute(
+    rows = await state.db.execute_fetchall(
         "SELECT COUNT(*) AS count FROM message_queue WHERE agent = ? AND processed = ?",
-        (shard, state.STATUS_QUEUED)
-    ) as cursor:
-        row = await cursor.fetchone()
+        (shard, state.STATUS_QUEUED))
+    row = rows[0] if rows else None
     if row and row["count"]:
         state.log.info(f"{agent} has {row['count']} messages still queued — draining again")
-        asyncio.create_task(drain_shard(state, shard))
+        spawn(state, drain_shard(state, shard))
     elif _stealing_on(state, shard):
         # This shard is about to be free with nothing of its own: a busy
         # sibling's waiting rows may be stolen (drain_shard decides).
@@ -786,7 +1324,27 @@ async def maybe_steal_idle(state: ServerState, shard: str) -> None:
         return
     depths = await msgqueue.queued_depths(state.db, mine)
     if any(depths[sid] for sid in mine if sid != shard):
-        asyncio.create_task(drain_shard(state, shard))
+        spawn(state, drain_shard(state, shard))
+
+
+async def _coalesce(state: ServerState, shard: str) -> None:
+    """Burst coalescing at idle: sleep out the rest of the window, once, so a
+    burst is claimed as one batch. Measured from the oldest queued row's
+    arrival (not sliding), so the added latency is at most coalesce_ms."""
+    sc = steering.steer_config(state.cfg(shard))
+    if not sc.coalesce_ms:
+        return
+    rows = await msgqueue.peek_claimable(state.db, shard, 20)
+    if not rows:
+        return
+    head = rows[0]
+    created = steering._epoch(_row_get(head, "created_at")) or 0.0
+    arrived = max(state.enqueued_at.get(shard, 0.0), created)
+    view = {"call_id": _row_get(head, "call_id"), "priority": _row_get(head, "priority"),
+            "created_at": arrived}
+    wait = steering.coalesce_wait_s(view, time.time(), sc, queued=len(rows))
+    if wait > 0:
+        await asyncio.sleep(wait)
 
 
 async def drain_shard(state: ServerState, shard: str):
@@ -796,6 +1354,7 @@ async def drain_shard(state: ServerState, shard: str):
         return
 
     result = None
+    extra_followups: list = []
     async with lock:
         if state.agent_states.get(shard) != "IDLE":
             return
@@ -813,22 +1372,34 @@ async def drain_shard(state: ServerState, shard: str):
         if any(v for v in await state.hooks.fire("before_claim", shard)):
             return
 
+        if steering_on(state, shard):
+            proc = state.agent_processes.get(shard)
+            if proc is not None and getattr(proc, "returncode", None) is not None:
+                # The process is gone: the respawn watcher brings it back and
+                # redrains. Claiming now would write into a dead pipe.
+                return
+            extra_followups.extend(await _drain_stale_self_turn(state, shard))
+            await _coalesce(state, shard)
+
         batch = await claim_next(state, shard)
         if batch is None:
             batch = await steal_next(state, shard)
-        if batch is None:
-            return
-        if batch.origin == "queue" and _stealing_on(state, shard):
-            # Backlog behind this (possibly long) turn: an idle sibling may take it.
-            asyncio.create_task(maybe_steal_wake(state, shard, busy=shard))
+        if batch is not None:
+            state.enqueued_at.pop(shard, None)
+            if batch.origin == "queue" and _stealing_on(state, shard):
+                # Backlog behind this (possibly long) turn: an idle sibling may take it.
+                spawn(state, maybe_steal_wake(state, shard, busy=shard))
 
-        await state.hooks.fire("on_turn_start", shard, batch)
-        result = await run_turn(state, shard, batch)
-        await finish_turn(state, shard, result)
+            await state.hooks.fire("on_turn_start", shard, batch)
+            result = await run_turn(state, shard, batch)
+            await finish_turn(state, shard, result)
+            # The CLI may have more of this process's work to report (lines it
+            # queued after the last tool boundary, a self-started turn).
+            extra_followups.extend(await _settle_loop(state, shard, batch))
 
     # Lock released: hook followups (e.g. 2.6's reset) may take it themselves.
-    if result is not None:
-        for fn in list(result.followups):
+    if result is not None or extra_followups:
+        for fn in (list(result.followups) if result is not None else []) + extra_followups:
             try:
                 value = fn()
                 if inspect.isawaitable(value):
@@ -840,10 +1411,11 @@ async def drain_shard(state: ServerState, shard: str):
 def notify_enqueued(state: ServerState, shard: str, channel_id: str) -> None:
     """A row was just inserted for `shard`: wake the loop or show typing."""
     st = state.agent_states.get(shard)
+    state.enqueued_at.setdefault(shard, time.time())
     if st == "IDLE":
-        asyncio.create_task(drain_shard(state, shard))
+        spawn(state, drain_shard(state, shard))
     elif st in ("PROCESSING", "ERROR_RECOVERY") and _stealing_on(state, shard):
-        asyncio.create_task(maybe_steal_wake(state, shard))
+        spawn(state, maybe_steal_wake(state, shard))
     if st == "PROCESSING":
         # Agent is mid-turn in another channel. Without this, a message
         # landing behind a busy turn shows no typing indicator and no ack
@@ -859,3 +1431,5 @@ def notify_enqueued(state: ServerState, shard: str, channel_id: str) -> None:
         # started — no turn is running, nothing will call stop_typing(), and
         # the indicator would spin until the process restarts.
         asyncio.create_task(state.start_typing(shard, channel_id))
+        if steering_on(state, shard):
+            spawn(state, _steer_task(state, shard, channel_id))

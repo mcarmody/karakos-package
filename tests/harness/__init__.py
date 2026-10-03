@@ -79,9 +79,11 @@ def write_agents_config(workspace: Path, agents, shards=None) -> None:
         json.dumps({"permissions": {"allow": [], "deny": []}}))
 
 
+ARGV_WAIT_S = 3.0   # argv(): how long to wait for the fake CLI's argv file
+
 class Harness:
     def __init__(self, tmp_workspace, agents=["a", "b"], shards=None, write_config=True,
-                 work_stealing=None):
+                 work_stealing=None, steering=None):
         from conftest import import_script  # tests/ is on sys.path under pytest
         self.workspace = Path(tmp_workspace)
         self.agents = list(agents)
@@ -98,6 +100,13 @@ class Harness:
             if not isinstance(agents, dict):
                 agents = {name: {} for name in agents}
             agents = {n: {**(e or {}), "work_stealing": dict(work_stealing)}
+                      for n, e in agents.items()}
+        if steering is not None:
+            # Merged into every agent's steering block (step 2.5); an agent's own
+            # block wins key by key.
+            if not isinstance(agents, dict):
+                agents = {name: {} for name in agents}
+            agents = {n: {**(e or {}), "steering": {**steering, **((e or {}).get("steering") or {})}}
                       for n, e in agents.items()}
         if write_config:
             write_agents_config(self.workspace, agents, self.shards)
@@ -123,6 +132,8 @@ class Harness:
         self.module.post_to_discord = self._record_discord
         self.client = TestClient(TestServer(self.module.create_app(), host="127.0.0.1"))
         await self.client.start_server()
+        if os.environ.get("KARAKOS_DB_TRACE"):
+            await self._trace_db()
         # The ephemeral port is only known now, after the shards have spawned, so
         # the fake's MCP tools server reads the base URL from this file (and a
         # respawned shard inherits it through AGENT_SERVER_URL). Step 2.3.
@@ -131,6 +142,30 @@ class Harness:
         self.log_dir.mkdir(parents=True, exist_ok=True)
         (self.log_dir / "server-url").write_text(url)
         return self
+
+    async def _trace_db(self):
+        """Debug aid (KARAKOS_DB_TRACE=1): record every statement the server's
+        connection runs, so a lock failure can show who held the lock."""
+        import collections
+        self.db_trace = collections.deque(maxlen=60)
+        trace = self.db_trace
+        conn = self.module.db._conn
+        await self.module.db._execute(
+            lambda: conn.set_trace_callback(
+                lambda sql: trace.append((time.monotonic(), sql[:160]))))
+
+    def dump_lock_state(self, label=""):
+        """Debug aid: server connection state + recent statements + task stacks."""
+        import io
+        out = io.StringIO()
+        db = self.module.db
+        print(f"=== DB LOCK DUMP {label} in_transaction={db._conn.in_transaction}", file=out)
+        for ts, sql in list(getattr(self, "db_trace", [])):
+            print(f"  {ts:.3f} {sql}", file=out)
+        for t in asyncio.all_tasks():
+            print(f"  task {t.get_name()}:", file=out)
+            t.print_stack(limit=4, file=out)
+        sys.stderr.write(out.getvalue())
 
     async def stop(self):
         if self.client is not None:
@@ -240,9 +275,21 @@ class Harness:
         return [json.loads(l)["text"] for l in path.read_text().splitlines() if l]
 
     def argv(self, shard):
-        """argv (without the program name) of the shard's latest spawn."""
+        """argv (without the program name) of the shard's latest spawn. The fake
+        CLI writes it from its own process just after exec, so a test can get
+        here first; poll briefly (the writer is another process, so a blocking
+        wait cannot starve it). None if it never appears."""
         path = self.log_dir / f"{self.session_id(shard)}.argv.json"
-        return json.loads(path.read_text()) if path.exists() else None
+        deadline = time.monotonic() + ARGV_WAIT_S
+        while True:
+            if path.exists():
+                try:
+                    return json.loads(path.read_text())
+                except ValueError:
+                    pass                      # caught mid-write; retry
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.02)
 
     def io(self, shard):
         """Parsed <session>.io.jsonl the fake wrote in queued-stdin mode: every
@@ -279,6 +326,25 @@ class Harness:
             return json.loads(path.read_text()).get("findings", [])
         except (OSError, ValueError):
             return []
+
+    def stdin_events(self, shard):
+        """Every stdin line the fake recorded for the shard's current session,
+        control requests included: [{"t", "event"}] with seconds since the fake
+        started (its <session>.io.jsonl, direction "in")."""
+        return [{"t": r["t"], "event": r["event"]} for r in self.io(shard)
+                if r.get("dir") == "in" and "event" in r]
+
+    def results(self, shard):
+        """The `result` events the server read for this shard (its stream log),
+        oldest first."""
+        return [e for e in self.stream_events(shard) if e.get("type") == "result"]
+
+    def row_status(self, shard, id):
+        """processed status of one row, by row id or message_id (None if absent)."""
+        for r in self.queue_rows(shard):
+            if r["id"] == id or r["message_id"] == id:
+                return r["processed"]
+        return None
 
     def queue_rows(self, shard):
         return self._query(

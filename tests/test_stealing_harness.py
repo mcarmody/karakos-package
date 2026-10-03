@@ -8,6 +8,7 @@ waiting row becomes stealable between ~0.3 s and ~1.3 s after it arrives.
 import asyncio
 import json
 import logging
+import os
 import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
@@ -23,8 +24,8 @@ def run(coro):
     return asyncio.run(coro)
 
 
-def fixture(harness, steal=STEAL):
-    return harness(agents=["a", "b"], shards=SHARDS, work_stealing=steal)
+def fixture(harness, steal=STEAL, steering=None):
+    return harness(agents=["a", "b"], shards=SHARDS, work_stealing=steal, steering=steering)
 
 
 def slow_x1(extra=()):
@@ -46,11 +47,26 @@ def insert(h, agent, name, channel_id="9", age=60, **kw):
     cols = {"agent": agent, "channel": kw.pop("channel", "c"), "channel_id": channel_id,
             "server": "local", "author": "u", "author_id": "1", "is_bot": 0,
             "content": name, "message_id": name, "created_at": created, **kw}
+    if os.environ.get("KARAKOS_DB_TRACE"):
+        probe = sqlite3.connect(str(h.module.DB_PATH), timeout=0, isolation_level=None)
+        try:
+            probe.execute("BEGIN EXCLUSIVE")
+            probe.execute("ROLLBACK")
+        except sqlite3.OperationalError:
+            h.dump_lock_state(f"probe before {name}")
+        finally:
+            probe.close()
     conn = sqlite3.connect(str(h.module.DB_PATH))
-    conn.execute(f"INSERT INTO message_queue ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
-                 list(cols.values()))
-    conn.commit()
-    conn.close()
+    try:
+        conn.execute(f"INSERT INTO message_queue ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
+                     list(cols.values()))
+        conn.commit()
+    except sqlite3.OperationalError:
+        if os.environ.get("KARAKOS_DB_TRACE"):
+            h.dump_lock_state(name)
+        raise
+    finally:
+        conn.close()
 
 
 def wake(h, shard, channel_id="9"):
@@ -146,7 +162,9 @@ def test_off_by_default(harness, monkeypatch):
 # -- continuity ---------------------------------------------------------------
 
 def test_same_channel_not_stolen(harness):
-    h = fixture(harness)
+    # Steering off: with it on (the default) a same-channel row is steered into
+    # the busy turn rather than left waiting, which is not what this tests.
+    h = fixture(harness, steering={"enabled": False})
 
     async def scenario():
         async with h:
@@ -420,6 +438,27 @@ def test_remove_victim_skips_queued_leaves_stolen(harness):
 # -- needs 2.5 --------------------------------------------------------------------
 
 def test_coalescing_floor(harness):
+    """With steering on, a row younger than the coalescing window is not stolen
+    even when after_s would allow it (2.4's floor, 2.5's key)."""
     from lib import registry
-    if "steering" not in registry._DEFAULTS:
-        pytest.skip("needs spec 2.5 (the `steering` registry key and coalesce_ms)")
+    assert "steering" in registry._DEFAULTS
+    h = fixture(harness, steal={"enabled": True, "after_s": 0, "max_rows": 5},
+                steering={"enabled": True, "coalesce_ms": 1500})
+    busy = [{"match": "X1", "shard": "^a$", "step": {"text": "r-X1", "delay_ms": 6000}}]
+
+    async def scenario():
+        async with h:
+            h.script(default={"text": "ok"}, rules=busy)
+            await h.send("a", "X1", channel_id="1")
+            await h.wait_for(lambda: h.module.agent_states.get("a") == "PROCESSING", timeout=4)
+            t0 = time.monotonic()
+            await h.send("a", "X2", channel_id="2")     # another channel: not steerable either
+            await asyncio.sleep(1.0)
+            assert row(h, "a", "X2")["claimed_by"] is None      # inside the window
+            await h.wait_for(lambda: row(h, "a", "X2")["claimed_by"] == "a-2", timeout=5)
+            assert time.monotonic() - t0 >= 1.5
+            await h.wait_idle("a", timeout=10)
+
+    run(scenario())
+
+

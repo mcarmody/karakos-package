@@ -350,6 +350,7 @@ def test_reload_leaves_the_note_and_the_next_reset_consumes_it_once(harness):
             note = h.workspace / "data" / "handoff" / "a.md"
             note.parent.mkdir(parents=True, exist_ok=True)
             note.write_text("RELOAD-NOTE")
+            assert h.argv("a") is not None  # first spawn's argv written before we clear it
             argv_file = h.log_dir / f"{h.session_id('a')}.argv.json"
             argv_file.unlink()          # same session id after a reload: wait for the new spawn's
             r = await h.client.post("/agents/a/reload", headers=h._headers())

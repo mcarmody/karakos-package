@@ -7,6 +7,12 @@ SHARDS = {"a": ["a", "a-2"]}
 UX = {"channels": {"general": {"id": "1", "ux": {"edit_reroute": True}}}}
 
 
+# A queued row is edited in place only while it is still queued; with steering on
+# (step 2.5) a same-channel row arriving mid-turn is written into the running turn
+# within milliseconds and is no longer editable. These tests need it to wait.
+NO_STEER = {"enabled": False}
+
+
 def run(coro):
     return asyncio.run(coro)
 
@@ -41,7 +47,7 @@ def busy_script(h, text="{{text}}", delay_ms=700):
 
 
 def test_queued_row_is_updated_in_place(harness):
-    h = harness(agents=["a", "b"], shards=SHARDS)
+    h = harness(agents=["a", "b"], shards=SHARDS, steering=NO_STEER)
 
     async def scenario():
         async with h:
@@ -139,7 +145,7 @@ def test_refusals_change_nothing(harness):
 
 
 def test_fourth_followup_refused_and_queued_followup_updated_in_place(harness):
-    h = harness(agents=["a", "b"], shards=SHARDS)
+    h = harness(agents=["a", "b"], shards=SHARDS, steering=NO_STEER)
 
     async def scenario():
         async with h:

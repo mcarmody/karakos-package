@@ -57,7 +57,7 @@ def _ids(workspace):
 
 
 async def _scenario(workspace):
-    h = Harness(workspace, agents=["a", "b"])
+    h = Harness(workspace, agents=["a", "b"], steering={"enabled": False})
     cap = _Capture()
     async with h:
         h.module.log.addHandler(cap)

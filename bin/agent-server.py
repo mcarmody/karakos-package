@@ -838,6 +838,13 @@ async def start_agent_subprocess(shard: str):
     if persona_content:
         cmd.extend(["--append-system-prompt", persona_content])
 
+    # Steering (2.5): the CLI replays each user line it consumes, which is the
+    # server's only signal of which steered lines the model has seen.
+    if turn_loop.steering_on(STATE, shard):
+        cmd.append("--replay-user-messages")
+    STATE.pushback.pop(shard, None)
+    STATE.replay_seen.pop(shard, None)
+
     # Add disallowed tools
     disallowed = config.get("disallowed_tools", [])
     for pattern in disallowed:
@@ -981,6 +988,10 @@ async def kill_agent_subprocess(shard: str):
         log.info(f"{label_of(shard)} subprocess already gone at kill time")
 
     agent_processes.pop(shard, None)
+    # Lines the dead process never replayed go back to the queue (2.5).
+    STATE.pushback.pop(shard, None)
+    STATE.replay_seen.pop(shard, None)
+    await turn_loop.release_pending(STATE, shard, "kill")
 
     # Whatever the tool calls left running (dev servers, nohup/setsid children).
     try:
@@ -1078,12 +1089,13 @@ async def respawn_watcher(shard: str, proc: asyncio.subprocess.Process):
         # A call row the dead process was answering will never get a reply, and
         # a dead caller cannot be waiting on a call.
         await hive_cancel_caller(shard)
+        await turn_loop.release_pending(STATE, shard, "exit")
         try:
-            await db.execute(
+            await msgqueue.write_commit(
+                db,
                 "UPDATE message_queue SET processed = ? WHERE agent = ? AND processed = ?"
                 " AND call_id IS NOT NULL AND reply_to_agent IS NOT NULL",
                 (STATUS_CRASHED, shard, STATUS_IN_PROGRESS))
-            await db.commit()
         except Exception as e:
             log.warning(f"hive crash mark for {shard} failed: {e}")
 
@@ -1112,6 +1124,9 @@ async def respawn_watcher(shard: str, proc: asyncio.subprocess.Process):
 
         log.warning(f"{label_of(shard)} subprocess exited unexpectedly (code {returncode}), respawning")
         await start_agent_subprocess(shard)
+        if turn_loop.steering_on(STATE, shard):
+            # Released steered rows are queued again: deliver them to the new process.
+            turn_loop.spawn(STATE, turn_loop.drain_shard(STATE, shard))
 
     await notify_respawn(shard, f"the subprocess exited unexpectedly (code {returncode})")
 
@@ -1179,11 +1194,11 @@ async def flush_agent_queue(shard: str) -> int:
         pending = row["count"]
 
     if pending:
-        await db.execute(
+        await msgqueue.write_commit(
+            db,
             "UPDATE message_queue SET processed = ? WHERE agent = ? AND processed = ?",
             (STATUS_SKIPPED, shard, STATUS_QUEUED),
         )
-        await db.commit()
 
     log.info(f"Flushed {pending} queued message(s) for {label_of(shard)}")
     return pending
@@ -1210,14 +1225,14 @@ async def post_cost_update(agent: str, metadata: Dict):
     agent_last_cost[agent] = session_total
 
     # Store in database
-    await db.execute(
+    await msgqueue.write_commit(
+        db,
         """
         INSERT INTO cost_events (agent, cost_delta, session_total, input_tokens, output_tokens, duration_ms, session_id)
         VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
         (agent, cost_delta, session_total, input_tokens, output_tokens, duration_ms, session_id)
     )
-    await db.commit()
 
     # Post to Discord cost channel (if configured)
     cost_channel_id = channels_config.get("channels", {}).get("cost", {}).get("id")
@@ -1491,10 +1506,10 @@ async def record_rate_limit_event(agent: str, info, now=None) -> None:
         if resets_at is not None and prior and prior["alerted_for_resets_at"] == resets_at:
             continue  # already said so for this window
 
-        await db.execute(
+        await msgqueue.write_commit(
+            db,
             "UPDATE rate_limit_state SET alerted_for_resets_at = ?"
             " WHERE rate_limit_type = ?", (resets_at, u.type))
-        await db.commit()
 
         consumed = ("in the warning band" if progress is None
                     else f"{progress * 100:.0f}% through the window")
@@ -1862,13 +1877,13 @@ async def _writeback_discord_id(queue_message_id: str, discord_id: str) -> None:
     Rows of the same turn (same agent, channel, response, processed_at) share
     the reply, so they are marked together."""
     try:
-        await db.execute(
+        await msgqueue.write_commit(
+            db,
             "UPDATE message_queue SET discord_response_id = ? WHERE discord_response_id IS NULL "
             "AND (message_id = ? OR (processed_at IS NOT NULL AND (agent, channel_id, response, processed_at) = "
             "(SELECT agent, channel_id, response, processed_at FROM message_queue "
             "WHERE message_id = ? AND processed_at IS NOT NULL)))",
             (discord_id, queue_message_id, queue_message_id))
-        await db.commit()
     except Exception as e:
         log.warning(f"Discord outbox: could not write id back for {queue_message_id} "
                     f"({type(e).__name__}: {e})")
@@ -2248,12 +2263,16 @@ async def write_turn_event(message_ids: List[str], seq: int, kind: str, content:
     if not message_ids or db is None:
         return
     try:
-        for mid in message_ids:
-            await db.execute(
-                "INSERT INTO turn_events (message_id, seq, kind, content) VALUES (?, ?, ?, ?)",
-                (mid, seq, kind, content),
-            )
-        await db.commit()
+        def job(conn):
+            try:
+                conn.executemany(
+                    "INSERT INTO turn_events (message_id, seq, kind, content) VALUES (?, ?, ?, ?)",
+                    [(mid, seq, kind, content) for mid in message_ids])
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+        await db._execute(job, db._conn)  # one hop: no write lock held across an await
     except Exception as e:
         log.warning(f"turn_events insert failed: {e}")
 
@@ -2297,7 +2316,7 @@ async def stop_typing(channel_id: str):
 
 async def send_to_agent(agent: str, content: str, message_ids: List[str]):
     """Send message to agent subprocess"""
-    await turn_loop.write_user_line(STATE, agent, content, message_ids)
+    return await turn_loop.write_user_line(STATE, agent, content, message_ids)
 
 async def write_streaming_response(message_ids: List[str], text: str) -> None:
     """Push partial response text into message_queue so SSE polling sees it.
@@ -2310,11 +2329,11 @@ async def write_streaming_response(message_ids: List[str], text: str) -> None:
         return
     placeholders = ",".join("?" * len(message_ids))
     try:
-        await db.execute(
+        await msgqueue.write_commit(
+            db,
             f"UPDATE message_queue SET response = ? WHERE message_id IN ({placeholders})",
             (text, *message_ids),
         )
-        await db.commit()
     except Exception as e:
         log.warning(f"streaming response write failed: {e}")
 
@@ -2538,13 +2557,15 @@ def format_wall_notice(kind, until):
 async def agent_hold_until(agent: str, now=None):
     """Latest future `not_before` among the agent's queued rows, or None."""
     now = int(time.time() if now is None else now)
-    async with db.execute(
+    # execute_fetchall: one hop that also finalizes the statement. An open
+    # cursor (execute() then fetchone()) keeps SQLite's SHARED lock across the
+    # next await, which blocks any other writer on the file.
+    rows = await db.execute_fetchall(
         "SELECT MAX(not_before) AS nb FROM message_queue"
         " WHERE agent = ? AND processed = ? AND not_before > ?",
         (agent, STATUS_QUEUED, now),
-    ) as cursor:
-        row = await cursor.fetchone()
-    return row["nb"] if row and row["nb"] else None
+    )
+    return rows[0]["nb"] if rows and rows[0]["nb"] else None
 
 
 def schedule_hold_wake(agent: str, until: int) -> None:
@@ -3078,6 +3099,8 @@ async def handle_agents(request):
                 "last_channel": agent_last_channel.get(sp.id),
                 "paused": _paused_entry(sp.id),
                 "stolen_total": STATE.stolen_total.get(sp.id, 0),
+                "steer_pending": len(STATE.steer[sp.id].entries) if sp.id in STATE.steer else 0,
+                "steered_total": STATE.steered_total.get(sp.id, 0),
             })
         agents_list.append({
             "name": agent,
@@ -3133,6 +3156,11 @@ async def sync_shards(new_specs, old_specs=None) -> Dict[str, List[str]]:
     for sp in diff.removed:
         sid = sp.id
         await kill_agent_subprocess(sid)
+        await turn_loop.release_pending(STATE, sid, "shard removed")
+        for d in (STATE.steer, STATE.steer_lock, STATE.steer_unmatched, STATE.steered_total,
+                  STATE.turn_seq, STATE.enqueued_at, STATE.pushback, STATE.bg_seen,
+                  STATE.replay_seen):
+            d.pop(sid, None)
         for d in (agent_locks, agent_states, response_buffers, agent_last_cost,
                   agent_sessions, agent_last_channel, agent_turn_context,
                   agent_wall_strikes, respawn_history, _last_beacon_write):
@@ -3254,6 +3282,31 @@ async def handle_agent_interrupt(request):
     targets = _resolve_request_targets(request)
     if not targets:
         return web.json_response({"error": "Unknown agent"}, status=404)
+
+    # Optional body {"message", "channel_id", "author"} (2.5): interrupt and
+    # follow with a message that runs first. No body keeps today's behaviour.
+    body_in = {}
+    if request.can_read_body:
+        try:
+            parsed = await request.json()
+            body_in = parsed if isinstance(parsed, dict) else {}
+        except ValueError:
+            body_in = {}
+    message = body_in.get("message")
+    if isinstance(message, str) and message.strip():
+        if len(targets) > 1:
+            return web.json_response({"error": "shard required"}, status=400)
+        out = await turn_loop.interrupt_with_message(
+            STATE, targets[0], message,
+            channel_id=str(body_in.get("channel_id") or "0"),
+            author=str(body_in.get("author") or "interrupt"),
+            fallback=interrupt_agent)
+        return web.json_response({
+            "status": "interrupted" if out["interrupted"] else "queued",
+            "interrupted": out["interrupted"],
+            "message_id": out["message_id"],
+            "mode": out["mode"],
+        })
 
     # interrupt_agent is a no-op for a shard that is not PROCESSING, so an
     # agent id interrupts only the busy ones.
@@ -4356,7 +4409,7 @@ async def begin_reset(shard, reason):
             elif await _run_compact(shard):
                 sp.inflight.pop(shard, None)
                 sp.last_reset_at[shard] = time.time()
-                asyncio.create_task(turn_loop.drain_shard(STATE, shard))
+                turn_loop.spawn(STATE, turn_loop.drain_shard(STATE, shard))
                 return
         with_handoff = (
             reason != sp_lib.REASON_OVERFLOW
@@ -4432,7 +4485,7 @@ async def do_reset(shard):
     finally:
         sp.resetting.pop(shard, None)
     # Queued human rows run on the fresh session.
-    asyncio.create_task(turn_loop.drain_shard(STATE, shard))
+    turn_loop.spawn(STATE, turn_loop.drain_shard(STATE, shard))
 
 
 # =============================================================================
@@ -4587,6 +4640,7 @@ async def graceful_shutdown(sig):
 
     # No summarizer and no handoff turn here: the stop timeout cannot hold a
     # model turn. Sessions persist and the next boot resumes them.
+    await turn_loop.cancel_background(STATE)
     # Kill subprocesses
     log.info("Terminating agent subprocesses...")
     for agent in list(agent_processes.keys()):
@@ -4695,6 +4749,10 @@ async def startup(app):
 async def shutdown(app):
     """Cleanup on shutdown"""
     log.info("Server shutdown initiated")
+
+    # Background drain/steal/steer tasks first: none may touch the db or a
+    # process after they are closed.
+    await turn_loop.cancel_background(STATE)
 
     # Kill all subprocesses
     for agent in list(agent_processes.keys()):

@@ -33,6 +33,7 @@ def test_constructor():
     prefix("__init__", [("tmp_workspace", EMPTY), ("agents", ["a", "b"])])
     assert dict(params("__init__"))["shards"] is None
     assert dict(params("__init__"))["work_stealing"] is None  # 2.4
+    assert dict(params("__init__"))["steering"] is None  # 2.5
 
 
 def test_send():
@@ -52,6 +53,14 @@ def test_shard_keyed_readers_are_sync():
     prefix("cost_rows", [])
     assert dict(params("cost_rows"))["shard"] is None
     assert not inspect.iscoroutinefunction(Harness.cost_rows)
+
+
+def test_steering_helpers_are_sync():
+    # additive in 2.5
+    for name in ("stdin_events", "results"):
+        assert params(name) == [("shard", EMPTY)], name
+        assert not inspect.iscoroutinefunction(getattr(Harness, name)), name
+    assert params("row_status") == [("shard", EMPTY), ("id", EMPTY)]
 
 
 def test_discord_recorder_attribute(tmp_workspace):
