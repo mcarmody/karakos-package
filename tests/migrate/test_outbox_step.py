@@ -43,10 +43,10 @@ def step():
     return next(s for s in runner.load_steps() if s.name == "60_outbox")
 
 
-def test_chain_order_places_outbox_after_memory_and_before_the_end():
+def test_chain_order_places_outbox_after_memory_and_before_the_stamp():
     names = [s.name for s in runner.load_steps()]
     assert names == sorted(names) and names.index("40_memory") < names.index("60_outbox")
-    assert names[-1] == "60_outbox"
+    assert names.index("60_outbox") < names.index("90_stamp")
 
 
 def test_dry_run_reports_counts_and_changes_nothing(tmp_path):
