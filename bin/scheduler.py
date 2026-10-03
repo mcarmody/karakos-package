@@ -14,7 +14,7 @@ import json
 import time
 import logging
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 
 WORKSPACE_ROOT = Path(os.environ.get("WORKSPACE_ROOT", "/workspace"))
@@ -31,6 +31,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import oneshot  # noqa: E402
 import registry as agent_registry  # noqa: E402
+import heartbeats  # noqa: E402
+import job_registry  # noqa: E402
 
 # Logging
 log = logging.getLogger("scheduler")
@@ -229,11 +231,76 @@ def purge_old_data():
     except subprocess.CalledProcessError as e:
         log.error(f"Data purge failed: {e.stderr}")
 
+JOBS_FILE = WORKSPACE_ROOT / "data" / "health" / "scheduler-jobs.json"
+
+
+def run_command(cmd):
+    """Run a user job from config/jobs.yaml; a failure raises so it is recorded."""
+    subprocess.run(cmd, check=True, capture_output=True, text=True, cwd=str(WORKSPACE_ROOT))
+
+
+def _runner(job, primary_agent, monitor_agent):
+    """The callable for a job-table entry, or None if it cannot run here."""
+    if isinstance(job.run, list):
+        return lambda: run_command(job.run)
+    if job.run == "scheduler:heartbeat-primary":
+        return (lambda: run_heartbeat(primary_agent)) if primary_agent else None
+    if job.run == "scheduler:heartbeat-monitor":
+        return (lambda: run_heartbeat(monitor_agent)) if monitor_agent else None
+    if isinstance(job.run, str):
+        mod, _, fn = job.run.partition(":")
+        if mod == "scheduler":  # this script is __main__; do not re-import it
+            return globals().get(fn)
+        return job_registry.resolve_callable(job.run)
+    return None
+
+
+def _wrap(job, fn):
+    """Record every run in the job's heartbeat; exceptions are caught and logged."""
+    def wrapped():
+        try:
+            fn()
+            heartbeats.touch(WORKSPACE_ROOT, job.name, ok=True)
+        except Exception as e:
+            log.error(f"Job {job.name} failed: {e}")
+            try:
+                heartbeats.touch(WORKSPACE_ROOT, job.name, ok=False, detail=str(e)[:300])
+            except OSError:
+                pass
+    return wrapped
+
+
+_last_jobs_doc = None
+
+
+def write_jobs_file(started_at, sched_jobs):
+    """data/health/scheduler-jobs.json: what is actually scheduled, for drift."""
+    global _last_jobs_doc
+    nxt = {}
+    for j in sched_jobs:
+        name = next(iter(j.tags), None)
+        if name and j.next_run and (name not in nxt or j.next_run < nxt[name]):
+            nxt[name] = j.next_run
+    doc = {"started_at": started_at,
+           "jobs": [{"name": n, "next_run": t.isoformat()} for n, t in sorted(nxt.items())]}
+    if doc == _last_jobs_doc:
+        return
+    try:
+        JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = JOBS_FILE.with_name(JOBS_FILE.name + ".tmp")
+        tmp.write_text(json.dumps(doc))
+        os.replace(tmp, JOBS_FILE)
+        _last_jobs_doc = doc
+    except OSError as e:
+        log.error(f"Could not write scheduler-jobs.json: {e}")
+
+
 def main():
     """Main scheduler loop"""
     log.info("Scheduler starting")
+    started_at = datetime.now(timezone.utc).isoformat()
 
-    # Load the registry: the primary gets the heartbeat, and so does the monitor
+    # Load the registry: the primary and the monitor each get a heartbeat
     try:
         reg = agent_registry.load_registry(WORKSPACE_ROOT)
         primary_agent = reg.primary().id
@@ -242,33 +309,25 @@ def main():
         primary_agent = monitor_agent = None
         log.warning(f"No usable agent registry: {e}")
 
-    # Schedule heartbeats for each agent (staggered by 15 minutes)
-    if primary_agent:
-        schedule.every(30).minutes.do(lambda: run_heartbeat(primary_agent))
-        log.info(f"Scheduled heartbeat for primary agent: {primary_agent}")
-
-        # The monitor (the old "relay" agent) heartbeats offset by 15 minutes
-        schedule.every(30).minutes.at(":15").do(lambda: run_heartbeat(monitor_agent))
-        log.info(f"Scheduled heartbeat for monitor agent: {monitor_agent}")
-
-    # Schedule maintenance tasks
-    schedule.every().day.at("03:00").do(run_memory_maintenance)
-    schedule.every().day.at("04:00").do(run_health_monitor)
-    # Every minute, not daily: the acceptance test for a wedged agent is an
-    # alert within two minutes, and a check that runs at 04:00 cannot make
-    # that promise at any other hour. It is a file read and a comparison.
-    schedule.every(1).minutes.do(run_wedge_check)
-    # Hourly, not daily: a CLI swapped in by an image pull darkens the install
-    # from the moment it lands, and a daily check leaves up to 24 hours of
-    # unanswered messages. The tick itself is a version read — it only spends
-    # an API turn when the version actually moved.
-    schedule.every().hour.do(run_cli_upgrade_watchdog)
-    # Every 5 minutes: a message spooled during an agent-server outage (#88)
-    # should arrive shortly after the server returns, not at the next daily
-    # sweep. A pass over an empty spool directory is a directory listing.
-    schedule.every(5).minutes.do(run_flush_deferred_messages)
-    schedule.every().day.at("04:30").do(purge_old_data)
-    schedule.every().monday.at("05:00").do(check_updates)  # Weekly update check
+    # Every scheduled job comes from lib/job_registry.py (and config/jobs.yaml),
+    # the same table the monitor checks. Heartbeats are at minute marks 0/30
+    # (primary) and 15/45 (monitor); the old `.at(":15")` set seconds, not minutes.
+    wrapped = {}
+    sched_jobs = []
+    for job in job_registry.load_jobs(WORKSPACE_ROOT):
+        if job.kind != "job":
+            continue
+        try:
+            fn = _runner(job, primary_agent, monitor_agent)
+            if fn is None:
+                log.warning(f"Job {job.name} has no runnable target here; not scheduled")
+                continue
+            wrapped[job.name] = _wrap(job, fn)
+            sched_jobs += job_registry.apply_schedule(schedule.default_scheduler, job, wrapped[job.name])
+            log.info(f"Scheduled job {job.name}")
+        except Exception as e:
+            log.error(f"Could not schedule job {job.name}: {e}")
+    write_jobs_file(started_at, sched_jobs)
 
     # Declare liveness BEFORE the replay, not after. Replay fires every
     # deadline missed while we were down, synchronously, and the longer the
@@ -288,7 +347,8 @@ def main():
     # is how a new Claude CLI actually arrives. Waiting for the first hourly
     # tick would leave a broken CLI unchallenged for an hour of the exact
     # window it is most likely to be broken in.
-    run_cli_upgrade_watchdog()
+    if "cli-watchdog" in wrapped:
+        run_cli_upgrade_watchdog()
 
     # Main loop
     while True:
@@ -296,6 +356,7 @@ def main():
             schedule.run_pending()
             run_due_oneshots()
             write_health_timestamp()
+            write_jobs_file(started_at, sched_jobs)
             time.sleep(TICK_SECONDS)
         except KeyboardInterrupt:
             log.info("Scheduler shutting down")

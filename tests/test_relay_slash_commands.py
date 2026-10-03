@@ -577,6 +577,8 @@ def health_workspace(relay, monkeypatch, tmp_path):
     # same WORKSPACE_ROOT/bin path the relay uses in the container.
     (tmp_path / "bin" / "health-monitor.py").write_text(
         (PACKAGE_ROOT / "bin" / "health-monitor.py").read_text())
+    # health-monitor imports lib/ (job table, alerts) from the workspace.
+    (tmp_path / "lib").symlink_to(PACKAGE_ROOT / "lib")
     monkeypatch.setattr(relay, "WORKSPACE_ROOT", tmp_path)
     return tmp_path
 

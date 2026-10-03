@@ -41,6 +41,7 @@ import json
 import os
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -473,15 +474,12 @@ def test_the_scheduler_still_runs_the_weekly_check():
                 if isinstance(c, ast.Constant) and isinstance(c.value, str)]
     assert any("check-updates.sh" in lit for lit in literals)
 
-    main = _function_node(tree, "main")
-    weekly = [
-        c for c in ast.walk(main)
-        if isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
-        and c.func.attr == "do"
-        and c.args and isinstance(c.args[0], ast.Name)
-        and c.args[0].id == "check_updates"
-    ]
-    assert weekly, "the update check is not scheduled at all"
+    # Scheduling lives in the job table (lib/job_registry.py), Monday 05:00.
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+    import job_registry
+    job = {j.name: j for j in job_registry.BUILTIN}["update-check"]
+    assert job.run == "scheduler:check_updates"
+    assert job.schedule == job_registry.Weekly("mon", "05:00")
 
 
 def test_the_scheduler_logs_a_failed_update_check():

@@ -268,8 +268,12 @@ def test_the_check_is_scheduled_often_enough_to_meet_its_acceptance_test():
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
 
-    src = SCHEDULER.read_text()
-    assert "schedule.every(1).minutes.do(run_wedge_check)" in src
+    # The cadence now lives in the job table (lib/job_registry.py).
+    sys.path.insert(0, str(PACKAGE_ROOT / "lib"))
+    import job_registry
+    job = {j.name: j for j in job_registry.BUILTIN}["wedge-check"]
+    assert job.schedule == job_registry.Every(60)
+    assert job.run == "scheduler:run_wedge_check"
     assert "wedge-check.py" in _collect_str_literals(tree)
 
 

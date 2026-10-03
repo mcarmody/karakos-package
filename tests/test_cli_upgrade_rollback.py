@@ -29,6 +29,7 @@ Three properties are load-bearing and each is pinned:
    API blip is an outage generator, not a safety net.
 """
 
+import sys
 import ast
 import json
 import os
@@ -619,15 +620,12 @@ def test_the_scheduler_actually_runs_the_watchdog():
                and c.func.id == "run_cli_upgrade_watchdog" for c in calls), \
         "the watchdog is never run at scheduler startup"
 
-    # ...and on an hourly schedule thereafter: schedule.every().hour.do(fn)
-    hourly = [
-        c for c in calls
-        if isinstance(c.func, ast.Attribute) and c.func.attr == "do"
-        and isinstance(c.func.value, ast.Attribute) and c.func.value.attr == "hour"
-        and c.args and isinstance(c.args[0], ast.Name)
-        and c.args[0].id == "run_cli_upgrade_watchdog"
-    ]
-    assert hourly, "the watchdog is not on an hourly schedule"
+    # ...and on an hourly schedule thereafter (the job table, lib/job_registry.py).
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+    import job_registry
+    job = {j.name: j for j in job_registry.BUILTIN}["cli-watchdog"]
+    assert job.run == "scheduler:run_cli_upgrade_watchdog"
+    assert job.schedule == job_registry.Every(3600), "the watchdog is not on an hourly schedule"
 
 
 def _shell_regions(path: Path):
