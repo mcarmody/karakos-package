@@ -1,0 +1,14 @@
+name: Coupling check
+
+# Event-driven only (no push or schedule trigger; see ci.yml on Actions budget).
+on:
+  pull_request:
+    branches: [main, release/2.0]
+
+jobs:
+  coupling:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Household coupling check
+        run: bash system/check-coupling.sh

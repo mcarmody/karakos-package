@@ -1,0 +1,7 @@
+# Allow-list for system/check-coupling.sh.
+# One entry per line: path-glob <TAB> regex
+# A hit is suppressed when its file matches the glob (bash pattern, e.g.
+# docs/*.md) AND the matching line matches the regex. Lines starting with # are
+# ignored.
+Dockerfile	/home/karakos
+config/docker-compose*.yml	/home/karakos

@@ -493,3 +493,33 @@ channel, so the summary is an allow-list rather than a best-effort dump.
 
 Agents running with `channel_id` `"0"` (the local/headless lane) post
 nothing, as with every other Discord surface.
+
+## Review checklist
+
+Every release/2.0 PR is reviewed against this list. Each item is yes/no; any
+"no" on items 1 to 4 is a high finding.
+
+1. Runtime state is keyed by shard id.
+2. No data is mutated at boot; every schema change is a `lib/migrate/steps/` step.
+3. No household identifiers: `system/check-coupling.sh` prints `coupling: clean`.
+4. The tests named in the spec exist and run.
+5. Old-install behaviour is unchanged where the spec says so.
+6. No new dependency without a pin.
+
+`system/check-coupling.sh` scans git-tracked files against
+`system/coupling-denylist.txt` (tab-separated `name`, `regex`, optional
+`path-regex`, optional `line-regex`) and honours `system/coupling-allow.txt`
+(`path-glob<TAB>regex`). Forks add their own hostnames and names to the
+denylist locally. To run it before every push:
+`system/install-hooks.sh --install-pre-push` (off by default).
+
+## release/2.0 stability contract
+
+For downstream forks tracking `release/2.0`:
+
+- **Churn expected:** `bin/agent-server.py`, `bin/relay.py`, the `config/`
+  layout, `setup.sh`, `dashboard/`.
+- **Stable:** the `/message` and `/agents` HTTP shapes, `config/channels.json`,
+  hook file names, MCP tool names.
+- Small portable fixes submitted by forks are welcome on `release/2.0` now;
+  landing them early lets forks rebase once.
