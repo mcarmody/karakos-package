@@ -4176,6 +4176,10 @@ async def handle_hive_call_get(request):
     deadline = (oc.deadline if oc else (exp or time.time())) + hive_lib.HIVE_DEADLINE_SLACK_S
     wait_end = time.time() + wait
     while True:
+        # Read before any check: a reply notified after this point must not be
+        # missed by the wait below (the checks are awaits; the notify can land
+        # between them and the wait).
+        seen = msgqueue.work_version(caller)
         # Produce 1.2's expiry reply even while the callee is busy in a turn
         # (claim_batch is the only other place expire runs).
         await msgqueue.expire(db, callee)
@@ -4216,7 +4220,7 @@ async def handle_hive_call_get(request):
             return web.json_response({"status": "pending", "call_id": cid})
         slice_s = min(wait_end - now, deadline - now,
                       0.25 if proc == STATUS_QUEUED else hive_lib.HIVE_POLL_WAIT_S)
-        await msgqueue.wait_for_work(caller, max(0.05, slice_s))
+        await msgqueue.wait_for_work(caller, max(0.05, slice_s), since=seen)
 
 
 async def handle_hive_call_cancel(request):
