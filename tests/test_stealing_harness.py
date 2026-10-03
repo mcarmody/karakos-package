@@ -24,10 +24,7 @@ def run(coro):
 
 
 def fixture(harness, steal=STEAL, steering=None):
-    # Steering off by default here: a same-channel row would otherwise be steered
-    # into the busy turn instead of waiting to be (not) stolen.
-    return harness(agents=["a", "b"], shards=SHARDS, work_stealing=steal,
-                   steering=steering if steering is not None else {"enabled": False})
+    return harness(agents=["a", "b"], shards=SHARDS, work_stealing=steal, steering=steering)
 
 
 def slow_x1(extra=()):
@@ -149,7 +146,9 @@ def test_off_by_default(harness, monkeypatch):
 # -- continuity ---------------------------------------------------------------
 
 def test_same_channel_not_stolen(harness):
-    h = fixture(harness)
+    # Steering off: with it on (the default) a same-channel row is steered into
+    # the busy turn rather than left waiting, which is not what this tests.
+    h = fixture(harness, steering={"enabled": False})
 
     async def scenario():
         async with h:

@@ -158,3 +158,24 @@ def test_message_with_several_target_shards_is_400(harness):
             assert (status, body) == (400, {"error": "shard required"})
             assert h.queue_rows("a") == [] and h.queue_rows("a-2") == []
     run(scenario())
+
+
+def test_message_interrupt_with_steering_off_still_interrupts(harness):
+    """enabled: false restores 2.0 exactly: any interrupt kills the turn, and the
+    message then runs first on the respawned process."""
+    h = harness(agents=["a", "b"], shards=SHARDS, steering={"enabled": False})
+    h.script(rules=[{"match": "A-msg", "step": {"text": "r-A", "delay_ms": 4000}},
+                    {"match": "urgent", "step": {"text": "r-urgent"}}])
+
+    async def scenario():
+        async with h:
+            pid = h.module.agent_processes["a"].pid
+            await h.send("a", "A-msg")
+            await h.wait_for(lambda: row(h, "a", "A-msg")["processed"] == 1)
+            await asyncio.sleep(0.2)
+            status, body = await post_interrupt(h, "a", {"message": "urgent"}, shard="a")
+            assert status == 200 and body["interrupted"] is True
+            await h.wait_for(lambda: row(h, "a", "urgent")["processed"] == 2, timeout=10)
+            assert h.module.agent_processes["a"].pid != pid
+            assert row(h, "a", "urgent")["response"] == "r-urgent"
+    run(scenario())

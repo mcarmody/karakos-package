@@ -1,20 +1,18 @@
-"""Real `claude` + haiku against the two scenarios steering rests on (step 2.5):
-Q1 (a line written during a `sleep 5` tool turn is merged into that turn: one
-result, both lines replayed) and Q3 (a control_request interrupt aborts the turn,
-the same process answers the next line). Slow; run by hand before 2.5 merges.
-Skips without a CLI and credential. Expected cost under $0.15.
+"""Steering against a real `claude` + haiku, through the real agent-server (step 2.5).
 
-The test speaks the stream-json protocol directly, exactly as lib/turn_loop.py
-does (`--replay-user-messages`, user lines, control_request); the harness's fake
-is held to the same shapes by tests/test_fake_claude_queued.py.
+Slow; run by hand before 2.5 merges. Skips without a CLI and credential. The
+harness is the real server with the real binary put first on PATH (no fake), so
+this exercises what the fake cannot: that real replay content matches the
+ledger, rows complete on the turn's `result`, and a control_request interrupt
+keeps the process. Expected cost under $0.15.
+
+Q1: a `sleep 5` tool turn plus one mid-turn line -> one result, both rows
+COMPLETE. Q3: interrupt-with-message -> same PID, message row COMPLETE.
 """
 
-import json
+import asyncio
 import os
-import select
 import shutil
-import subprocess
-import time
 from pathlib import Path
 
 import pytest
@@ -33,107 +31,61 @@ def _need_cli():
         pytest.skip("no claude CLI or credential")
 
 
-class Cli:
-    def __init__(self, tmp_path):
-        self.proc = subprocess.Popen(
-            ["claude", "-p", "--input-format", "stream-json", "--output-format", "stream-json",
-             "--verbose", "--replay-user-messages", "--model", "haiku",
-             "--permission-mode", "bypassPermissions", "--max-budget-usd", "0.10",
-             "--setting-sources", ""],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            cwd=str(tmp_path), text=True)
-        self.events = []
-
-    def write(self, obj):
-        self.proc.stdin.write(json.dumps(obj) + "\n")
-        self.proc.stdin.flush()
-
-    def user(self, text):
-        self.write({"type": "user", "message": {"role": "user", "content": text}})
-
-    def read_until(self, pred, timeout=90):
-        end = time.time() + timeout
-        while time.time() < end:
-            for e in self.events:
-                if pred(e):
-                    return e
-            r, _, _ = select.select([self.proc.stdout], [], [], 0.5)
-            if r:
-                line = self.proc.stdout.readline()
-                if not line:
-                    break
-                try:
-                    self.events.append(json.loads(line))
-                except ValueError:
-                    pass
-        raise TimeoutError("event not seen")
-
-    def drain(self, secs):
-        """Keep reading for `secs` (a stray extra event would arrive meanwhile)."""
-        end = time.time() + secs
-        while time.time() < end:
-            r, _, _ = select.select([self.proc.stdout], [], [], 0.2)
-            if r:
-                line = self.proc.stdout.readline()
-                if not line:
-                    return
-                try:
-                    self.events.append(json.loads(line))
-                except ValueError:
-                    pass
-
-    def results(self):
-        return [e for e in self.events if e.get("type") == "result"]
-
-    def replays(self):
-        return [e for e in self.events if e.get("type") == "user" and e.get("isReplay")]
-
-    def close(self):
-        try:
-            self.proc.stdin.close()
-            self.proc.wait(timeout=15)
-        except Exception:
-            self.proc.kill()
+def _real_harness(tmp_path, monkeypatch):
+    import harness as harness_pkg
+    real = shutil.which("claude")
+    bin_dir = tmp_path / "real-bin"
+    bin_dir.mkdir()
+    (bin_dir / "claude").symlink_to(real)
+    monkeypatch.setattr(harness_pkg, "FAKE_BIN_DIR", bin_dir)
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    return harness_pkg.Harness(ws, agents={"a": {"model": "haiku"}},
+                               steering={"coalesce_ms": 0})
 
 
-def test_q1_line_written_mid_tool_is_merged_into_the_turn(tmp_path):
+def _row(h, text):
+    return next(r for r in h.queue_rows("a") if text in r["content"])
+
+
+def test_q1_mid_tool_line_is_merged_and_both_rows_complete(tmp_path, monkeypatch):
     _need_cli()
-    cli = Cli(tmp_path)
-    try:
-        cli.user("Use the Bash tool to run exactly: sleep 5. Then reply DONE1.")
-        cli.read_until(lambda e: e.get("type") == "assistant"
-                       and any(b.get("type") == "tool_use"
-                               for b in e["message"].get("content", [])))
-        cli.user("Also include the word SECOND2 in your final reply.")
-        cli.read_until(lambda e: e.get("type") == "result")
-        cli.drain(3)    # a stray second result would arrive by now
-        assert len(cli.results()) == 1
-        texts = [e["message"]["content"] for e in cli.replays()]
-        assert len(texts) == 2 and "SECOND2" in texts[1]
-        assert "SECOND2" in (cli.results()[0].get("result") or "")
-    finally:
-        cli.close()
+    h = _real_harness(tmp_path, monkeypatch)
+
+    async def scenario():
+        async with h:
+            await h.send("a", "Use the Bash tool to run exactly: sleep 5. Then reply DONE1.")
+            await h.wait_for(lambda: any(
+                "Bash" in str(e) for e in h.stream_events("a")), timeout=90)
+            await h.send("a", "Also include the word SECOND2 in your final reply.")
+            await h.wait_idle("a", timeout=120)
+            assert len(h.results("a")) == 1
+            assert _row(h, "sleep 5")["processed"] == 2
+            assert _row(h, "SECOND2")["processed"] == 2
+            assert h.module.STATE.steered_total.get("a") == 1
+            assert h.module.STATE.steer["a"].pending() == []
+            assert "SECOND2" in _row(h, "SECOND2")["response"]
+
+    asyncio.run(scenario())
 
 
-def test_q3_interrupt_keeps_the_process_and_next_line_runs(tmp_path):
+def test_q3_interrupt_with_message_keeps_the_process(tmp_path, monkeypatch):
     _need_cli()
-    cli = Cli(tmp_path)
-    pid = cli.proc.pid
-    try:
-        cli.user("Use the Bash tool to run exactly: sleep 20. Then reply DONE.")
-        cli.read_until(lambda e: e.get("type") == "assistant"
-                       and any(b.get("type") == "tool_use"
-                               for b in e["message"].get("content", [])))
-        cli.write({"type": "control_request", "request_id": "req-int-1",
-                   "request": {"subtype": "interrupt"}})
-        resp = cli.read_until(lambda e: e.get("type") == "control_response")
-        assert resp["response"]["subtype"] == "success"
-        res = cli.read_until(lambda e: e.get("type") == "result")
-        assert res["subtype"] == "error_during_execution"
-        assert res.get("terminal_reason") == "aborted_tools"
-        cli.user("Reply with only the word AFTER.")
-        cli.read_until(lambda e: e.get("type") == "result" and e is not res)
-        assert "AFTER" in (cli.results()[-1].get("result") or "")
-        assert cli.proc.pid == pid and cli.proc.poll() is None
-    finally:
-        cli.close()
+    h = _real_harness(tmp_path, monkeypatch)
+
+    async def scenario():
+        async with h:
+            pid = h.module.agent_processes["a"].pid
+            await h.send("a", "Use the Bash tool to run exactly: sleep 20. Then reply DONE.")
+            await h.wait_for(lambda: any(
+                "Bash" in str(e) for e in h.stream_events("a")), timeout=90)
+            resp = await h.client.post(
+                "/agents/a/interrupt", headers=h._headers(),
+                json={"message": "Reply with only the word AFTER.", "channel_id": "1"})
+            assert (await resp.json())["interrupted"] is True
+            await h.wait_for(lambda: _row(h, "AFTER")["processed"] == 2, timeout=120)
+            assert h.module.agent_processes["a"].pid == pid
+            assert "AFTER" in _row(h, "AFTER")["response"]
+            assert [r["subtype"] for r in h.results("a")][0] == "error_during_execution"
+
+    asyncio.run(scenario())

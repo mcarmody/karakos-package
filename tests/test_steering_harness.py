@@ -182,7 +182,7 @@ def test_idle_late_send_gets_its_own_turn(harness):
     async def scenario():
         async with h:
             await h.send("a", "X1")
-            await asyncio.sleep(0.9)
+            await asyncio.sleep(0.4)
             await h.send("a", "X2")
             await settle_idle(h, "a")
             assert len(h.sent_to("a")) == 2
@@ -228,10 +228,11 @@ def test_steering_disabled_restores_hold_until_idle(harness):
 
 # -- release on exit -----------------------------------------------------------------------
 
-def test_release_on_exit_delivers_once(harness):
-    h = fixture(harness)
-    # A's tool dies 300 ms in, before the boundary where B would have been merged.
-    h.script(rules=[{"match": "A-msg", "step": tool_turn("r-A", exit_in_tool_ms=400)},
+def _exit_run(harness_factory, steering):
+    h = harness_factory(agents=["a", "b"], shards=SHARDS, steering=steering)
+    # A answers after 500 ms and then the process dies without a result; B is
+    # written (or queued) in between and is never replayed by the dead process.
+    h.script(rules=[{"match": "A-msg", "step": {"text": "r-A", "delay_ms": 500, "exit": True}},
                     {"match": "B-msg", "step": {"text": "r-B"}}])
 
     async def scenario():
@@ -240,20 +241,35 @@ def test_release_on_exit_delivers_once(harness):
             await h.send("a", "A-msg")
             await asyncio.sleep(0.15)
             await h.send("a", "B-msg")
-            await h.wait_for(lambda: status(h, "a", "B-msg") == 2, timeout=10)
-            assert status(h, "a", "A-msg") in (2, 3)
-            assert row(h, "a", "B-msg")["response"] == "r-B"
-            assert h.module.STATE.steer["a"].pending() == []
-            # The dead process never replayed B; the new one did, once, and the
-            # reply went out once. (The fake's stdin log is per session, so it
-            # holds the dead process's receipt of B as well.)
-            replays = [r["event"] for r in h.io("a") if r.get("dir") == "out"
-                       and r["event"].get("isReplay")
-                       and "B-msg" in r["event"]["message"]["content"]]
-            assert len(replays) == 1
-            assert [d["content"] for d in posts(h, "a")].count("r-B") == 1
+            await h.wait_for(lambda: status(h, "a", "B-msg") == 2, timeout=12)
+            await h.wait_idle("a", timeout=10)
             assert h.session_id("a") == sid_before
-    run(scenario())
+            return h, (row(h, "a", "A-msg")["processed"], row(h, "a", "A-msg")["response"]), \
+                [d["content"] for d in posts(h, "a")]
+
+    return run(scenario())
+
+
+def test_release_on_exit_delivers_once(harness, tmp_path_factory):
+    from harness import Harness
+    h, a_on, posted_on = _exit_run(
+        lambda **kw: Harness(tmp_path_factory.mktemp("on"), **kw), {"coalesce_ms": 0})
+    # B was written into the turn (steered) and never replayed.
+    assert h.module.STATE.steered_total["a"] == 1
+    # The dead process never replayed B; the new one did, once, and the reply
+    # went out once. (The fake's stdin log is per session, so it holds the dead
+    # process's receipt of B as well.)
+    replays = [r["event"] for r in h.io("a") if r.get("dir") == "out"
+               and r["event"].get("isReplay") and "B-msg" in r["event"]["message"]["content"]]
+    assert len(replays) == 1
+    assert posted_on.count("r-B") == 1
+    assert h.module.STATE.steer["a"].pending() == []
+
+    # A's rows follow the pre-existing crash handling: equal to a no-steering run.
+    _, a_off, posted_off = _exit_run(
+        lambda **kw: Harness(tmp_path_factory.mktemp("off"), **kw), {"enabled": False})
+    assert a_on == a_off
+    assert posted_on.count("r-B") == posted_off.count("r-B") == 1
 
 
 # -- follow-on timeout ------------------------------------------------------------------------
@@ -451,34 +467,37 @@ def test_other_channel_row_is_not_steered(harness):
 
 
 def test_line_allowance_per_turn(harness):
-    h = fixture(harness, steering={"max_lines_per_turn": 2})
-    h.script(rules=[{"match": "A-msg", "step": tool_turn("r-A", ms=1200)}])
+    h = fixture(harness)       # default max_lines_per_turn: 8
+    h.script(rules=[{"match": "A-msg", "step": tool_turn("r-A", ms=2000)}])
 
     async def scenario():
         async with h:
             await h.send("a", "A-msg")
             await asyncio.sleep(0.2)
-            for n in ("S1", "S2", "S3"):
+            names = [f"S{i}" for i in range(1, 10)]
+            for n in names:
                 await h.send("a", n)
-                await asyncio.sleep(0.05)
-            await asyncio.sleep(0.2)
-            assert status(h, "a", "S1") == status(h, "a", "S2") == 1
-            assert status(h, "a", "S3") == 0               # over the allowance: next turn
+                await asyncio.sleep(0.03)
+            await asyncio.sleep(0.3)
+            assert [status(h, "a", n) for n in names[:8]] == [1] * 8
+            assert status(h, "a", "S9") == 0                 # the ninth waits for the next turn
             await settle_idle(h, "a", timeout=15)
-            assert status(h, "a", "S3") == 2
+            assert status(h, "a", "S9") == 2
             assert len(h.results("a")) == 2
     run(scenario())
 
 
 # -- replay events do not leak ---------------------------------------------------------------------------
 
-def test_replay_events_do_not_leak_into_tool_lines_or_context(harness, tmp_path):
+def test_replay_events_do_not_leak_into_tool_lines_or_context(harness, tmp_path, monkeypatch):
+    # Both runs use the fake's queued mode; only --replay-user-messages differs.
+    monkeypatch.setenv("FAKE_CLAUDE_QUEUED", "1")
+
     def one(steering):
-        import shutil
         from pathlib import Path
+        from harness import Harness
         ws = Path(tmp_path) / ("on" if steering else "off")
         ws.mkdir()
-        from harness import Harness
         h = Harness(ws, agents=["a", "b"], steering={"enabled": steering})
         h.script(default={"text": "ok", "tools": [
             {"name": "Bash", "input": {"command": "ls"}, "ms": 10},
@@ -488,13 +507,17 @@ def test_replay_events_do_not_leak_into_tool_lines_or_context(harness, tmp_path)
 
         async def go():
             async with h:
+                assert ("--replay-user-messages" in h.argv("a")) is steering
                 await h.send("a", "hello")
                 await h.wait_idle("a")
                 ctx = (await h.module.get_context_tokens()).get("a")
                 tool_lines = [d["content"] for d in h.discord if d["content"].startswith("-#")]
                 events = [r["content"] for r in h._query(
                     "SELECT content FROM turn_events ORDER BY id")]
-                return ctx, tool_lines, sorted(events)
+                replayed = any(r["event"].get("isReplay") for r in h.io("a")
+                               if r.get("dir") == "out")
+                assert replayed is steering
+                return ctx, tool_lines, events
         return run(go())
 
     assert one(True) == one(False)

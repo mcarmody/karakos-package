@@ -843,6 +843,7 @@ async def start_agent_subprocess(shard: str):
     if turn_loop.steering_on(STATE, shard):
         cmd.append("--replay-user-messages")
     STATE.pushback.pop(shard, None)
+    STATE.replay_seen.pop(shard, None)
 
     # Add disallowed tools
     disallowed = config.get("disallowed_tools", [])
@@ -989,6 +990,7 @@ async def kill_agent_subprocess(shard: str):
     agent_processes.pop(shard, None)
     # Lines the dead process never replayed go back to the queue (2.5).
     STATE.pushback.pop(shard, None)
+    STATE.replay_seen.pop(shard, None)
     await turn_loop.release_pending(STATE, shard, "kill")
 
     # Whatever the tool calls left running (dev servers, nohup/setsid children).
@@ -2591,7 +2593,8 @@ async def sync_shards(new_specs, old_specs=None) -> Dict[str, List[str]]:
         await kill_agent_subprocess(sid)
         await turn_loop.release_pending(STATE, sid, "shard removed")
         for d in (STATE.steer, STATE.steer_lock, STATE.steer_unmatched, STATE.steered_total,
-                  STATE.turn_seq, STATE.enqueued_at, STATE.pushback, STATE.bg_seen):
+                  STATE.turn_seq, STATE.enqueued_at, STATE.pushback, STATE.bg_seen,
+                  STATE.replay_seen):
             d.pop(sid, None)
         for d in (agent_locks, agent_states, response_buffers, agent_last_cost,
                   agent_sessions, agent_last_channel, agent_turn_context,

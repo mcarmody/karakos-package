@@ -168,6 +168,7 @@ class ServerState:
         self.enqueued_at: Dict[str, float] = {}              # first unclaimed arrival (epoch)
         self.pushback: Dict[str, collections.deque] = {}     # stdout lines read ahead
         self.bg_seen: Dict[str, bool] = {}                   # a background task may self-start a turn
+        self.replay_seen: Dict[str, bool] = {}               # this process has emitted a replay
 
     def __getattr__(self, name):
         if name in _SERVER_NAMES:
@@ -740,9 +741,13 @@ async def read_events(
     if eof and ledger is not None and ledger.entries:
         # The process is gone: lines it never replayed go back to the queue.
         await release_pending(state, shard, "eof")
-    elif ledger is not None and batch.primary_entry is not None:
-        # The turn that consumed our own write has ended; if its replay never
-        # matched, the entry must not linger as a phantom follow-on.
+    elif (ledger is not None and batch.primary_entry is not None
+            and not state.replay_seen.get(shard)):
+        # This process has never replayed a line, so the entry cannot be waiting
+        # on one (an old CLI, a stub): it must not linger as a phantom follow-on.
+        # Once replays are seen, an unconsumed primary stays pending: the CLI
+        # started a turn of its own (a self turn) ahead of it, and the line is
+        # read as a follow-on.
         ledger.remove(batch.primary_entry)
 
     # Strip any inline thinking blocks (defense in depth)
@@ -776,6 +781,7 @@ async def _on_replay(state: ServerState, shard: str, batch: TurnBatch, event: di
     steered entry it covers belong to the turn this replay appears in. They
     stay in progress until that turn's `result`."""
     ledger = ledger_of(state, shard)
+    state.replay_seen[shard] = True
     message = event.get("message") or {}
     content = message.get("content", "")
     if isinstance(content, list):
@@ -889,10 +895,18 @@ async def interrupt_with_message(state: ServerState, shard: str, message: str,
     out = {"message_id": message_id, "interrupted": False, "mode": "queued"}
 
     batch = state.active_turns.get(shard)
-    if (state.agent_states.get(shard) != "PROCESSING" or batch is None
-            or batch.phase != "streaming" or not steering_on(state, shard)):
-        # IDLE: the normal drain runs it. Mid-turn but not interruptible by
-        # request: it is first in line when the turn ends.
+    if state.agent_states.get(shard) != "PROCESSING":
+        # IDLE: the normal drain runs it.
+        notify_enqueued(state, shard, channel_id)
+        return out
+    if not steering_on(state, shard):
+        # No control-request path (2.0 behaviour): today's interrupt, then the
+        # priority row is first in line on the respawned process.
+        interrupted = bool(fallback is not None and await fallback(shard))
+        out.update(interrupted=interrupted, mode="kill" if interrupted else "queued")
+        return out
+    if batch is None or batch.phase != "streaming":
+        # The turn is starting or already closing: first in line when it ends.
         notify_enqueued(state, shard, channel_id)
         return out
 
