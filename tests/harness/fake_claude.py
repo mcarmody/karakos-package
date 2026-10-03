@@ -27,7 +27,7 @@ until the tool answers. Results are available to `text` as {{mcp:0}} (the raw
 tool result text) and {{mcp:0.answer}} (a field of its JSON). Rules may match
 on `agent` and/or `shard` (regexes on KARAKOS_SHARD, else KARAKOS_AGENT).
 
-Step 2.6 keys (default, non-queued mode): `write_file_from_prompt: "<text>"`
+Step 2.6 keys (both modes): `write_file_from_prompt: "<text>"`
 emits a `Write` tool_use for the path found in the user text (the handoff
 prompt carries it alone on a line) and writes that file itself, creating its
 directory; `compact: true` emits a `system` `compact_boundary` event
@@ -467,6 +467,8 @@ class Queued:
         if step.get("hang"):
             while True:  # unresponsive: never reads again, never answers
                 time.sleep(3600)
+        if step.get("spawn_child"):
+            spawn_child(step["spawn_child"])
         self.open_turn(ts, text)
         usage = step.get("usage") or DEFAULT_USAGE
         mid = f"msg_{self.sid[:8]}_{n}"
@@ -519,6 +521,7 @@ class Queued:
             self.finish(step, text, started, "", len(tools), aborted=True)
             return None
         mcp_out = run_mcp(step.get("mcp") or [], self.sid, n, self.out)
+        self.step_2_6(step, text, n, usage)
         reply = render(step.get("text", "ok"), text,
                        {"queued": queued_text, "system_prompt": self.system_prompt,
                         "mcp": mcp_out})
@@ -527,6 +530,24 @@ class Queued:
             sys.exit(1)
         self.finish(step, text, started, reply, len(tools))
         return step
+
+    def step_2_6(self, step, text, n, usage):
+        """`write_file_from_prompt` and `compact` (step 2.6) in queued mode too:
+        steering puts every agent on this path by default."""
+        if step.get("write_file_from_prompt") is not None:
+            m = re.search(r"^(/\S+\.md)$", text, re.M)
+            if m:
+                self.assistant(f"msg_{self.sid[:8]}_{n}_w",
+                               {"type": "tool_use", "id": f"toolu_w_{n}", "name": "Write",
+                                "input": {"file_path": m.group(1),
+                                          "content": step["write_file_from_prompt"]}}, usage)
+                os.makedirs(os.path.dirname(m.group(1)), exist_ok=True)
+                with open(m.group(1), "w") as fh:
+                    fh.write(step["write_file_from_prompt"])
+        if step.get("compact"):
+            self.out(self.base(type="system", subtype="compact_boundary",
+                               pre_tokens=step.get("pre_tokens", 60000),
+                               post_tokens=step.get("post_tokens", 5000)))
 
     def interrupted_events(self):
         tool_id, self.tool_in_flight = self.tool_in_flight, None
