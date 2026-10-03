@@ -53,7 +53,7 @@ def jarvis(real_template_workspace, monkeypatch):
 def test_composition_default_shard(jarvis):
     out = pc.compose_system_prompt(jarvis, "jarvis")
     assert "Jarvis" in out and "`jarvis`" in out
-    assert "- #general" in out and "- **Relay** (" in out
+    assert "- #general" in out and "- **Monitor** (" in out
     assert "## Shards and the hive" in out
     assert "{{" not in out
     assert len(out) <= 9000, len(out)

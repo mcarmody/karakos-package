@@ -291,8 +291,8 @@ def test_no_schema_change_and_no_new_migrator_step(harness):
 
     run(scenario())
     steps = sorted(p.name for p in (PACKAGE_ROOT / "lib" / "migrate" / "steps").glob("*.py"))
-    # 2.7 adds 35; 4.4 adds 40_memory and its helper. 2.1 itself adds no step
-    assert steps == ["00_noop.py", "10_registry.py", "20_queue.py", "30_sessions.py",
+    # 3.2b adds 12; 2.7 adds 35; 4.4 adds 40_memory and its helper. 2.1 itself adds no step
+    assert steps == ["00_noop.py", "10_registry.py", "12_monitor.py", "20_queue.py", "30_sessions.py",
                      "35_rate_limit.py", "40_memory.py", "__init__.py", "_legacy_memory.py"]
     cols = {t: [r["name"] for r in h._query(f"PRAGMA table_info({t})")]
             for t in ("sessions", "message_queue", "cost_events")}
