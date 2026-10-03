@@ -121,9 +121,9 @@ also use to talk to other people. Two per-channel keys in
 ```json
 {
   "channels": {
-    "general": { "id": "...", "default_agent": "amos" },
-    "kitchen": { "id": "...", "default_agent": "amos", "reply_gate": true },
-    "agent-chat": { "id": "...", "default_agent": "amos", "guest_agents": true }
+    "general": { "id": "...", "default_agent": "main" },
+    "kitchen": { "id": "...", "default_agent": "main", "reply_gate": true },
+    "agent-chat": { "id": "...", "default_agent": "main", "guest_agents": true }
   }
 }
 ```
@@ -140,7 +140,7 @@ is heuristic only. Make it an object to let a small model (Haiku) decide the
 messages the heuristics leave open, such as a plain question said to the room:
 
 ```json
-"kitchen": { "id": "...", "default_agent": "amos",
+"kitchen": { "id": "...", "default_agent": "main",
   "reply_gate": { "classifier": "haiku", "context_messages": 6,
                   "min_confidence": 0.7, "timeout_s": 8,
                   "max_per_minute": 4, "max_per_hour": 60 } }
