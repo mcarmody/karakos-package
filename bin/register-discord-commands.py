@@ -67,7 +67,10 @@ COMMANDS = [
     _cmd("cost", "Today's and this month's spend for an agent", [AGENT_OPTION]),
     _cmd("clear", "Clear an agent's session and restart it (destructive)", [AGENT_OPTION]),
     _cmd("reload", "Bounce an agent's subprocess, preserve session", [AGENT_OPTION]),
-    _cmd("interrupt", "Stop an agent's current generation, keep the session", [AGENT_OPTION]),
+    _cmd("interrupt", "Stop an agent's current generation, keep the session", [
+        AGENT_OPTION,
+        {"name": "message", "description": "Send this right after the stop; it runs first",
+         "type": STRING, "required": False, "max_length": 1900}]),
     _cmd("kill", "Kill an agent's subprocess without respawning it", [AGENT_OPTION]),
     _cmd("flush", "Drop an agent's pending message queue", [AGENT_OPTION]),
     _cmd("pause", "Hold an agent's queue; the turn in progress finishes", [

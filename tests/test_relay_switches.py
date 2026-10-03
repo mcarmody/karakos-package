@@ -158,3 +158,95 @@ def test_effort_failure_and_owner_gate(relay, owner):
 def test_slash_args_for_effort(relay):
     assert relay.slash_args("effort", {"level": "xhigh"}) == "xhigh"
     assert "effort" in relay.SLASH_COMMANDS and "effort" not in relay.SYS_COMMANDS
+
+
+# -- /interrupt with a message --------------------------------------------------------
+
+class Reg:
+    """The three registry methods route_message reads."""
+
+    def __init__(self):
+        self.s = {"a": SimpleNamespace(id="a", agent="a", channels=["main"]),
+                  "a-2": SimpleNamespace(id="a-2", agent="a", channels=["side"]),
+                  "b": SimpleNamespace(id="b", agent="b", channels=["bch"])}
+
+    def ids(self):
+        return {"a", "b"}
+
+    def shards(self):
+        return list(self.s.values())
+
+    def shard_for_channel(self, name):
+        return next((x for x in self.s.values() if name in x.channels), None)
+
+    def shards_of(self, agent):
+        return [x for x in self.s.values() if x.agent == agent]
+
+
+@pytest.fixture
+def reg(relay, owner, monkeypatch):
+    monkeypatch.setattr(relay, "registry_obj", Reg())
+
+
+def interrupt_adapter(relay, names, body=None):
+    ad = Adapter(relay, {"/agents/": (True, "", body or {"interrupted": True})})
+    ad.a.get_channel_name = lambda cid: names.get(cid)
+    return ad
+
+
+def test_interrupt_without_message_is_todays_call(relay, reg):
+    ad = interrupt_adapter(relay, {}, {"interrupted": False})
+    out = ad.run(message(), "interrupt", "")
+    assert ad.calls == [("/agents/a/interrupt", None)]
+    assert "was not generating" in out[0]
+
+
+@pytest.mark.parametrize("channel,names,shard", [
+    (1, {"1": "side"}, "a-2"),          # owned by a-2
+    (2, {"2": "elsewhere"}, "a"),       # listed, unowned: first shard
+    (3, {}, "a"),                       # not in channels.json: first shard, no exception
+    (4, {"4": "bch"}, "a"),             # owned by another agent's shard
+])
+def test_interrupt_message_routes_to_the_agents_shard(relay, reg, channel, names, shard):
+    ad = interrupt_adapter(relay, {str(k): v for k, v in names.items()})
+    out = ad.run(message(cid=channel), "interrupt", "do this instead")
+    assert ad.calls == [(f"/agents/a/interrupt?shard={shard}",
+                         {"message": "do this instead", "channel_id": str(channel),
+                          "author": "Owner"})]
+    assert out == ["`[SYS]` `a` interrupted; your message runs next."]
+
+
+def test_interrupt_message_not_generating_and_failure(relay, reg):
+    ad = interrupt_adapter(relay, {}, {"interrupted": False, "status": "queued"})
+    assert "was not generating; your message is queued." in ad.run(message(), "interrupt", "x")[0]
+    ad = Adapter(relay, {"/agents/": (False, "agent server returned 400: shard required", {})})
+    ad.a.get_channel_name = lambda cid: None
+    out = ad.run(message(), "interrupt", "x")
+    assert "interrupt failed for `a` — agent server returned 400" in out[0]
+
+
+def test_interrupt_message_with_no_registry_uses_the_agent_id(relay, owner, monkeypatch):
+    monkeypatch.setattr(relay, "registry_obj", None)
+    ad = interrupt_adapter(relay, {})
+    ad.run(message(), "interrupt", "x", mentioned="b")
+    assert ad.calls[0][0] == "/agents/b/interrupt?shard=b"
+
+
+def test_interrupt_over_length_message_is_refused_without_a_call(relay, reg):
+    ad = interrupt_adapter(relay, {})
+    out = ad.run(message(), "interrupt", "x" * 1901)
+    assert ad.calls == [] and "too long" in out[0]
+    ad.run(message(), "interrupt", "x" * 1900)
+    assert len(ad.calls) == 1
+
+
+def test_interrupt_non_owner_denied_before_any_call(relay, reg):
+    ad = interrupt_adapter(relay, {})
+    out = ad.run(message(author_id=1), "interrupt", "hi")
+    assert ad.calls == [] and "Permission denied" in out[0]
+
+
+def test_slash_args_for_interrupt(relay):
+    assert relay.slash_args("interrupt", {"message": "  go  ", "agent": "a"}) == "go"
+    assert relay.slash_args("interrupt", {"agent": "a"}) == ""
+    assert "interrupt" not in relay.SYS_COMMANDS

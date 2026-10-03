@@ -97,6 +97,7 @@ SLASH_COMMANDS = frozenset({
     "logs", "pause", "resume", "effort",
 })
 
+INTERRUPT_MESSAGE_MAX = 1900
 EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max", "default")
 
 # Commands that report on the whole install rather than one agent, so they
@@ -133,6 +134,8 @@ def slash_args(cmd: str, options: Dict) -> str:
         return s("minutes")
     if cmd == "effort":
         return s("level")
+    if cmd == "interrupt":
+        return s("message")
     # Everything else is either untargeted or agent-targeted, and the target
     # travels as `mentioned` (the same slot a text-path @mention fills), not
     # as args — so there is nothing left to rebuild.
@@ -1198,6 +1201,8 @@ class DiscordAdapter(discord.Client):
             await self.sys_reply(
                 message,
                 f"`{agent}` reloaded, session preserved." if ok else f"reload failed for `{agent}` — {detail}")
+        elif cmd == "interrupt" and args:
+            await self.sys_interrupt_with_message(message, agent, args)
         elif cmd == "interrupt":
             ok, detail, body = await self.agent_server_post_json(f"/agents/{agent}/interrupt")
             if not ok:
@@ -1235,6 +1240,42 @@ class DiscordAdapter(discord.Client):
             await self.sys_effort(message, agent, args)
         elif cmd == "cost":
             await self.sys_cost(message, agent)
+
+    def interrupt_shard(self, message, agent: str) -> str:
+        """The shard an interrupt message is addressed to: the one that owns the
+        channel and belongs to the agent, else the agent's first shard. Works in
+        channels that are not in channels.json (route_message answers None)."""
+        route = None
+        if registry_obj is not None:
+            channel_name = self.get_channel_name(str(message.channel.id))
+            route = routing.route_message(registry_obj, channel_name, agent, False)
+        if route is not None and route.agent == agent:
+            return route.shard
+        try:
+            shards = registry_obj.shards_of(agent) if registry_obj is not None else []
+        except Exception:
+            shards = []
+        return shards[0].id if shards else agent
+
+    async def sys_interrupt_with_message(self, message, agent: str, text: str):
+        """/interrupt with a message: stop the turn, run the message first (2.5)."""
+        if len(text) > INTERRUPT_MESSAGE_MAX:
+            await self.sys_reply(
+                message, f"interrupt message is too long ({len(text)} of "
+                         f"{INTERRUPT_MESSAGE_MAX} characters).")
+            return
+        shard = self.interrupt_shard(message, agent)
+        ok, detail, body = await self.agent_server_post_json(
+            f"/agents/{agent}/interrupt?shard={shard}",
+            {"message": text, "channel_id": str(message.channel.id),
+             "author": message.author.display_name})
+        if not ok:
+            await self.sys_reply(message, f"interrupt failed for `{agent}` — {detail}")
+        elif body.get("interrupted"):
+            await self.sys_reply(message, f"`{agent}` interrupted; your message runs next.")
+        else:
+            await self.sys_reply(
+                message, f"`{agent}` was not generating; your message is queued.")
 
     async def sys_effort(self, message, agent: str, args: str):
         """Set the agent-level effort override (owner only, via handle_sys_command)."""
