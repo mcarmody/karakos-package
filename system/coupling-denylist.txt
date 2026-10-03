@@ -1,0 +1,21 @@
+# Household-coupling denylist for system/check-coupling.sh.
+#
+# One rule per line, TAB-separated:
+#   name <TAB> regex [<TAB> path-regex [<TAB> line-regex]]
+# name        reported as `file:line: name`
+# regex       extended regex matched against each line of each tracked file
+# path-regex  optional ERE; the rule only applies to tracked paths matching it
+# line-regex  optional case-insensitive ERE; the line must also match it
+# Lines starting with # and blank lines are ignored.
+#
+# Allow-list exceptions live in system/coupling-allow.txt.
+# This file is skipped by the scan. Package code must stay free of household
+# identifiers: the lists below ship as generic placeholders; a downstream
+# household adds its own real hostnames and names to its copy and never
+# commits them to the package repo or a PR description.
+
+private-ipv4	\b(10\.[0-9]{1,3}|172\.(1[6-9]|2[0-9]|3[01])|192\.168|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])|169\.254)\.[0-9]{1,3}\.[0-9]{1,3}\b
+discord-snowflake	\b[0-9]{17,20}\b	^(config|agents|docs|tests)/	channel|guild|user|bot
+home-path	/home/([a-tv-z]|u[a-rt-z]|us[a-df-z]|use[a-qs-z]|user[a-z0-9_.-])	
+household-hostname	\b(placeholder-host-one|placeholder-host-two)\b
+personal-name	\b(PlaceholderPersonOne|PlaceholderPersonTwo)\b
