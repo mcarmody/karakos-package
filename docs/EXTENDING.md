@@ -143,6 +143,39 @@ python3 mcp/tools-server.py --test-tool my_tool '{"query": "test"}'
 
 Reset the agent session (dashboard → Agents → Reset, or via API). The MCP server restarts with the agent and discovers the new skill.
 
+## Writing a harness test
+
+`tests/harness/` runs the real `bin/agent-server.py` against a fake `claude`
+binary that speaks stream-json, so a test exercises the real spawn path, argv,
+queue, cost rows and result parsing with no API spend. CI has no
+pytest-asyncio; drive it with `asyncio.run`.
+
+```python
+def test_reply(harness):
+    h = harness(agents=["a", "b"])          # or Harness(tmp_workspace, agents={"a": {"model": "x"}})
+
+    async def scenario():
+        async with h:
+            h.script(default={"text": "pong: {{text}}"},
+                     rules=[{"match": "slow", "step": {"delay_ms": 300}}])
+            await h.send("a", "ping", channel_id="1")
+            await h.wait_idle("a", timeout=5)
+
+    asyncio.run(scenario())
+    assert h.queue_rows("a")[0]["response"].startswith("pong:")
+    assert h.discord[-1]["content"].startswith("pong:")   # post_to_discord is stubbed
+```
+
+A step is `{text, tools: [{name, input, usage, message_id, parent_tool_use_id}],
+usage, cost, delay_ms, is_error, exit, hang}`; `{{text}}` echoes the input and
+`{{env:KARAKOS_AGENT}}` names the agent. `exit` kills the fake mid-turn (respawn
+watcher), `hang` stops it reading (pair with `h.interrupt`). Readers
+(`h.sent_to`, `h.argv`, `h.queue_rows`, `h.stream_events`) take a shard id,
+which equals the agent id until the registry has shards; `h.cost_rows()` is
+global. Tests must not read `HOME`, bind real ports or touch Discord;
+`tests/test_no_home_access.py` enforces this. The `Harness` signatures are
+frozen by `tests/test_harness_api.py`.
+
 ## Using the Builder Agent
 
 The builder agent receives specs as markdown files in its inbox and implements them on feature branches.

@@ -1,0 +1,193 @@
+"""Two-agent integration harness: the real agent-server, a fake `claude`.
+
+    h = Harness(tmp_workspace, agents=["a", "b"])
+    async with h:
+        await h.send("a", "hello")
+        await h.wait_idle("a")
+        assert h.sent_to("a") == [...]
+
+Tests drive it with plain `asyncio.run` (CI does not install pytest-asyncio).
+Everything is keyed by *shard id*; until the registry grows shards, the shard
+id is the agent id.
+"""
+
+import asyncio
+import glob
+import json
+import os
+import sqlite3
+import time
+from pathlib import Path
+
+HARNESS_DIR = Path(__file__).resolve().parent
+FAKE_BIN_DIR = HARNESS_DIR / "bin"
+PACKAGE_ROOT = HARNESS_DIR.parent.parent
+DEFAULT_TOKEN = "harness-token"
+
+_ENV_KEYS = ("PATH", "WORKSPACE_ROOT", "AGENT_SERVER_TOKEN", "FAKE_CLAUDE_LOG_DIR",
+             "FAKE_CLAUDE_SCRIPT", "DISCORD_BOT_TOKEN", "OWNER_DISCORD_ID")
+
+
+def write_agents_config(workspace: Path, agents) -> None:
+    """The one place the harness writes agent config (1.1a swaps this to
+    agents.yaml). `agents` is a list of ids or {id: config-overrides}."""
+    if not isinstance(agents, dict):
+        agents = {name: {} for name in agents}
+    entries = {}
+    for name, extra in agents.items():
+        prompt_dir = workspace / "agents" / name
+        prompt_dir.mkdir(parents=True, exist_ok=True)
+        (prompt_dir / "SYSTEM_PROMPT.md").write_text(f"You are harness agent {name}.")
+        entries[name] = {"system_prompt": f"agents/{name}/SYSTEM_PROMPT.md",
+                         "model": "fake-model", **(extra or {})}
+    (workspace / "config").mkdir(parents=True, exist_ok=True)
+    (workspace / "config" / "agents.json").write_text(json.dumps({"agents": entries}))
+    (workspace / "config" / "claude-settings.json").write_text(
+        json.dumps({"permissions": {"allow": [], "deny": []}}))
+
+
+class Harness:
+    def __init__(self, tmp_workspace, agents=["a", "b"]):
+        from conftest import import_script  # tests/ is on sys.path under pytest
+        self.workspace = Path(tmp_workspace)
+        self.agents = list(agents)
+        self.log_dir = self.workspace / "fake-claude-logs"
+        self.script_path = self.workspace / "fake-claude-script.json"
+        self.discord = []
+        self._saved_env = {}
+        self._import_script = import_script
+        self.module = None
+        self.client = None
+        write_agents_config(self.workspace, agents)
+        self.script()
+
+    # -- lifecycle ---------------------------------------------------------
+
+    async def start(self):
+        from aiohttp.test_utils import TestClient, TestServer
+        self._saved_env = {k: os.environ.get(k) for k in _ENV_KEYS}
+        os.environ["PATH"] = f"{FAKE_BIN_DIR}{os.pathsep}{os.environ.get('PATH', '')}"
+        os.environ["WORKSPACE_ROOT"] = str(self.workspace)
+        os.environ["AGENT_SERVER_TOKEN"] = DEFAULT_TOKEN
+        os.environ["FAKE_CLAUDE_LOG_DIR"] = str(self.log_dir)
+        os.environ["FAKE_CLAUDE_SCRIPT"] = str(self.script_path)
+        # Nothing may reach Discord: no bot tokens, and the poster is stubbed.
+        os.environ.pop("DISCORD_BOT_TOKEN", None)
+        os.environ.pop("OWNER_DISCORD_ID", None)
+        self.module = self._import_script("agent-server")
+        self.module.post_to_discord = self._record_discord
+        self.client = TestClient(TestServer(self.module.create_app(), host="127.0.0.1"))
+        await self.client.start_server()
+        return self
+
+    async def stop(self):
+        if self.client is not None:
+            await self.client.close()
+            self.client = None
+        for k, v in self._saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    async def __aenter__(self):
+        return await self.start()
+
+    async def __aexit__(self, *exc):
+        await self.stop()
+
+    async def _record_discord(self, agent, channel_id, content, reply_to=None,
+                              dead_letter=False):
+        self.discord.append({"agent": agent, "channel_id": channel_id,
+                             "content": content, "reply_to": reply_to,
+                             "dead_letter": dead_letter})
+        return f"discord-{len(self.discord)}"
+
+    # -- scripting the fake -------------------------------------------------
+
+    def script(self, default=None, rules=None):
+        """Write the fake's script (see tests/harness/fake_claude.py)."""
+        self.script_path.write_text(json.dumps(
+            {"default": default or {}, "rules": rules or []}))
+
+    # -- driving ------------------------------------------------------------
+
+    def _headers(self):
+        return {"Authorization": f"Bearer {DEFAULT_TOKEN}"}
+
+    async def send(self, agent, text, channel_id="1"):
+        resp = await self.client.post(
+            "/message", headers=self._headers(),
+            json={"agent": agent, "content": text, "channel_id": channel_id,
+                  "server": "local", "author": "harness"})
+        assert resp.status == 202, await resp.text()
+        return await resp.json()
+
+    async def interrupt(self, agent):
+        resp = await self.client.post(f"/agents/{agent}/interrupt",
+                                      headers=self._headers())
+        return await resp.json()
+
+    async def wait_idle(self, agent, timeout=5):
+        """Wait until `agent` is IDLE with nothing queued or in progress."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            busy = [r for r in self.queue_rows(agent) if r["processed"] in (0, 1)]
+            if not busy and self.module.agent_states.get(agent) == "IDLE":
+                return
+            await asyncio.sleep(0.02)
+        raise TimeoutError(
+            f"{agent} not idle after {timeout}s "
+            f"(state={self.module.agent_states.get(agent)}, rows={self.queue_rows(agent)})")
+
+    async def wait_for(self, predicate, timeout=5):
+        """Poll `predicate()` until truthy; for conditions wait_idle can't see."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return
+            await asyncio.sleep(0.02)
+        raise TimeoutError("condition not met")
+
+    # -- observing ----------------------------------------------------------
+
+    def _query(self, sql, params=()):
+        conn = sqlite3.connect(str(self.module.DB_PATH))
+        conn.row_factory = sqlite3.Row
+        try:
+            return [dict(r) for r in conn.execute(sql, params).fetchall()]
+        finally:
+            conn.close()
+
+    def session_id(self, shard):
+        rows = self._query("SELECT session_id FROM sessions WHERE agent = ?", (shard,))
+        return rows[0]["session_id"] if rows else None
+
+    def sent_to(self, shard):
+        """Texts the fake received for this shard's current session, in order."""
+        path = self.log_dir / f"{self.session_id(shard)}.in.jsonl"
+        if not path.exists():
+            return []
+        return [json.loads(l)["text"] for l in path.read_text().splitlines() if l]
+
+    def argv(self, shard):
+        """argv (without the program name) of the shard's latest spawn."""
+        path = self.log_dir / f"{self.session_id(shard)}.argv.json"
+        return json.loads(path.read_text()) if path.exists() else None
+
+    def queue_rows(self, shard):
+        return self._query(
+            "SELECT * FROM message_queue WHERE agent = ? ORDER BY id", (shard,))
+
+    def cost_rows(self):
+        return self._query("SELECT * FROM cost_events ORDER BY id")
+
+    def stream_events(self, shard):
+        """Raw stream-json events the server tee'd for this shard (for 1.5)."""
+        events = []
+        pattern = str(self.module.STREAM_LOG_DIR / f"{shard}_*.jsonl")
+        for path in sorted(glob.glob(pattern)):
+            for line in Path(path).read_text().splitlines():
+                if line.strip():
+                    events.append(json.loads(line))
+        return events

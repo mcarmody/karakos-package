@@ -147,3 +147,19 @@ def memory_db(tmp_workspace):
     """)
     conn.commit()
     return conn, db_path
+
+
+@pytest.fixture
+def harness(tmp_workspace):
+    """Factory for the two-agent integration harness (tests/harness).
+
+    Usage: `h = harness(agents=["a", "b"])`, then `async with h:` inside
+    `asyncio.run(...)`. The factory exists because the harness needs a running
+    event loop to start, and CI has no pytest-asyncio.
+    """
+    from harness import Harness
+
+    def make(agents=("a", "b")):
+        return Harness(tmp_workspace, agents=list(agents))
+
+    return make
