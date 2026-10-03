@@ -15,7 +15,7 @@ Three properties, each of which the design turns on:
 wedged process is not a check. This is a separate script on its own schedule,
 reading files.
 
-**It alerts direct to Discord, never through poke.sh.** poke.sh queues a
+**It alerts direct to Discord, never through the agent poke path.** A poke queues a
 message *for an agent*. If that agent is the wedged one, the alert lands in
 the queue it cannot read and is never seen — the check would fail silently in
 exactly the case it exists for. bin/discord-notify.sh posts with the bot token
@@ -141,7 +141,7 @@ def alert_key(beacon):
 
 
 def send_alert(message):
-    """Post direct to Discord. Never poke.sh — see the module docstring."""
+    """Post direct to Discord. Never the agent poke path — see the module docstring."""
     notify = WORKSPACE_ROOT / "bin" / "discord-notify.sh"
     if not notify.exists():
         print(f"wedge-check: no discord-notify.sh, alert not sent: {message}", file=sys.stderr)

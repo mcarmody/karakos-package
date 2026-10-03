@@ -121,41 +121,66 @@ class TestHealthFileChecks:
         healthy, reason = monitor.check_health_file("relay.json", 300)
         assert healthy is True, reason
 
-    def test_every_threshold_names_a_file_something_writes(self, tmp_workspace, monkeypatch):
-        """A threshold whose file has no writer is a permanent false alarm.
+    def test_every_job_and_component_names_a_file_something_writes(self, tmp_workspace, monkeypatch):
+        """A table entry whose file has no writer is a permanent false alarm.
 
-        `memory.json` was in this table for months and nothing ever wrote it;
-        memory-maintenance.py writes `memory-maintenance.json`.
+        `memory.json` was in the old table for months and nothing ever wrote
+        it. The writer list is derived from the job table: components are
+        written by their own process, scheduled jobs by the scheduler wrapper
+        (lib/heartbeats.py), and a job's extra health file by its own script.
         """
         monitor = self._make_monitor(tmp_workspace, monkeypatch)
+        import job_registry
 
-        writers = {
-            "mcp-tools.json": PACKAGE_ROOT / "mcp" / "tools-server.py",
-            "relay.json": PACKAGE_ROOT / "bin" / "relay.py",
-            "memory-maintenance.json": PACKAGE_ROOT / "bin" / "memory-maintenance.py",
-            "scheduler.json": PACKAGE_ROOT / "bin" / "scheduler.py",
+        component_writers = {
+            "mcp-tools": PACKAGE_ROOT / "mcp" / "tools-server.py",
+            "relay": PACKAGE_ROOT / "bin" / "relay.py",
+            "scheduler": PACKAGE_ROOT / "bin" / "scheduler.py",
         }
-        assert set(monitor.THRESHOLDS) == set(writers)
-        for component, writer in writers.items():
-            assert component in writer.read_text(), (
-                f"{writer.name} does not write {component}"
-            )
+        health_file_writers = {
+            "memory-maintenance.json": PACKAGE_ROOT / "bin" / "memory-maintenance.py",
+        }
+        files = monitor._health_files()
+        for job in job_registry.BUILTIN:
+            if job.kind == "component":
+                assert f"{job.name}.json" in files
+                writer = component_writers[job.name]
+                assert f"{job.name}.json" in writer.read_text(), (
+                    f"{writer.name} does not write {job.name}.json")
+            elif job.health_file:
+                assert job.health_file in files
+                assert job.health_file in health_file_writers[job.health_file].read_text()
+        assert set(files) == {"mcp-tools.json", "relay.json", "scheduler.json",
+                              "memory-maintenance.json"}
+        sched = (PACKAGE_ROOT / "bin" / "scheduler.py").read_text()
+        assert "heartbeats.touch" in sched and "job_registry.load_jobs" in sched
+
+    def test_verdict_shape(self, tmp_workspace, monkeypatch):
+        monitor = self._make_monitor(tmp_workspace, monkeypatch)
+        v = monitor.verdict()
+        assert set(v) == {"healthy", "issues", "components"}
+        assert set(v["components"]) == {"mcp-tools.json", "relay.json", "scheduler.json",
+                                        "memory-maintenance.json"}
+        assert v["healthy"] is False and len(v["issues"]) == 4
 
 
 class TestPokeAlertPath:
-    """The alert path has to tell the truth about whether it alerted."""
+    """The alert path has to tell the truth about whether it alerted.
 
-    def _make_monitor(self, tmp_workspace, monkeypatch):
+    It posts through bin/discord-notify.sh directly (never an agent queue)."""
+
+    def _make_monitor(self, tmp_workspace, monkeypatch, with_script=True):
         monkeypatch.setenv("WORKSPACE_ROOT", str(tmp_workspace))
+        if with_script:
+            script = tmp_workspace / "bin" / "discord-notify.sh"
+            script.write_text("#!/bin/sh\n")
+            script.chmod(0o755)
         return import_script("health-monitor")
 
-    def test_returns_false_when_poke_script_is_missing(self, tmp_workspace, monkeypatch):
-        """A missing poke.sh raises OSError, not CalledProcessError.
-
-        Uncaught it took down the entire monitor rather than one alert.
-        """
-        monitor = self._make_monitor(tmp_workspace, monkeypatch)
-        assert not (tmp_workspace / "bin" / "poke.sh").exists()
+    def test_returns_false_when_notify_script_is_missing(self, tmp_workspace, monkeypatch):
+        """A missing script raises OSError, not CalledProcessError."""
+        monitor = self._make_monitor(tmp_workspace, monkeypatch, with_script=False)
+        assert not (tmp_workspace / "bin" / "discord-notify.sh").exists()
 
         assert monitor.poke_signals("boom") is False
 
@@ -163,29 +188,32 @@ class TestPokeAlertPath:
         monitor = self._make_monitor(tmp_workspace, monkeypatch)
 
         def fake_run(*a, **kw):
-            raise subprocess.CalledProcessError(1, "poke.sh", stderr=b"discord 500")
+            raise subprocess.CalledProcessError(1, "discord-notify.sh", stderr=b"discord 500")
 
         monkeypatch.setattr(monitor.subprocess, "run", fake_run)
         assert monitor.poke_signals("boom") is False
+        assert "discord 500" in (tmp_workspace / "logs" / "health-alerts.log").read_text()
 
     def test_returns_false_on_timeout(self, tmp_workspace, monkeypatch):
         monitor = self._make_monitor(tmp_workspace, monkeypatch)
 
         def fake_run(*a, **kw):
-            raise subprocess.TimeoutExpired("poke.sh", 30)
+            raise subprocess.TimeoutExpired("discord-notify.sh", 30)
 
         monkeypatch.setattr(monitor.subprocess, "run", fake_run)
         assert monitor.poke_signals("boom") is False
 
-    def test_passes_a_timeout_so_a_hung_poke_cannot_wedge_the_monitor(
-            self, tmp_workspace, monkeypatch):
+    def test_passes_a_timeout_and_uses_discord_notify(self, tmp_workspace, monkeypatch):
         monitor = self._make_monitor(tmp_workspace, monkeypatch)
         seen = {}
 
         def fake_run(cmd, **kw):
+            seen["cmd"] = cmd
             seen.update(kw)
             return subprocess.CompletedProcess(cmd, 0)
 
         monkeypatch.setattr(monitor.subprocess, "run", fake_run)
         assert monitor.poke_signals("boom") is True
         assert seen.get("timeout")
+        assert seen["cmd"][0].endswith("discord-notify.sh")
+        assert seen["cmd"][1:] == ["signals", "boom"]
