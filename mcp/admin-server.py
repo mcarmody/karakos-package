@@ -180,7 +180,7 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "name": {"type": "string", "description": "New agent name (lowercase, hyphens allowed, must start with a letter)"},
-                "template": {"type": "string", "description": "Base template (default 'primary'). Examples: primary, relay, builder, reviewer"},
+                "template": {"type": "string", "description": "Base template (default 'primary'). Examples: primary, monitor, builder, reviewer"},
                 "model": {"type": "string", "description": "Claude model: opus, sonnet, haiku (default sonnet)"},
                 "max_turns": {"type": "integer", "description": "Max agentic turns per message (default 200)"},
                 "system_prompt": {"type": "string", "description": "Override agents/<name>/SYSTEM_PROMPT.md after scaffolding, then reload"},

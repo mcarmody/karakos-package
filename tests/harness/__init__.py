@@ -253,6 +253,22 @@ class Harness:
             return []
         return [json.loads(l) for l in path.read_text().splitlines() if l]
 
+    def beacon(self, shard):
+        """The shard's liveness beacon (data/health/agents/<shard>.json), or None."""
+        path = self.workspace / "data" / "health" / "agents" / f"{shard}.json"
+        try:
+            return json.loads(path.read_text())
+        except (OSError, ValueError):
+            return None
+
+    def findings(self):
+        """Findings in data/health/findings.json, as dicts (empty when absent)."""
+        path = self.workspace / "data" / "health" / "findings.json"
+        try:
+            return json.loads(path.read_text()).get("findings", [])
+        except (OSError, ValueError):
+            return []
+
     def queue_rows(self, shard):
         return self._query(
             "SELECT * FROM message_queue WHERE agent = ? ORDER BY id", (shard,))

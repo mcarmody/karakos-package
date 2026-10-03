@@ -44,6 +44,9 @@ from datetime import datetime
 from pathlib import Path
 
 WORKSPACE_ROOT = Path(os.environ.get("WORKSPACE_ROOT", "/workspace"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+sys.path.insert(1, str(WORKSPACE_ROOT / "lib"))
+import stall  # noqa: E402
 BEACON_DIR = WORKSPACE_ROOT / "data" / "health" / "agents"
 STATE_PATH = WORKSPACE_ROOT / "data" / "health" / "wedge-check-state.json"
 ALERT_CHANNEL = os.environ.get("WEDGE_ALERT_CHANNEL", "signals")
@@ -81,13 +84,19 @@ def read_beacon(path: Path):
         last = datetime.fromisoformat(data["last_activity"])
     except (KeyError, TypeError, ValueError):
         return None
-    return {
+    beacon = {
         "agent": data.get("agent") or path.stem,
         "state": data.get("state"),
         "message_id": data.get("message_id"),
         "pid": data.get("pid"),
         "last_activity": last,
     }
+    # Additive diagnosis fields (absent from a 1.x beacon).
+    for key in ("shard", "proc_pid", "phase", "last_event_type", "current_tool",
+                "held_until", "blocked_on", "ask_pending", "paused"):
+        if key in data:
+            beacon[key] = data[key]
+    return beacon
 
 
 def find_wedged(threshold_sec, now=None):
@@ -155,16 +164,36 @@ def send_alert(message):
         return False
 
 
+def diagnose_all(wedged, threshold=DEFAULT_THRESHOLD_SEC):
+    """beacon -> stall.Diagnosis for each wedged record (never raises)."""
+    ctx = {"beacons": {b["agent"]: {**b, "last_activity": b["last_activity"]} for b in wedged}}
+    out = []
+    for b in wedged:
+        try:
+            out.append(stall.diagnose(b, ctx, {"stall_s": threshold}))
+        except Exception as e:
+            out.append(stall.Diagnosis("unknown", f"diagnosis failed: {e}", "warn"))
+    return out
+
+
 def format_alert(wedged):
     lines = ["🚨 Agent wedged — alive but not processing. **No restart has been attempted.**"]
-    for beacon in wedged:
+    diags = diagnose_all(wedged)
+    for beacon, diag in zip(wedged, diags):
         minutes = beacon["silent_for"] / 60
         lines.append(
             f"• `{beacon['agent']}` — {beacon['state']}, silent {minutes:.1f} min"
             + (f" (message {beacon['message_id']})" if beacon.get("message_id") else "")
             + (f", pid {beacon['pid']}" if beacon.get("pid") else "")
         )
+        lines.append(f"  Why: {diag.why} ({diag.severity})")
     return "\n".join(lines)
+
+
+def pageable(wedged):
+    """The wedged records whose diagnosis warrants a page: `info` causes (a tool that
+    is legitimately running, a pause) are logged but do not page."""
+    return [b for b, d in zip(wedged, diagnose_all(wedged)) if d.severity != "info"]
 
 
 def main(argv=None):
@@ -193,7 +222,7 @@ def main(argv=None):
     if not args.no_alert:
         state = _load_state()
         already = set(state.get("alerted", []))
-        fresh = [b for b in wedged if alert_key(b) not in already]
+        fresh = [b for b in pageable(wedged) if alert_key(b) not in already]
         if fresh:
             if send_alert(format_alert(fresh)):
                 # Only the episodes just reported are remembered, so a wedge

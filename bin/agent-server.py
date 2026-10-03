@@ -40,6 +40,7 @@ import ask_handler  # noqa: E402
 import hive as hive_lib  # noqa: E402
 import msgqueue  # noqa: E402
 import registry as agent_registry  # noqa: E402
+import procreap  # noqa: E402
 import prompt_compose  # noqa: E402
 import rate_limits  # noqa: E402
 import shards as shards_lib  # noqa: E402
@@ -961,6 +962,12 @@ async def kill_agent_subprocess(shard: str):
     deliberate_kills.add(shard)
 
     log.info(f"Killing {label_of(shard)} subprocess (PID {proc.pid})")
+    # Snapshot the tree BEFORE signalling the root: once it dies its children
+    # reparent to init and can no longer be found.
+    # Only a real child process of ours: a test double's pid (FakeProcess(pid=1))
+    # must never reach a real process-tree reap.
+    tree = (procreap.snapshot_tree(proc.pid)
+            if isinstance(proc, asyncio.subprocess.Process) else {})
     def _already_dead(exc: BaseException) -> bool:
         # The process exited between the lookup and the signal (or the
         # respawn watcher reaped it): nothing left to kill.
@@ -984,6 +991,18 @@ async def kill_agent_subprocess(shard: str):
         log.info(f"{label_of(shard)} subprocess already gone at kill time")
 
     agent_processes.pop(shard, None)
+
+    # Whatever the tool calls left running (dev servers, nohup/setsid children).
+    try:
+        tree.pop(proc.pid, None)
+        reaped = await asyncio.to_thread(procreap.reap, tree)
+        n = len(reaped["termed"]) + len(reaped["killed"])
+        if n:
+            log.info(f"{label_of(shard)}: reaped {n} process(es) beyond the subprocess")
+        if reaped["survived"]:
+            log.warning(f"{label_of(shard)}: could not kill {reaped['survived']}")
+    except Exception as e:
+        log.warning(f"{label_of(shard)}: process reap failed: {type(e).__name__}: {e}")
 
     reader_task = stderr_reader_tasks.pop(shard, None)
     if reader_task and not reader_task.done():
@@ -1273,6 +1292,39 @@ async def check_cost_limits(author_id: str) -> Dict[str, Any]:
 
 _last_beacon_write: Dict[str, float] = {}
 
+# shard -> {phase, last_event_type, current_tool}: filled by the beacon hooks below.
+beacon_extra: Dict[str, dict] = {}
+
+
+def _beacon_diagnosis_fields(agent: str, state: str) -> dict:
+    """The additive keys wedge-check/lib/stall.py read to say *why* a shard is
+    silent. Every probe is guarded: a failure here must not cost the base beacon."""
+    extra = beacon_extra.get(agent, {}) if state != "IDLE" else {}
+    out = {
+        "shard": agent,
+        "proc_pid": None,
+        "phase": extra.get("phase"),
+        "last_event_type": extra.get("last_event_type"),
+        "current_tool": extra.get("current_tool"),
+        "held_until": None,
+        "blocked_on": None,
+        "ask_pending": state == ask_handler.AWAITING_USER_STATE,
+        "paused": None,
+    }
+    for key, probe in (
+        ("proc_pid", lambda: agent_processes[agent].pid if agent in agent_processes else None),
+        ("held_until", lambda: agent_hold_notice_until.get(agent)),
+        ("paused", lambda: _paused_entry(agent)),
+        ("blocked_on", lambda: next(
+            ({"call_id": cid, "callee": oc.callee}
+             for cid, oc in STATE.hive.open.items() if oc.caller == agent), None)),
+    ):
+        try:
+            out[key] = probe()
+        except Exception:
+            pass
+    return out
+
 
 def write_agent_beacon(agent: str, state: str, message_id: Optional[str] = None,
                        force: bool = False) -> None:
@@ -1299,6 +1351,7 @@ def write_agent_beacon(agent: str, state: str, message_id: Optional[str] = None,
             "message_id": message_id,
             "pid": os.getpid(),
         }
+        payload.update(_beacon_diagnosis_fields(agent, state))
         path = AGENT_BEACON_DIR / f"{agent}.json"
         # Written via a temp file and renamed: the watcher is reading this
         # concurrently, and a partial write would read as corrupt — which the
@@ -3475,6 +3528,58 @@ async def hive_startup_sweep():
     await msgqueue.reap_hive_rows(db, time.time(), hive_lib.HIVE_REPLY_TTL_S)
 
 
+def _beacon_state(shard):
+    return agent_states.get(shard) or "PROCESSING"
+
+
+def beacon_on_turn_start(shard, batch):
+    beacon_extra[shard] = {"phase": "awaiting_first_event", "last_event_type": None,
+                           "current_tool": None}
+    write_agent_beacon(shard, _beacon_state(shard), force=True)
+
+
+def beacon_on_event(shard, event):
+    """Track what the turn is doing. Never raises into the turn."""
+    try:
+        ex = beacon_extra.setdefault(shard, {})
+        etype = event.get("type") if isinstance(event, dict) else None
+        prev_phase = ex.get("phase")
+        ex["last_event_type"] = etype
+        phase = prev_phase or "streaming"
+        if etype == "assistant":
+            blocks = (event.get("message") or {}).get("content") or []
+            tool = next((b for b in blocks if isinstance(b, dict) and b.get("type") == "tool_use"), None)
+            if tool and not event.get("parent_tool_use_id"):
+                phase = "tool_running"
+                ex["current_tool"] = {"name": tool.get("name"), "started_at": time.time()}
+            else:
+                phase = "streaming"
+        elif etype == "user":
+            phase, ex["current_tool"] = "streaming", None
+        elif etype == "result":
+            phase, ex["current_tool"] = "closing", None
+        ex["phase"] = phase
+        write_agent_beacon(shard, _beacon_state(shard), force=phase != prev_phase)
+    except Exception as e:
+        log.debug(f"beacon on_event for {shard} failed: {e}")
+
+
+def beacon_on_turn_end(shard, result):
+    try:
+        beacon_extra[shard] = {"phase": "closing", "last_event_type": "result",
+                               "current_tool": None}
+    except Exception:
+        pass
+
+
+def register_beacon_hooks():
+    for name, fn in (("on_turn_start", beacon_on_turn_start),
+                     ("on_event", beacon_on_event),
+                     ("on_turn_end", beacon_on_turn_end)):
+        if fn not in getattr(STATE.hooks, name):
+            getattr(STATE.hooks, name).append(fn)
+
+
 def register_hive_hooks():
     """Hive's on_turn_end runs first, ahead of any later hook (2.6's handoff
     registers after it)."""
@@ -3692,6 +3797,7 @@ async def startup(app):
 
     # Hive first, so its on_turn_end precedes every other turn hook.
     register_hive_hooks()
+    register_beacon_hooks()
 
     # Initialize HTTP session
     http_session = aiohttp.ClientSession()
