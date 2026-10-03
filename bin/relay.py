@@ -18,6 +18,7 @@ import subprocess
 import sys
 import textwrap
 import time
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -31,6 +32,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import ask_handler  # noqa: E402
 import registry as agent_registry  # noqa: E402
+import reply_classifier  # noqa: E402
+import reply_gate_config  # noqa: E402
 import routing  # noqa: E402
 import tengwar  # noqa: E402
 
@@ -293,11 +296,115 @@ class ReplyGate:
     an unwanted "was that for me?" costs the humans their conversation, while
     silence costs one word to recover from. ASK is kept distinct from SILENT so
     an install can hook a classifier in without reworking the tiers.
+
+    Opt-in tier 2: a channel whose `reply_gate` is an object with
+    `"classifier": "haiku"` has ASK decided by a small model (`tier2`). Any
+    doubt, error, timeout or limit keeps the silence. Channels that do not opt
+    in never reach it.
     """
+
+    CONTEXT_RING = 20
 
     def __init__(self):
         # channel id -> {"human_msgs": [ts], "last_post": ts}
         self._channels: Dict[int, Dict] = {}
+        # In-memory only, never logged or written: channel id -> recent messages.
+        self._ring: Dict[int, "deque"] = {}
+        self._calls: Dict[int, "deque"] = {}      # channel id -> classifier call times
+        self._chan_locks: Dict[int, tuple] = {}   # channel id -> (loop, Lock)
+        self._sem = None                          # (loop, Semaphore(2))
+        self.runner = None                        # injectable; default run_claude
+        self.stats = {"calls": 0, "engaged": 0, "silent": 0, "errors": 0,
+                      "timeouts": 0, "rate_capped": 0, "budget": 0, "last_call_ts": None}
+        self._last_budget_warn = 0.0
+
+    def note_message(self, channel_id, author_name, text, is_agent=False, now=None):
+        ring = self._ring.setdefault(int(channel_id), deque(maxlen=self.CONTEXT_RING))
+        ring.append((str(author_name or ""), str(text or "")[:300], bool(is_agent),
+                     now if now is not None else time.time()))
+
+    def recent(self, channel_id, n):
+        """The last `n` messages as [(author, text)], oldest first."""
+        if n <= 0:
+            return []
+        return [(a, t) for a, t, _ag, _ts in list(self._ring.get(int(channel_id), ()))[-n:]]
+
+    def _loop_bound(self, store, key, factory):
+        loop = asyncio.get_running_loop()
+        entry = store.get(key)
+        if entry is None or entry[0] is not loop:
+            entry = (loop, factory())
+            store[key] = entry
+        return entry[1]
+
+    async def tier2(self, *, channel_id, cfg, agent_names, author_name, content,
+                    db_path=None, on_cost=None, now=None):
+        """Classify an ASK. Returns (verdict, reason); never raises."""
+        cid = int(channel_id)
+        deadline = time.monotonic() + cfg.timeout_s
+        try:
+            lock = self._loop_bound(self._chan_locks, cid, asyncio.Lock)
+            try:
+                await asyncio.wait_for(lock.acquire(), timeout=cfg.timeout_s)
+            except asyncio.TimeoutError:
+                self.stats["timeouts"] += 1
+                return ("silent", "haiku timeout")
+            try:
+                return await self._tier2_locked(
+                    cid, cfg, agent_names, author_name, content, db_path, on_cost,
+                    deadline, now)
+            finally:
+                lock.release()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            log.debug("tier2 error: %s", e)
+            self.stats["errors"] += 1
+            return ("silent", "haiku error")
+
+    async def _tier2_locked(self, cid, cfg, agent_names, author_name, content,
+                            db_path, on_cost, deadline, now):
+        if self._sem is None or self._sem[0] is not asyncio.get_running_loop():
+            self._sem = (asyncio.get_running_loop(), asyncio.Semaphore(2))
+        async with self._sem[1]:
+            if db_path is not None and await asyncio.to_thread(
+                    reply_classifier.account_paused, db_path):
+                return ("silent", "haiku account_paused")
+
+            t = time.time() if now is None else now
+            calls = self._calls.setdefault(cid, deque())
+            while calls and calls[0] <= t - 3600:
+                calls.popleft()
+            if len(calls) >= cfg.max_per_hour or sum(1 for c in calls if c > t - 60) >= cfg.max_per_minute:
+                self.stats["rate_capped"] += 1
+                return ("silent", "haiku rate_capped")
+            calls.append(t)
+
+            self.stats["calls"] += 1
+            self.stats["last_call_ts"] = t
+            v = await reply_classifier.classify(
+                cfg, list(agent_names), self.recent(cid, cfg.context_messages),
+                (author_name, content), runner=self.runner or reply_classifier.run_claude)
+
+        if v.cost and on_cost is not None:
+            try:
+                await on_cost(v.cost)
+            except Exception as e:  # noqa: BLE001
+                log.debug("classifier cost post failed: %s", e)
+        if v.reason == "timeout":
+            self.stats["timeouts"] += 1
+        elif v.reason in ("error", "exit", "empty"):
+            self.stats["errors"] += 1
+        elif v.reason == "budget":
+            self.stats["budget"] += 1
+            if time.time() - self._last_budget_warn > 3600:
+                self._last_budget_warn = time.time()
+                log.warning("classifier budget cap is below the per-call cost")
+        if v.engage:
+            self.stats["engaged"] += 1
+            return ("engage", f"haiku {v.confidence:.2f}")
+        self.stats["silent"] += 1
+        return ("silent", f"haiku {v.reason}")
 
     def _state(self, channel_id: int) -> Dict:
         return self._channels.setdefault(channel_id, {"human_msgs": [], "last_post": 0.0})
@@ -765,6 +872,12 @@ class DiscordAdapter(discord.Client):
         # keep answering in, and that is only knowable from our own traffic.
         if message.author == self.user:
             self.reply_gate.note_agent_post(message.channel.id)
+            own_name = self.get_channel_name(str(message.channel.id))
+            if own_name and ((channels_config.get("channels", {}).get(own_name) or {})
+                             .get("reply_gate")):
+                self.reply_gate.note_message(
+                    message.channel.id, message.author.display_name,
+                    message.content, is_agent=True)
             return
 
         # Ignore messages from servers we aren't configured for
@@ -816,7 +929,9 @@ class DiscordAdapter(discord.Client):
             # A human spoke: the bot-to-bot budget refills.
             self.guest_budget.reset(message.channel.id)
 
-            if channel_config.get("reply_gate"):
+            raw_gate = channel_config.get("reply_gate")
+            if raw_gate:
+                gate_cfg = reply_gate_config.parse(raw_gate)
                 replied_to = None
                 ref = getattr(message, "reference", None)
                 resolved = getattr(ref, "resolved", None) if ref else None
@@ -831,6 +946,20 @@ class DiscordAdapter(discord.Client):
                     agent_ids=agent_ids,
                     agent_names=list(agent_config.keys()),
                 )
+                if verdict == "ask" and gate_cfg.classifier and (message.content or "").strip():
+                    verdict, reason = await self.reply_gate.tier2(
+                        channel_id=message.channel.id,
+                        cfg=gate_cfg,
+                        agent_names=list(agent_config.keys()),
+                        author_name=message.author.display_name,
+                        content=message.content,
+                        db_path=WORKSPACE_ROOT / "data" / "memory" / "agent-server.db",
+                        on_cost=lambda cost: self.post_classifier_cost(
+                            channel_name, channel_config, cost),
+                    )
+                    await self.write_health_heartbeat()
+                self.reply_gate.note_message(
+                    message.channel.id, message.author.display_name, message.content)
                 if verdict != "engage":
                     log.info(
                         f"[gate] #{channel_name or message.channel.id} "
@@ -1533,14 +1662,31 @@ class DiscordAdapter(discord.Client):
         with open(log_file, "a") as f:
             f.write(json.dumps(entry) + "\n")
 
+    async def post_classifier_cost(self, channel_name, channel_config, cost):
+        """Record a classifier call's dollars under the channel's agent id."""
+        route = routing.route_message(
+            registry_obj, channel_name, None, False,
+            channel_opt_out=channel_config.get("route") is False,
+        ) if registry_obj is not None and channel_name else None
+        if route is None:
+            return
+        ok, detail, _ = await self.agent_server_post_json(
+            "/cost", {"agent": route.agent, "cost_delta": cost})
+        if not ok:
+            log.debug("classifier /cost failed: %s", detail)
+
     async def write_health_heartbeat(self):
         """Write health heartbeat"""
-        HEALTH_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(HEALTH_FILE, "w") as f:
-            json.dump({
-                "timestamp": datetime.now().isoformat(),
-                "status": "healthy"
-            }, f)
+        try:
+            HEALTH_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with open(HEALTH_FILE, "w") as f:
+                json.dump({
+                    "timestamp": datetime.now().isoformat(),
+                    "status": "healthy",
+                    "reply_gate": dict(self.reply_gate.stats),
+                }, f)
+        except OSError as e:
+            log.debug("health heartbeat failed: %s", e)
 
     async def close(self):
         """Cleanup on shutdown"""
