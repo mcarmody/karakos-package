@@ -134,6 +134,28 @@ def test_call_row_claimed_alone_and_expired_call_replies(ags):
     run(go2())
 
 
+def test_reply_row_is_never_claimed_and_is_reaped(ags):
+    """A reply row (call_id set, reply_to_agent NULL) is read by the waiting
+    caller, never run as a turn (step 2.3); unconsumed ones are skipped."""
+    async def go():
+        await ags.init_db()
+        db = ags.db
+        await add(db, "a", 1, call_id="c1", reply_to=None, created="2026-01-01 00:00:00")
+        await add(db, "a", 2)
+        batch = await msgqueue.claim_batch(db, "a", 20)
+        assert [r["message_id"] for r in batch] == ["ma2"]  # ordinary row only
+        assert await msgqueue.claim_batch(db, "a", 20) == []
+        # fresh reply rows survive the reaper; old ones are skipped
+        assert await msgqueue.reap_hive_rows(db, 1767225600 + 60, 600) == 0
+        assert await msgqueue.reap_hive_rows(db, 1767225600 + 700, 600) == 1
+        async with db.execute("SELECT processed, response FROM message_queue"
+                              " WHERE message_id='ma1'") as c:
+            row = await c.fetchone()
+        assert (row["processed"], row["response"]) == (msgqueue.STATUS_SKIPPED, "stale")
+        await db.close()
+    run(go())
+
+
 def test_release_and_partial(ags):
     async def go():
         await ags.init_db()

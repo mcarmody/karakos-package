@@ -17,6 +17,13 @@ parent_tool_use_id (for the text event), result_usage (the closing
 result's usage; defaults to `usage`, as the real CLI sums across calls). Templates in `text`: {{text}} echoes
 the user's input, {{env:NAME}} reads an environment variable.
 
+`mcp: [{"tool": "hive_call", "args": {...}}]` (step 2.3) runs mcp/tools-server.py
+once per entry in this process's environment, over the real JSON-RPC handshake,
+emits the tool_use/tool_result events (`mcp__karakos-tools__<tool>`) and blocks
+until the tool answers. Results are available to `text` as {{mcp:0}} (the raw
+tool result text) and {{mcp:0.answer}} (a field of its JSON). Rules may match
+on `agent` and/or `shard` (regexes on KARAKOS_SHARD, else KARAKOS_AGENT).
+
 Queued-stdin mode (step 0.3b) -- on only with `--replay-user-messages` or
 FAKE_CLAUDE_QUEUED=1; otherwise the fake behaves exactly as above. It replays
 the behaviour recorded from the real CLI (tests/harness/fixtures/real-cli):
@@ -38,6 +45,7 @@ import os
 import queue
 import re
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -73,11 +81,33 @@ def emit(event):
     sys.stdout.flush()
 
 
+def _mcp_value(results, key):
+    """{{mcp:N}} or {{mcp:N.field}} against the list of tool result texts."""
+    ref, _, field = key[4:].partition(".")
+    try:
+        raw = results[int(ref)]
+    except (ValueError, IndexError):
+        return None
+    if not field:
+        return raw
+    try:
+        value = json.loads(raw)
+        for part in field.split("."):
+            value = value[part]
+    except (ValueError, KeyError, TypeError, IndexError):
+        return ""
+    return value if isinstance(value, str) else json.dumps(value)
+
+
 def render(template, text, extra=None):
     def sub(m):
         key = m.group(1).strip()
         if key == "text":
             return text
+        if key.startswith("mcp:") and extra and "mcp" in extra:
+            value = _mcp_value(extra["mcp"], key)
+            if value is not None:
+                return value
         if extra and key in extra:
             return extra[key]
         if key.startswith("env:"):
@@ -96,10 +126,12 @@ def load_script():
 
 def pick_step(script, text):
     # A rule's "agent" regex is matched against the shard id (the agent id for a
-    # default shard).
+    # default shard); "shard" is the same match under its 2.3 name.
     agent = os.environ.get("KARAKOS_SHARD") or os.environ.get("KARAKOS_AGENT", "")
     for rule in script.get("rules", []):
         if rule.get("agent") and not re.search(rule["agent"], agent):
+            continue
+        if rule.get("shard") and not re.search(rule["shard"], agent):
             continue
         if re.search(rule["match"], text):
             return rule["step"]
@@ -111,6 +143,70 @@ def user_text(event):
     if isinstance(content, list):
         return "".join(b.get("text", "") for b in content if isinstance(b, dict))
     return content
+
+
+TOOLS_SERVER = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__)))), "mcp", "tools-server.py")
+
+
+def run_mcp(entries, sid, n, emit_fn):
+    """Run each {"tool", "args"} against a fresh tools-server process (real
+    initialize handshake), emitting tool_use/tool_result events through
+    `emit_fn`. Blocks while the tool blocks. Returns the result texts."""
+    results = []
+    for i, entry in enumerate(entries):
+        tool_id = f"toolu_mcp_{n}_{i}"
+        name = f"mcp__karakos-tools__{entry['tool']}"
+        emit_fn({"type": "assistant", "session_id": sid, "parent_tool_use_id": None,
+                 "message": {"id": f"msg_{sid[:8]}_{n}_mcp{i}", "role": "assistant",
+                             "content": [{"type": "tool_use", "id": tool_id,
+                                          "name": name, "input": entry.get("args", {})}],
+                             "usage": DEFAULT_USAGE}})
+        env = dict(os.environ)
+        url_file = os.path.join(os.environ.get("FAKE_CLAUDE_LOG_DIR", ""), "server-url")
+        if os.path.isfile(url_file):  # written by the harness once the port is known
+            with open(url_file) as f:
+                env["AGENT_SERVER_URL"] = f.read().strip()
+        proc = subprocess.Popen([sys.executable, TOOLS_SERVER], stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                text=True, env=env)
+        text, is_error = "", False
+        try:
+            for req in (
+                {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                    "protocolVersion": "2025-03-26", "capabilities": {},
+                    "clientInfo": {"name": "fake-claude", "version": VERSION}}},
+                {"jsonrpc": "2.0", "method": "notifications/initialized"},
+                {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+                    "name": entry["tool"], "arguments": entry.get("args", {})}},
+            ):
+                proc.stdin.write(json.dumps(req) + "\n")
+                proc.stdin.flush()
+            while True:
+                line = proc.stdout.readline()
+                if not line:
+                    text, is_error = "tools server exited", True
+                    break
+                msg = json.loads(line)
+                if msg.get("id") == 2:
+                    if "error" in msg:
+                        text, is_error = msg["error"].get("message", "error"), True
+                    else:
+                        text = msg["result"]["content"][0]["text"]
+                    break
+        finally:
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+            proc.wait(timeout=10)
+        results.append(text)
+        block = {"type": "tool_result", "tool_use_id": tool_id, "content": text}
+        if is_error:
+            block["is_error"] = True
+        emit_fn({"type": "user", "session_id": sid, "parent_tool_use_id": None,
+                 "message": {"role": "user", "content": [block]}})
+    return results
 
 
 SLICE_S = 0.02
@@ -377,8 +473,10 @@ class Queued:
             self.interrupted_events()
             self.finish(step, text, started, "", len(tools), aborted=True)
             return None
+        mcp_out = run_mcp(step.get("mcp") or [], self.sid, n, self.out)
         reply = render(step.get("text", "ok"), text,
-                       {"queued": queued_text, "system_prompt": self.system_prompt})
+                       {"queued": queued_text, "system_prompt": self.system_prompt,
+                        "mcp": mcp_out})
         self.assistant(f"{mid}_t", {"type": "text", "text": reply}, usage)
         if step.get("exit"):
             sys.exit(1)
@@ -468,7 +566,8 @@ def main():
             time.sleep(step["delay_ms"] / 1000.0)
 
         usage = step.get("usage") or DEFAULT_USAGE
-        reply = render(step.get("text", "ok"), text)
+        mcp_out = run_mcp(step.get("mcp") or [], sid, n_msg, emit)
+        reply = render(step.get("text", "ok"), text, {"mcp": mcp_out})
         ptu = step.get("parent_tool_use_id")
         emit({"type": "assistant", "session_id": sid, "parent_tool_use_id": ptu,
               "message": {"id": f"msg_{sid[:8]}_{n_msg}_t", "role": "assistant",

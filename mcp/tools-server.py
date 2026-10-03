@@ -369,6 +369,61 @@ CORE_TOOLS = [
             "required": ["question", "options"]
         }
     },
+    {
+        "name": "buzz",
+        "description": (
+            "Leave a message for another shard (an agent id or a shard id) and "
+            "carry on. Use it for anything the other shard can do later without "
+            "you; you will not see a result. The recipient handles it as an "
+            "ordinary turn. Buzzes nest at most two deep and at most five per turn."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "to": {
+                    "type": "string",
+                    "description": "Agent id or shard id to message",
+                    "path_mode": "none"
+                },
+                "message": {
+                    "type": "string",
+                    "description": "What the other shard should know or do",
+                    "path_mode": "none"
+                }
+            },
+            "required": ["to", "message"]
+        }
+    },
+    {
+        "name": "hive_call",
+        "description": (
+            "Ask another shard (an agent id or a shard id) a question and wait "
+            "for its answer. This blocks your turn until the answer arrives; use "
+            "it only when you cannot continue without it, otherwise use buzz. "
+            "Calls nest at most two deep; a shard cannot call itself or one that "
+            "is already waiting on it."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "to": {
+                    "type": "string",
+                    "description": "Agent id or shard id to ask",
+                    "path_mode": "none"
+                },
+                "question": {
+                    "type": "string",
+                    "description": "The question; the callee answers in one brief reply",
+                    "path_mode": "none"
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Seconds to wait (default 120, clamped to 5..900)"
+                }
+            },
+            "required": ["to", "question"]
+        }
+    },
 ]
 
 
@@ -624,11 +679,104 @@ def ask_user(args: dict, sleep=time.sleep, monotonic=time.monotonic) -> dict:
         sleep(ASK_POLL_INTERVAL_SEC)
 
 
+def _hive_identity():
+    return KARAKOS_SHARD or KARAKOS_AGENT
+
+
+def _hive_refusal(status: int, body: dict) -> dict:
+    if status == 0:
+        return {"status": "error", "error": "server_unreachable"}
+    out = {"status": "error", "error": body.get("error") or f"agent server returned {status}"}
+    if body.get("detail"):
+        out["detail"] = body["detail"]
+    return out
+
+
+def buzz(args: dict) -> dict:
+    """Leave a message for another shard. Never blocks, never raises."""
+    me = _hive_identity()
+    if not me:
+        return {"status": "error", "error": "no_identity"}
+    status, body = agent_server_request("POST", "/hive/buzz", {
+        "from": me, "to": args.get("to", ""), "message": args.get("message", "")})
+    if status == 202:
+        return {"status": "queued", "to": body.get("to"),
+                "message_id": body.get("message_id")}
+    return _hive_refusal(status, body)
+
+
+HIVE_POLL_WAIT_SEC = 20
+HIVE_UNREACHABLE_LIMIT = 3
+
+
+def hive_call(args: dict, monotonic=time.monotonic) -> dict:
+    """Ask another shard a question and block until it answers.
+
+    Same shape as ask_user: the turn is suspended inside this tool call and the
+    answer arrives as the tool result. The server owns every deadline; the
+    local guard below only stops a loop whose server went silent."""
+    me = _hive_identity()
+    if not me:
+        return {"status": "error", "error": "no_identity"}
+    payload = {"from": me, "to": args.get("to", ""), "question": args.get("question", "")}
+    if args.get("timeout") is not None:
+        payload["timeout"] = args["timeout"]
+    status, body = agent_server_request("POST", "/hive/call", payload)
+    if status != 202:
+        return _hive_refusal(status, body)
+    call_id = body.get("call_id")
+    try:
+        budget = min(900.0, max(5.0, float(args.get("timeout") or 120)))
+    except (TypeError, ValueError):
+        budget = 120.0
+    give_up = monotonic() + budget + 60.0
+    unreachable = 0
+    while True:
+        status, body = agent_server_request(
+            "GET", f"/hive/call/{call_id}?wait={HIVE_POLL_WAIT_SEC}",
+            timeout=HIVE_POLL_WAIT_SEC + 10)
+        if status == 0:
+            unreachable += 1
+            if unreachable >= HIVE_UNREACHABLE_LIMIT:
+                return {"status": "error", "error": "server_unreachable"}
+            time.sleep(1.0)
+            continue
+        unreachable = 0
+        state = body.get("status")
+        if status == 200 and state == "answered":
+            out = {"status": "answered", "answer": body.get("answer"),
+                   "from": body.get("from")}
+            if body.get("truncated"):
+                out["truncated"] = True
+            return out
+        if status == 200 and state == "timeout":
+            return {"status": "timeout", "error": "The callee did not answer in time; "
+                    "decide without it or ask again."}
+        if status == 200 and state in ("expired", "error"):
+            out = {"status": state, "error": body.get("error")}
+            if body.get("detail"):
+                out["detail"] = body["detail"]
+            return out
+        if status == 404:
+            return {"status": "error", "error": "unknown_call",
+                    "detail": "the server no longer knows this call (restarted?)"}
+        if status != 200:
+            return _hive_refusal(status, body)
+        if monotonic() >= give_up:
+            return {"status": "timeout", "error": "Timed out waiting for an answer."}
+
+
 def handle_core_tool(tool_name: str, args: dict) -> dict:
     """Handle built-in core tools."""
 
     if tool_name == "ask_user":
         return ask_user(args)
+
+    if tool_name == "buzz":
+        return buzz(args)
+
+    if tool_name == "hive_call":
+        return hive_call(args)
 
     if tool_name == "workspace":
         action = args.get("action", "status")

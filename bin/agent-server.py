@@ -37,6 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 # lib/ is a package root for lib.migrate (the schema-stamp guard).
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import ask_handler  # noqa: E402
+import hive as hive_lib  # noqa: E402
 import msgqueue  # noqa: E402
 import registry as agent_registry  # noqa: E402
 import prompt_compose  # noqa: E402
@@ -918,6 +919,8 @@ async def stderr_reader(shard: str, proc: asyncio.subprocess.Process):
 
 async def kill_agent_subprocess(shard: str):
     """Terminate agent subprocess"""
+    # A killed caller cannot be waiting on a hive call (step 2.3).
+    await hive_cancel_caller(shard)
     proc = agent_processes.get(shard)
     if not proc:
         return
@@ -1037,6 +1040,16 @@ async def respawn_watcher(shard: str, proc: asyncio.subprocess.Process):
         # Someone else already replaced this process; its lifecycle is theirs.
         if agent_processes.get(shard) is not proc:
             return
+
+        # A call row the dead process was answering will never get a reply.
+        try:
+            await db.execute(
+                "UPDATE message_queue SET processed = ? WHERE agent = ? AND processed = ?"
+                " AND call_id IS NOT NULL AND reply_to_agent IS NOT NULL",
+                (STATUS_CRASHED, shard, STATUS_IN_PROGRESS))
+            await db.commit()
+        except Exception as e:
+            log.warning(f"hive crash mark for {shard} failed: {e}")
 
         # Crashloop brake. A subprocess that dies immediately on spawn — bad
         # model name, missing MCP binary, unreadable settings file — would
@@ -3043,6 +3056,393 @@ async def handle_cost_conversations(request):
     return web.json_response({"conversations": conversations})
 
 # =============================================================================
+# Hive: buzz and hive call (step 2.3). The rules live in lib/hive.py.
+# =============================================================================
+
+_hive_last_reap = 0.0
+_HIVE_STATUS = {"unknown_caller": 404, "unknown_target": 404, "depth_exceeded": 409,
+                "self_call": 409, "deadlock": 409, "no_available_shard": 409,
+                "callee_paused": 409, "caller_not_in_turn": 409, "buzz_limit": 429,
+                "queue_full": 503}
+_HIVE_DETAIL = {
+    "self_call": "A shard cannot call itself; answer directly, or use buzz (which "
+                 "does not block) to leave yourself a message.",
+    "deadlock": "The target is already waiting, directly or through other calls, "
+                "on you; the call would never start. Decide without it or use buzz.",
+    "depth_exceeded": f"Hive calls and buzzes nest at most {hive_lib.HIVE_MAX_DEPTH} deep.",
+    "buzz_limit": f"At most {hive_lib.HIVE_MAX_BUZZ_PER_TURN} buzzes per turn.",
+    "caller_not_in_turn": "A hive call needs a running turn to suspend.",
+}
+
+
+def _hive_err(code, detail=None, **extra):
+    body = {"error": code, **extra}
+    detail = detail or _HIVE_DETAIL.get(code)
+    if detail:
+        body["detail"] = detail
+    return web.json_response(body, status=_HIVE_STATUS.get(code, 400))
+
+
+async def _hive_body(request):
+    try:
+        data = await request.json()
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+async def _hive_insert(row: dict, ignore: bool = False) -> bool:
+    cols = list(row)
+    cur = await db.execute(
+        f"INSERT {'OR IGNORE ' if ignore else ''}INTO message_queue "
+        f"({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
+        tuple(row[c] for c in cols))
+    n = cur.rowcount
+    await cur.close()
+    await db.commit()
+    return n > 0
+
+
+async def _hive_maybe_reap():
+    """Skip stale unconsumed reply rows; at most once a minute."""
+    global _hive_last_reap
+    now = time.time()
+    if now - _hive_last_reap < 60:
+        return
+    _hive_last_reap = now
+    await msgqueue.reap_hive_rows(db, now, hive_lib.HIVE_REPLY_TTL_S)
+
+
+async def hive_cancel_call(call_id: str):
+    """The caller gave up (or its turn ended): forget the call and skip its row
+    if the callee has not started it. A started row finishes; its reply is late."""
+    STATE.hive.open.pop(call_id, None)
+    cur = await db.execute(
+        "UPDATE message_queue SET processed = ?, response = 'cancelled',"
+        " processed_at = CURRENT_TIMESTAMP"
+        " WHERE call_id = ? AND reply_to_agent IS NOT NULL AND processed = ?",
+        (STATUS_SKIPPED, call_id, STATUS_QUEUED))
+    await cur.close()
+    await db.commit()
+
+
+async def hive_cancel_caller(shard: str):
+    """Close every open call whose caller is `shard` (its turn is over)."""
+    try:
+        for cid in STATE.hive.calls_of(shard):
+            await hive_cancel_call(cid)
+    except Exception as e:
+        log.warning(f"hive cancel for {shard} failed: {type(e).__name__}: {e}")
+
+
+def hive_on_turn_start(shard, batch):
+    STATE.hive.buzzes_this_turn[shard] = 0
+
+
+async def hive_on_turn_end(shard, result):
+    rows = result.batch.rows
+    first = rows[0] if rows else None
+    if first is not None and hive_lib.is_call_row(first):
+        result.suppress_post = True
+        cid = first["call_id"]
+        oc = STATE.hive.open.get(cid)
+        dur = int((time.time() - oc.started) * 1000) if oc else None
+        md = result.metadata or {}
+        if md.get("is_error"):
+            body = hive_lib.error_body(cid, "callee_error",
+                                       (result.response_text or "")[:500])
+        elif not md:
+            body = hive_lib.error_body(cid, "callee_failed",
+                                       "the callee's turn ended without a result")
+        else:
+            body = hive_lib.answer_body(cid, result.response_text, dur)
+        row = hive_lib.reply_row(first, body)
+        if oc is None:
+            row["processed"] = STATUS_SKIPPED
+            row["response"] = "late"
+        await _hive_insert(row, ignore=True)
+        msgqueue.notify(first["reply_to_agent"])
+    await hive_cancel_caller(shard)
+
+
+def _hive_known(name):
+    """A shard id (an agent id selects the agent's first shard) or None."""
+    return shards_lib.first_shard(effective_specs(), name) if isinstance(name, str) else None
+
+
+async def _hive_queue_counts() -> Dict[str, int]:
+    async with db.execute(
+        "SELECT agent, COUNT(*) AS n FROM message_queue WHERE processed = ?"
+        " GROUP BY agent", (STATUS_QUEUED,)) as cur:
+        return {r["agent"]: r["n"] for r in await cur.fetchall()}
+
+
+def _hive_pick(to, caller, kind, counts):
+    specs = effective_specs()
+    states = {s.id: agent_states.get(s.id, "IDLE") for s in specs}
+    return hive_lib.pick_callee(specs, to, caller, states, counts,
+                                STATE.hive.waits_for(), kind=kind)
+
+
+def _hive_unknown_detail():
+    return "known targets: " + ", ".join(sorted(
+        {s.agent for s in effective_specs()} | {s.id for s in effective_specs()}))
+
+
+async def handle_hive_buzz(request):
+    """POST /hive/buzz {from, to, message}: leave another shard a message."""
+    if not _bearer_ok(request):
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    data = await _hive_body(request)
+    if data is None:
+        return web.json_response({"error": "Invalid JSON"}, status=400)
+    await _hive_maybe_reap()
+    caller = _hive_known(data.get("from"))
+    if not caller:
+        return _hive_err("unknown_caller")
+    message = data.get("message")
+    if (not isinstance(message, str) or not message.strip()
+            or len(message) > hive_lib.HIVE_MAX_QUESTION_CHARS):
+        return web.json_response(
+            {"error": "invalid_message",
+             "detail": f"message must be 1 to {hive_lib.HIVE_MAX_QUESTION_CHARS} characters"},
+            status=400)
+    turn = STATE.active_turns.get(caller)
+    depth = hive_lib.next_depth(turn.rows) if turn else 1
+    if depth > hive_lib.HIVE_MAX_DEPTH:
+        return _hive_err("depth_exceeded")
+    hs = STATE.hive
+    if hs.buzzes_this_turn.get(caller, 0) >= hive_lib.HIVE_MAX_BUZZ_PER_TURN:
+        return _hive_err("buzz_limit")
+    counts = await _hive_queue_counts()
+    callee, err = _hive_pick(data.get("to"), caller, "buzz", counts)
+    if err:
+        return _hive_err(err, _hive_unknown_detail() if err == "unknown_target" else None)
+    if counts.get(callee, 0) >= QUEUE_DEPTH_LIMIT:
+        return _hive_err("queue_full")
+    row = hive_lib.buzz_row(label_of(caller), callee, spec_of(callee).agent, message, depth)
+    await _hive_insert(row)
+    hs.buzzes_this_turn[caller] = hs.buzzes_this_turn.get(caller, 0) + 1
+    msgqueue.notify(callee)
+    turn_loop.notify_enqueued(STATE, callee, "0")
+    return web.json_response({"status": "queued", "to": callee,
+                              "message_id": row["message_id"]}, status=202)
+
+
+async def handle_hive_call_create(request):
+    """POST /hive/call {from, to, question, timeout?}: a blocking question."""
+    if not _bearer_ok(request):
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    data = await _hive_body(request)
+    if data is None:
+        return web.json_response({"error": "Invalid JSON"}, status=400)
+    await _hive_maybe_reap()
+    hs = STATE.hive
+    hs.prune()
+    caller = _hive_known(data.get("from"))
+    if not caller:
+        return _hive_err("unknown_caller")
+    if agent_states.get(caller) != "PROCESSING":
+        return _hive_err("caller_not_in_turn")
+    question = data.get("question")
+    if (not isinstance(question, str) or not question.strip()
+            or len(question) > hive_lib.HIVE_MAX_QUESTION_CHARS):
+        return web.json_response(
+            {"error": "invalid_question",
+             "detail": f"question must be 1 to {hive_lib.HIVE_MAX_QUESTION_CHARS} characters"},
+            status=400)
+    timeout = hive_lib.clamp_timeout(data.get("timeout", hive_lib.HIVE_DEFAULT_TIMEOUT_S))
+    turn = STATE.active_turns.get(caller)
+    depth = hive_lib.next_depth(turn.rows) if turn else 1
+    if depth > hive_lib.HIVE_MAX_DEPTH:
+        return _hive_err("depth_exceeded")
+    counts = await _hive_queue_counts()
+    callee, err = _hive_pick(data.get("to"), caller, "call", counts)
+    if err:
+        return _hive_err(err, _hive_unknown_detail() if err == "unknown_target" else None)
+    if counts.get(callee, 0) >= QUEUE_DEPTH_LIMIT:
+        return _hive_err("queue_full")
+    call_id = hive_lib.new_call_id()
+    now = time.time()
+    row = hive_lib.call_row(call_id, caller, label_of(caller), callee,
+                            spec_of(callee).agent, question, depth, timeout, now)
+    hs.open[call_id] = hive_lib.OpenCall(caller, callee, depth, now + timeout, now)
+    try:
+        await _hive_insert(row)
+    except Exception:
+        hs.open.pop(call_id, None)
+        raise
+    msgqueue.notify(callee)
+    turn_loop.notify_enqueued(STATE, callee, "0")
+    return web.json_response(
+        {"call_id": call_id, "to": callee, "depth": depth,
+         "deadline": msgqueue.utc_iso(now + timeout)}, status=202)
+
+
+async def _hive_fetch(sql, params=()):
+    async with db.execute(sql, params) as cur:
+        return await cur.fetchall()
+
+
+def _hive_reply_view(call, reply):
+    """The GET /hive/call/{id} body for a reply row."""
+    body = hive_lib.parse_body(reply["content"])
+    cid = call["call_id"]
+    err = body.get("error")
+    if not err:
+        return {"status": "answered", "answer": body.get("answer", ""),
+                "from": call["agent"], "call_id": cid,
+                "duration_ms": body.get("duration_ms"),
+                **({"truncated": True} if body.get("truncated") else {})}
+    out = {"status": "expired" if err == "expired" else "error", "error": err,
+           "call_id": cid}
+    if body.get("detail"):
+        out["detail"] = body["detail"]
+    return out
+
+
+async def handle_hive_call_get(request):
+    """GET /hive/call/{call_id}?wait=<s>: long poll for the caller."""
+    if not _bearer_ok(request):
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    cid = request.match_info["call_id"]
+    try:
+        wait = max(0.0, float(request.query.get("wait", "0")))
+    except ValueError:
+        wait = 0.0
+    wait = min(wait, hive_lib.HIVE_POLL_WAIT_S)
+    hs = STATE.hive
+    hs.prune()
+    calls = await _hive_fetch(
+        "SELECT * FROM message_queue WHERE call_id = ? AND reply_to_agent IS NOT NULL"
+        " ORDER BY id LIMIT 1", (cid,))
+    if not calls:
+        return web.json_response({"error": "unknown_call"}, status=404)
+    call = calls[0]
+    caller, callee = call["reply_to_agent"], call["agent"]
+    oc = hs.open.get(cid)
+    exp = hive_lib._epoch(call["expires_at"])
+    deadline = (oc.deadline if oc else (exp or time.time())) + hive_lib.HIVE_DEADLINE_SLACK_S
+    wait_end = time.time() + wait
+    while True:
+        # Produce 1.2's expiry reply even while the callee is busy in a turn
+        # (claim_batch is the only other place expire runs).
+        await msgqueue.expire(db, callee)
+        replies = await _hive_fetch(
+            "SELECT * FROM message_queue WHERE call_id = ? AND reply_to_agent IS NULL"
+            " AND processed IN (?, ?) ORDER BY id LIMIT 1",
+            (cid, STATUS_QUEUED, STATUS_COMPLETE))
+        if replies:
+            reply = replies[0]
+            if reply["processed"] == STATUS_QUEUED:
+                await db.execute(
+                    "UPDATE message_queue SET processed = ?,"
+                    " processed_at = CURRENT_TIMESTAMP WHERE id = ? AND processed = ?",
+                    (STATUS_COMPLETE, reply["id"], STATUS_QUEUED))
+                await db.commit()
+            hs.open.pop(cid, None)
+            return web.json_response(_hive_reply_view(call, reply))
+        fresh = (await _hive_fetch(
+            "SELECT processed, response FROM message_queue WHERE id = ?",
+            (call["id"],)))[0]
+        proc, resp = fresh["processed"], fresh["response"]
+        if proc == STATUS_CRASHED:
+            hs.open.pop(cid, None)
+            return web.json_response({"status": "error", "error": "callee_failed",
+                                      "call_id": cid})
+        if proc == STATUS_SKIPPED and resp != "expired":
+            hs.open.pop(cid, None)
+            return web.json_response({"status": "error", "error": "cancelled",
+                                      "call_id": cid})
+        if proc in (STATUS_QUEUED, STATUS_IN_PROGRESS) and cid not in hs.open:
+            return web.json_response({"status": "error", "error": "cancelled",
+                                      "call_id": cid})
+        now = time.time()
+        if now >= deadline:
+            await hive_cancel_call(cid)
+            return web.json_response({"status": "timeout", "call_id": cid})
+        if now >= wait_end:
+            return web.json_response({"status": "pending", "call_id": cid})
+        slice_s = min(wait_end - now, deadline - now,
+                      0.25 if proc == STATUS_QUEUED else hive_lib.HIVE_POLL_WAIT_S)
+        await msgqueue.wait_for_work(caller, max(0.05, slice_s))
+
+
+async def handle_hive_call_cancel(request):
+    """POST /hive/call/{call_id}/cancel."""
+    if not _bearer_ok(request):
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    await hive_cancel_call(request.match_info["call_id"])
+    return web.json_response({"status": "cancelled"})
+
+
+async def handle_hive_calls(request):
+    """GET /hive/calls: the call log (docs/hive-call-log.md)."""
+    if not _bearer_ok(request):
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    await _hive_maybe_reap()
+    STATE.hive.prune()
+    q = request.query
+    try:
+        limit = max(1, min(500, int(q.get("limit", "100"))))
+    except ValueError:
+        limit = 100
+    where, params = ["call_id IS NOT NULL", "reply_to_agent IS NOT NULL"], []
+    if q.get("shard"):
+        where.append("(agent = ? OR reply_to_agent = ?)")
+        params += [q["shard"], q["shard"]]
+    if q.get("since"):
+        where.append("created_at >= ?")
+        params.append(q["since"].replace("T", " ").rstrip("Z"))
+    status_filter = q.get("status")
+    sql = ("SELECT * FROM message_queue WHERE " + " AND ".join(where)
+           + " ORDER BY created_at DESC, id DESC")
+    if not status_filter:
+        sql += " LIMIT ?"
+        params.append(limit)
+    calls = await _hive_fetch(sql, tuple(params))
+    replies = {}
+    if calls:
+        ids = [c["call_id"] for c in calls]
+        for r in await _hive_fetch(
+                "SELECT * FROM message_queue WHERE reply_to_agent IS NULL AND call_id IN"
+                f" ({','.join('?' * len(ids))}) ORDER BY id", tuple(ids)):
+            replies.setdefault(r["call_id"], r)
+    specs = effective_specs()
+    now = time.time()
+    out = []
+    for c in calls:
+        reply = replies.get(c["call_id"])
+        status = hive_lib.call_status(c, reply, c["call_id"] in STATE.hive.open, now)
+        if status_filter and status != status_filter:
+            continue
+        out.append(hive_lib.log_entry(c, reply, status, specs))
+        if len(out) >= limit:
+            break
+    return web.json_response({"calls": out})
+
+
+async def hive_startup_sweep():
+    """A restart killed every shard subprocess: no caller waits on a queued call
+    or reply, so none may run later."""
+    cur = await db.execute(
+        "UPDATE message_queue SET processed = ?, response = 'abandoned',"
+        " processed_at = CURRENT_TIMESTAMP"
+        " WHERE call_id IS NOT NULL AND processed = ?",
+        (STATUS_SKIPPED, STATUS_QUEUED))
+    await cur.close()
+    await db.commit()
+    await msgqueue.reap_hive_rows(db, time.time(), hive_lib.HIVE_REPLY_TTL_S)
+
+
+def register_hive_hooks():
+    for name, fn in (("on_turn_start", hive_on_turn_start),
+                     ("on_turn_end", hive_on_turn_end)):
+        if fn not in getattr(STATE.hooks, name):
+            STATE.hooks.register(name, fn)
+
+
+# =============================================================================
 # Graceful Shutdown
 # =============================================================================
 
@@ -3283,6 +3683,8 @@ async def startup(app):
 
     # Crash recovery
     await crash_recovery()
+    await hive_startup_sweep()
+    register_hive_hooks()
 
     # Start shard subprocesses, one at a time in plan order.
     for sid in STATE.shard_ids():
@@ -3353,6 +3755,11 @@ def create_app(with_lifecycle: bool = True) -> web.Application:
     app.router.add_post("/ask", handle_ask_create)
     app.router.add_get("/ask/{ask_id}", handle_ask_status)
     app.router.add_post("/ask/{ask_id}/answer", handle_ask_answer)
+    app.router.add_post("/hive/buzz", handle_hive_buzz)
+    app.router.add_post("/hive/call", handle_hive_call_create)
+    app.router.add_get("/hive/call/{call_id}", handle_hive_call_get)
+    app.router.add_post("/hive/call/{call_id}/cancel", handle_hive_call_cancel)
+    app.router.add_get("/hive/calls", handle_hive_calls)
 
     # Register startup/shutdown handlers
     if with_lifecycle:

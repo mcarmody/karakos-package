@@ -27,7 +27,8 @@ DEFAULT_TOKEN = "harness-token"
 sys.path.insert(0, str(PACKAGE_ROOT))  # lib.migrate
 
 _ENV_KEYS = ("PATH", "WORKSPACE_ROOT", "AGENT_SERVER_TOKEN", "FAKE_CLAUDE_LOG_DIR",
-             "FAKE_CLAUDE_SCRIPT", "DISCORD_BOT_TOKEN", "OWNER_DISCORD_ID")
+             "FAKE_CLAUDE_SCRIPT", "DISCORD_BOT_TOKEN", "OWNER_DISCORD_ID",
+             "AGENT_SERVER_URL")
 
 
 FAKE_ENV_KEYS = ("FAKE_CLAUDE_LOG_DIR", "FAKE_CLAUDE_SCRIPT", "FAKE_CLAUDE_QUEUED",
@@ -114,6 +115,13 @@ class Harness:
         self.module.post_to_discord = self._record_discord
         self.client = TestClient(TestServer(self.module.create_app(), host="127.0.0.1"))
         await self.client.start_server()
+        # The ephemeral port is only known now, after the shards have spawned, so
+        # the fake's MCP tools server reads the base URL from this file (and a
+        # respawned shard inherits it through AGENT_SERVER_URL). Step 2.3.
+        url = str(self.client.make_url("/")).rstrip("/")
+        os.environ["AGENT_SERVER_URL"] = url
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        (self.log_dir / "server-url").write_text(url)
         return self
 
     async def stop(self):
@@ -163,6 +171,13 @@ class Harness:
         resp = await self.client.post(f"/agents/{agent}/interrupt",
                                       headers=self._headers())
         return await resp.json()
+
+    async def hive_calls(self, **filters):
+        """The `calls` list of GET /hive/calls (limit, since, shard, status)."""
+        resp = await self.client.get("/hive/calls", headers=self._headers(),
+                                     params={k: str(v) for k, v in filters.items()})
+        assert resp.status == 200, await resp.text()
+        return (await resp.json())["calls"]
 
     async def wait_idle(self, agent, timeout=5):
         """Wait until `agent` is IDLE with nothing queued or in progress."""
