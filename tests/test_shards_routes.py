@@ -64,7 +64,8 @@ def test_agents_and_health_shapes(harness):
     assert [s["id"] for s in a["shards"]] == ["a", "a-2"]
     assert a["shards"][0]["is_default"] is True and a["shards"][1]["is_default"] is False
     assert set(a["shards"][1]) == {"id", "is_default", "state", "alive", "pid", "session_id",
-                                   "queue_depth", "context_tokens", "channels", "last_channel", "paused"}
+                                   "queue_depth", "context_tokens", "channels", "last_channel", "paused",
+                                       "stolen_total"}
     assert a["shards"][1]["state"] == "PROCESSING" and a["shards"][0]["state"] == "IDLE"
     assert a["shards"][1]["last_channel"] == "55"
     assert len(a["shards"][1]["session_id"]) == 8
