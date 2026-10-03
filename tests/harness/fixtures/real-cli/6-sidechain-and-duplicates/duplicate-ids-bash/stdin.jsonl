@@ -1,0 +1,1 @@
+{"t":0.001,"dir":"in","event":{"type":"user","message":{"role":"user","content":"Write a 60-word paragraph about tides, then use the Bash tool to run: echo hi"}}}
