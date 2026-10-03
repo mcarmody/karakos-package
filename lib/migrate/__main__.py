@@ -43,6 +43,11 @@ def main(argv=None) -> int:
         except backup.BackupError as e:
             print(e, file=sys.stderr)
             return EXIT_STEP_FAILED
+        # A restore is the operator's explicit choice: the interrupted-run
+        # marker must not later re-restore this (or an older) backup over
+        # whatever the restored install writes from now on.
+        from lib.migrate import runner
+        runner.clear_marker(Path(a.backup_to) if a.backup_to else root / "backups")
         print(f"restored from {a.to_backup}")
         return EXIT_OK
 

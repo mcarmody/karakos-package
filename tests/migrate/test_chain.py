@@ -303,6 +303,51 @@ def test_failed_step_then_rerun_succeeds(tmp_path, fake_embedder):
     assert rc == 0, lines
 
 
+
+def _failed_run(root, backups):
+    steps = runner.load_steps()
+    bad = runner.Step("30_sessions", 1, 2, lambda c: True,
+                      lambda c: (_ for _ in ()).throw(RuntimeError("boom")), lambda c: None)
+    steps = [bad if s.name == "30_sessions" else s for s in steps]
+    rc = runner.run(root / "data", root / "config", backups, steps=steps,
+                    out=lambda l: None, parity_queries=5)
+    assert rc == 1 and (backups / runner.MARKER).is_file()
+
+
+def test_explicit_restore_clears_the_marker(tmp_path, fake_embedder):
+    """After `--restore`, the restored install is the operator's: a later run
+    must not restore the old backup over what it has written since."""
+    from lib.migrate.__main__ import main
+    root = extract("v1.3", tmp_path)
+    backups = tmp_path / "backups"
+    _failed_run(root, backups)
+    prev = (backups / runner.MARKER).read_text().strip()
+    rc = main(["--root", str(root), "--backup-to", str(backups), "--to-backup", prev])
+    assert rc == 0
+    assert not (backups / runner.MARKER).exists()
+    (root / "data" / "written-after-restore.txt").write_text("keep me")
+    rc, lines = go(root, backups)
+    assert rc == 0, lines
+    assert not any("previous run did not finish" in l for l in lines)
+    assert (root / "data" / "written-after-restore.txt").read_text() == "keep me"
+
+
+def test_a_stale_marker_is_not_restored_automatically(tmp_path, fake_embedder):
+    root = extract("v1.3", tmp_path)
+    backups = tmp_path / "backups"
+    _failed_run(root, backups)
+    marker = backups / runner.MARKER
+    old = marker.stat().st_mtime - runner.MARKER_MAX_AGE_S - 60
+    os.utime(marker, (old, old))
+    (root / "data" / "written-later.txt").write_text("keep me")
+    rc, lines = go(root, backups)
+    assert rc != 0
+    assert any("--restore" in l for l in lines)
+    assert marker.is_file()
+    assert (root / "data" / "written-later.txt").read_text() == "keep me"
+    assert guard.read_stamp(root / "data") is None
+
+
 # -- 05_layout: compose, .env, import, keep-bind -------------------------------
 
 def test_compose_keeps_ports_and_project_name(tmp_path, fake_embedder):
@@ -444,3 +489,4 @@ def test_wrapper_restore_maps_to_to_backup(tmp_path):
     assert r.returncode == 0, r.stderr
     run = next(c for c in calls if " run " in c)
     assert "--to-backup /restore" in run
+    assert "--backup-to /backups" in run      # so the restore clears the marker there

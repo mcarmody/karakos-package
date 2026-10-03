@@ -1,6 +1,7 @@
 """Migrator core: detect, backup, run applicable steps, verify, stamp last."""
 import importlib
 import logging
+import time
 import pkgutil
 import re
 from dataclasses import dataclass, field
@@ -113,6 +114,14 @@ def unreferenced_env_report(config_dir) -> List[str]:
 
 
 MARKER = ".migration-in-progress"
+# An interrupted run is resumed by restoring its backup only while the marker is
+# fresh. Older than this, the install may have been run (restored by hand, or a
+# 1.x image started on it) and an automatic restore would discard that work.
+MARKER_MAX_AGE_S = 86400
+
+
+def clear_marker(root) -> None:
+    (Path(root) / MARKER).unlink(missing_ok=True)
 
 
 def _recover_interrupted(root: Path, data_dir: Path, config_dir: Path, out) -> bool:
@@ -123,6 +132,13 @@ def _recover_interrupted(root: Path, data_dir: Path, config_dir: Path, out) -> b
     if not marker.is_file():
         return True
     prev = Path(marker.read_text().strip())
+    age = time.time() - marker.stat().st_mtime
+    if age > MARKER_MAX_AGE_S:
+        out(f"a previous run did not finish {age / 3600:.0f} h ago (backup {prev}).")
+        out("not restoring it automatically: the install may have changed since.")
+        out(f"to start from that backup: karakos migrate --restore {prev}")
+        out(f"to keep the current files instead: delete {marker} and run again")
+        return False
     out(f"previous run did not finish; restoring {prev} first")
     try:
         backup_mod.restore(prev, data_dir=data_dir, config_dir=config_dir)

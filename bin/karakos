@@ -73,7 +73,7 @@ if [ -n "$RESTORE" ]; then
   "${DC[@]}" down
   src="$(cd "$RESTORE" && pwd)"
   # restore verifies the manifest first; --to-backup is the shipped flag
-  run_in_container -v "$src:/restore:ro" -- --to-backup /restore
+  run_in_container -v "$src:/restore:ro" -- --to-backup /restore --backup-to /backups
   echo "restored from $RESTORE; start the stack with: docker compose -f $COMPOSE_FILE up -d"
   exit 0
 fi
