@@ -23,6 +23,8 @@
   "tier2_review_required": [
     "bin/",
     "agents/templates/",
+    "agents/CORE.md",
+    "agents/HOUSE_STYLE.md",
     "mcp/tools-server.py"
   ],
   "unprotected_overrides": [
