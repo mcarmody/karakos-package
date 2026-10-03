@@ -148,3 +148,21 @@ def test_child_under_live_shard_is_not_an_orphan(tmp_path):
     finally:
         p.kill()
         p.wait()
+
+
+def test_tree_of_pid_1_or_an_ancestor_is_never_snapshotted():
+    """Regression, 2026-10-03: kill_agent_subprocess snapshotted a test double's
+    pid 1, and reap SIGKILLed the user's whole session."""
+    assert procreap.snapshot_tree(1) == {}
+    assert procreap.snapshot_tree(0) == {}
+    assert procreap.snapshot_tree("x") == {}
+    assert procreap.snapshot_tree(os.getppid()) == {}
+
+
+def test_reap_never_signals_an_ancestor_or_init_like(monkeypatch):
+    sent = []
+    monkeypatch.setattr(os, "kill", lambda *a: sent.append(a))
+    monkeypatch.setattr(os, "killpg", lambda *a: sent.append(a))
+    snap = {os.getppid(): procinfo.starttime(os.getppid())}
+    res = procreap.reap(snap, grace=0.1, sleep=lambda s: None)
+    assert sent == [] and res["termed"] == [] and res["killed"] == []

@@ -964,7 +964,10 @@ async def kill_agent_subprocess(shard: str):
     log.info(f"Killing {label_of(shard)} subprocess (PID {proc.pid})")
     # Snapshot the tree BEFORE signalling the root: once it dies its children
     # reparent to init and can no longer be found.
-    tree = procreap.snapshot_tree(proc.pid)
+    # Only a real child process of ours: a test double's pid (FakeProcess(pid=1))
+    # must never reach a real process-tree reap.
+    tree = (procreap.snapshot_tree(proc.pid)
+            if isinstance(proc, asyncio.subprocess.Process) else {})
     def _already_dead(exc: BaseException) -> bool:
         # The process exited between the lookup and the signal (or the
         # respawn watcher reaped it): nothing left to kill.
