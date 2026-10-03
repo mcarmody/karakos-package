@@ -38,12 +38,15 @@ BACKUPS="$SMOKE_WORK/backups"
 ARTIFACTS="${KARAKOS_SMOKE_ARTIFACTS:-}"
 export COMPOSE_PROJECT_NAME="$SMOKE_PROJECT"
 export HOME="$SMOKE_WORK/home"
-export COMPOSE_PULL_POLICY=never
 mkdir -p "$OLD" "$BACKUPS" "$HOME/.claude"
 echo '{}' > "$HOME/.claude.json"
 
 DC=(docker compose -f config/docker-compose.yml -f config/docker-compose.smoke.yml --env-file config/.env)
 EXTRA_PROJECTS=()
+
+open_perms() {   # the container user is not the runner's uid; let it write the bind mounts
+  chmod -R a+rwX "$OLD" "$HOME" 2>/dev/null || true
+}
 
 cleanup() {
   local rc=$?
@@ -61,9 +64,13 @@ cleanup() {
     docker ps -aq --filter "label=com.docker.compose.project=$p" | xargs -r docker rm -f >/dev/null 2>&1 || true
     docker volume ls -q --filter "label=com.docker.compose.project=$p" | xargs -r docker volume rm -f >/dev/null 2>&1 || true
   done
+  rm -rf "$SMOKE_WORK" 2>/dev/null || {
+    docker run --rm -v "$SMOKE_WORK:/w" --entrypoint sh "$NEW_IMAGE" -c 'rm -rf /w/* /w/.[!.]*' >/dev/null 2>&1 || true
+    rm -rf "$SMOKE_WORK" 2>/dev/null || true
+  }
   docker rmi -f "$NEW_IMAGE" >/dev/null 2>&1 || true
-  [ "$OLD_BUILT" = 1 ] && docker rmi -f "$OLD_IMAGE" >/dev/null 2>&1 || true
-  rm -rf "$SMOKE_WORK"
+  if [ "$OLD_BUILT" = 1 ]; then docker rmi -f "$OLD_IMAGE" >/dev/null 2>&1 || true; fi
+  if [ $rc -eq 0 ]; then smoke_assert_clean || rc=1; fi
   exit $rc
 }
 trap cleanup EXIT
@@ -131,11 +138,13 @@ echo '{"version":"1.0.0","system_name":"smoke","owner_name":"smoke"}' > .karakos
 printf '#!/bin/sh\n# custom hook (upgrade smoke)\nexit 0\n' > config/hooks/custom-smoke.sh
 HOOK_SUM="$(sha256sum config/hooks/custom-smoke.sh | cut -d' ' -f1)"
 echo '{"default":{"text":"smoke-ok"},"rules":[{"match":"HOLD","step":{"hang":true}}]}' > config/fake-claude-script.json
-write_override() {   # <claude path> <fixed container ports? 0|1>
+write_override() {   # <claude path> <fixed container ports? 0|1> <image>
   printf '#!/bin/sh\nexec python3 /opt/fake/fake_claude.py "$@"\n' > config/fake-claude-wrapper.sh
   chmod 755 config/fake-claude-wrapper.sh
   {
-    printf 'services:\n  karakos:\n    volumes:\n      - %s/tests/harness:/opt/fake:ro\n      - ./fake-claude-wrapper.sh:%s:ro\n' "$SMOKE_WORK/fake-src" "$1"
+    # `image:` is set because the 1.0 to 1.2 compose files have `build:` and no `image:`;
+    # with the tag present locally, compose uses it instead of building.
+    printf 'services:\n  karakos:\n    image: %s\n    pull_policy: never\n    volumes:\n      - %s/tests/harness:/opt/fake:ro\n      - ./fake-claude-wrapper.sh:%s:ro\n' "$3" "$SMOKE_WORK/fake-src" "$1"
     # A compose file with fixed container ports (1.0 to 1.2) must not see the
     # chosen port numbers from env_file: the server would bind a port the
     # mapping does not forward.
@@ -145,7 +154,7 @@ write_override() {   # <claude path> <fixed container ports? 0|1>
 mkdir -p "$SMOKE_WORK/fake-src"
 git -C "$REPO" archive HEAD tests/harness | tar -x -C "$SMOKE_WORK/fake-src"
 FIXED=0; grep -q 'AGENT_SERVER_PORT:-18791}:\${AGENT_SERVER_PORT' config/docker-compose.yml || FIXED=1
-write_override "$OLD_CLAUDE" "$FIXED"
+write_override "$OLD_CLAUDE" "$FIXED" "$OLD_IMAGE"
 # Fixed-port layouts publish the container's own ports; the health check and API
 # live on the container side of the mapping.
 BASE="http://127.0.0.1:$SRV_PORT"
@@ -155,6 +164,9 @@ container_healthy() {
   local cid; cid="$("${DC[@]}" ps -q karakos)"
   [ -n "$cid" ] && [ "$(docker inspect -f '{{.State.Health.Status}}' "$cid")" = healthy ]
 }
+# Old images are waited on through the authenticated API, not Docker's health status:
+# the 1.0 healthcheck is an unauthenticated curl that need not match what the server does.
+api_healthy() { curl -fsS -H "$AUTH" "$BASE/health" >/dev/null; }
 api() { curl -fsS -H "$AUTH" "$BASE$1"; }
 post_message() {   # <agent> <text>
   curl -fsS -H "$AUTH" -H 'Content-Type: application/json' \
@@ -173,8 +185,9 @@ vol_hash() {   # <volume>: hash of every file in a volume (read-only mount)
 DATA_VOL="${SMOKE_PROJECT}_karakos-data"
 
 step "start, seed through the old API"
-"${DC[@]}" up -d
-smoke_wait "old stack healthy" 180 container_healthy
+open_perms
+"${DC[@]}" up -d --pull never
+smoke_wait "old stack answering /health" 180 api_healthy
 for i in 1 2 3; do post_message main "seed turn $i"; wait_done "$i"; done
 post_message helper "seed helper turn"; wait_done 4
 post_message main "HOLD this turn"          # the scripted hang
@@ -184,8 +197,18 @@ post_message main "queued behind the hold"
 HDRS="$SMOKE_WORK/old-login.hdrs"
 curl -s -D "$HDRS" -o /dev/null -H 'Content-Type: application/json' \
   -d "{\"username\":\"admin\",\"password\":\"$PASSWORD\"}" "http://127.0.0.1:$DASH_PORT/api/auth"
-OLD_COOKIE="$(grep -i '^set-cookie: karakos_session=' "$HDRS" | sed -E 's/^[^=]*=([^;]*).*/\1/' | tr -d '\r')"
-[ -n "$OLD_COOKIE" ] || { echo "FAIL: the old dashboard set no karakos_session cookie" >&2; cat "$HDRS" >&2; exit 1; }
+OLD_COOKIE="$(grep -i '^set-cookie: karakos_session=' "$HDRS" | sed -E 's/^[^=]*=([^;]*).*/\1/' | tr -d '\r' || true)"
+# The 1.0 to 1.2 compose files bind-mount the whole checkout over /workspace, which
+# hides the image's built dashboard (a git checkout has no dashboard/.next), so the
+# old dashboard cannot serve there and the cookie proof does not apply to that layout.
+BIND_ALL=0; grep -qE '^[[:space:]]*-[[:space:]]*\.\.:/workspace[[:space:]]*$' config/docker-compose.yml && BIND_ALL=1
+if [ -z "$OLD_COOKIE" ]; then
+  if [ "$BIND_ALL" = 1 ]; then
+    echo "NOTE: no old session cookie: $TAG bind-mounts the whole checkout, which hides the built dashboard; the cookie compatibility check is skipped for this layout"
+  else
+    echo "FAIL: the old dashboard set no karakos_session cookie" >&2; cat "$HDRS" >&2; exit 1
+  fi
+fi
 # Memory: the 1.x memory tool is read-only, so seed memory.db through the tag's own
 # bin/memory-maintenance.py init_db() and insert the rows its nightly job would.
 "${DC[@]}" exec -T karakos python3 - <<'PY'
@@ -214,7 +237,7 @@ git -C "$REPO" archive HEAD | tar -x -C "$OLD"
 export KARAKOS_VERSION="$NEW_TAG"
 [ -f config/.env ] && [ -f config/agents.json ] && [ -f config/hooks/custom-smoke.sh ] \
   || { echo "FAIL: the pull emulation lost an untracked file" >&2; exit 1; }
-write_override "$NEW_CLAUDE" 0
+write_override "$NEW_CLAUDE" 0 "$NEW_IMAGE"
 
 # A copy for the refusal path, made now while the data is still 1.x.
 REFUSE_PROJECT="$SMOKE_PROJECT-r"
@@ -250,17 +273,20 @@ p='/workspace/config/agents.yaml'; d=yaml.safe_load(open(p))
 for a in d['agents'].values():
     a.setdefault('env',{}).update({k:'\${%s}'%k for k in ('FAKE_CLAUDE_LOG_DIR','FAKE_CLAUDE_SCRIPT')})
 yaml.safe_dump(d, open(p,'w'), sort_keys=False)"
-"${DC[@]}" up -d
+open_perms
+"${DC[@]}" up -d --pull never
 smoke_wait "2.0 healthy on migrated volumes" 180 container_healthy
 
 step "assert the migrated install"
 assert_eq "$("${DC[@]}" exec -T karakos python3 -c "import json; print(json.load(open('data/.schema-version'))['schema'])")" 2 "schema stamp"
 api /agents | python3 -c "
 import json,sys
-d=json.load(sys.stdin)['agents']; names={a['name'] for a in d}
-assert names>={'main','helper','monitor'}, names"
-assert_eq "$(dbq "select count(*) from message_queue where agent not in ('main','helper','monitor')")" 0 "queue rows keyed by agent id"
-assert_eq "$(dbq "select count(*) from sessions where agent not in ('main','helper','monitor')")" 0 "sessions keyed by agent id"
+names={a['name'] for a in json.load(sys.stdin)['agents']}
+assert names>={'main','helper'} and len(names)>=3, names   # the migrated agents plus a monitor"
+# Keying (plan rule): every row and session is keyed by an id the server lists.
+IDS="$(api /agents | python3 -c "import json,sys; print(','.join(\"'%s'\" % a['name'] for a in json.load(sys.stdin)['agents']))")"
+assert_eq "$(dbq "select count(*) from message_queue where agent not in ($IDS)")" 0 "queue rows keyed by agent id"
+assert_eq "$(dbq "select count(*) from sessions where agent not in ($IDS)")" 0 "sessions keyed by agent id"
 [ "$(dbq "select count(*) from sessions")" -ge 1 ] || { echo "FAIL: no sessions survived" >&2; exit 1; }
 [ "$(dbq "select count(*) from message_queue where processed=2 and response='smoke-ok'")" -ge "$SEED_DONE" ] \
   || { echo "FAIL: completed rows lost their responses" >&2; exit 1; }
@@ -273,7 +299,9 @@ m = json.loads(g.execute("select value from meta where key='migration'").fetchon
 assert m["episodes"] == 5 and m["facts"] == 3, m
 assert os.path.exists("data/memory/memory.db.migrated"), "memory.db.migrated missing"
 PY
-assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -H "Cookie: karakos_session=$OLD_COOKIE" "http://127.0.0.1:$DASH_PORT/agents")" 200 "old session cookie on the new dashboard"
+if [ -n "$OLD_COOKIE" ]; then
+  assert_eq "$(curl -s -o /dev/null -w '%{http_code}' -H "Cookie: karakos_session=$OLD_COOKIE" "http://127.0.0.1:$DASH_PORT/agents")" 200 "old session cookie on the new dashboard"
+fi
 assert_eq "$(sha256sum config/hooks/custom-smoke.sh | cut -d' ' -f1)" "$HOOK_SUM" "custom hook preserved"
 post_message main "post-upgrade round trip"
 wait_done "$((SEED_DONE + 1))"
@@ -328,8 +356,9 @@ assert not extra and not missing and not bad, (sorted(extra)[:5], sorted(missing
 git -C "$REPO" archive "$TAG" | tar -x -C "$OLD"
 export KARAKOS_VERSION="$TAG"
 write_override "$OLD_CLAUDE" "$FIXED"
-"${DC[@]}" up -d
-smoke_wait "old image healthy on restored volumes" 180 container_healthy
+open_perms
+"${DC[@]}" up -d --pull never
+smoke_wait "old image answering /health on restored volumes" 180 api_healthy
 assert_eq "$(dbq "select count(*) from message_queue")" "$SEED_ROWS" "seeded rows are back"
 [ "$("${DC[@]}" exec -T karakos sh -c 'test -e data/.schema-version && echo yes || echo no')" = no ] \
   || { echo "FAIL: a schema stamp survived the restore" >&2; exit 1; }

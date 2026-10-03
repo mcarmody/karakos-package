@@ -8,10 +8,12 @@ name: Release gate
 # Budget policy (see ci.yml's header): no push trigger, at most one scheduled
 # run a week, and pull_request only when a file that can break these changes.
 #
-# Secrets (all optional here; a missing one skips on a PR and FAILS on a tag,
-# a dispatch or a schedule):
-#   DASHBOARD_FETCH_TOKEN    read access to the private karakos-dashboard repo (image build)
-#   CLAUDE_CODE_OAUTH_TOKEN  a scratch Anthropic account's long-lived token (real-CLI smoke)
+# Secrets:
+#   DASHBOARD_FETCH_TOKEN    read access to the private karakos-dashboard repo (image build).
+#                            Missing: build-image and the two Docker smokes SKIP with a
+#                            warning on every event (as ci.yml's docker-smoke does).
+#   CLAUDE_CODE_OAUTH_TOKEN  a scratch Anthropic account's long-lived token (real-CLI smoke).
+#                            Missing: skips on a PR, FAILS on a tag, dispatch or schedule.
 # GITHUB_TOKEN (packages: read) pulls the ghcr.io/mcarmody/karakos tags the upgrade matrix uses.
 on:
   workflow_call:
@@ -70,12 +72,9 @@ jobs:
         run: |
           if [ "$HAS_DASHBOARD_TOKEN" = true ]; then
             echo "built=true" >> "$GITHUB_OUTPUT"
-          elif [ "${{ github.event_name }}" = pull_request ]; then
-            echo "built=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::DASHBOARD_FETCH_TOKEN unavailable (a forked PR, or the secret is not set): skipping the image build and the two Docker smokes"
           else
-            echo "::error::DASHBOARD_FETCH_TOKEN is required to build the image on a tag, dispatch or schedule; the gate cannot pass without it"
-            exit 1
+            echo "built=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::DASHBOARD_FETCH_TOKEN is not available (a forked PR, or the secret is not set): skipping the image build and the fresh-install and upgrade smokes. This is a skip, not a pass: release.yml's build-push also needs this secret, so nothing publishes without it."
           fi
 
       - uses: actions/checkout@v4

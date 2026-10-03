@@ -40,3 +40,13 @@ smoke_wait() {
     sleep 2
   done
 }
+
+# Nothing named after this run's project (or its `-r` sibling) may remain.
+smoke_assert_clean() {
+  local left
+  left="$(docker ps -aq --filter "name=${SMOKE_PROJECT}" ; docker volume ls -q --filter "name=${SMOKE_PROJECT}")"
+  if [ -n "$left" ]; then
+    echo "smoke: leftovers for ${SMOKE_PROJECT}: $left" >&2
+    return 1
+  fi
+}

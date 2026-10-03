@@ -350,9 +350,17 @@ def test_every_job_has_a_timeout():
     assert gate["upgrade-smoke"]["needs"] == "build-image"
 
 
-def test_release_gate_secrets_skip_on_pr_and_fail_otherwise():
+def test_release_gate_missing_secrets_behave_as_stated():
+    gate = load("release-gate.yml")["jobs"]
+    build = json.dumps(gate["build-image"])
+    # DASHBOARD_FETCH_TOKEN absent: skip with a warning, never fail (as 5.3's docker-smoke does)
+    assert "::warning::DASHBOARD_FETCH_TOKEN" in build and "exit 1" not in build
+    assert gate["fresh-install-smoke"]["if"] == "needs.build-image.outputs.built == 'true'"
+    assert gate["upgrade-smoke"]["if"] == "needs.build-image.outputs.built == 'true'"
+    # CLAUDE_CODE_OAUTH_TOKEN absent: skip on a PR, fail otherwise
+    real = json.dumps(gate["real-cli-smoke"])
+    assert "= pull_request" in real and "exit 1" in real
     text = (WORKFLOWS / "release-gate.yml").read_text()
-    assert text.count("= pull_request") >= 2 and text.count("exit 1") >= 2
     assert "KARAKOS_REQUIRE_REAL_CLI" in text and "KARAKOS_REQUIRE_DOCKER" in text
 
 
@@ -437,3 +445,12 @@ def test_quickstart_smoke_lines_are_in_fresh_install_script():
     assert lines
     missing = [l for l in lines if l not in body]
     assert not missing, missing
+
+
+def test_compose_up_never_pulls_and_leftovers_are_checked():
+    for name in SCRIPTS:
+        text = (SMOKE / name).read_text()
+        for line in text.splitlines():
+            if re.search(r"\bup -d\b", line) and not line.lstrip().startswith("#"):
+                assert "--pull never" in line, f"{name}: {line}"
+        assert "smoke_assert_clean" in text

@@ -29,7 +29,6 @@ ARTIFACTS="${KARAKOS_SMOKE_ARTIFACTS:-}"
 export COMPOSE_PROJECT_NAME="$SMOKE_PROJECT"
 export KARAKOS_VERSION="$VERSION_TAG"
 export HOME="$SMOKE_WORK/home"        # compose binds $HOME/.claude and $HOME/.claude.json
-export COMPOSE_PULL_POLICY=never
 
 mkdir -p "$INSTALL" "$HOME/.claude"
 echo '{}' > "$HOME/.claude.json"
@@ -40,6 +39,10 @@ cd "$INSTALL"
 
 DC=(docker compose -f config/docker-compose.yml -f config/docker-compose.smoke.yml --env-file config/.env)
 
+open_perms() {   # the container user is not the runner's uid; let it write the bind mounts
+  chmod -R a+rwX "$INSTALL" "$HOME" 2>/dev/null || true
+}
+
 cleanup() {
   local rc=$?
   smoke_guard
@@ -49,8 +52,12 @@ cleanup() {
     "${DC[@]}" ps -a > "$ARTIFACTS/compose-ps.txt" 2>&1 || true
   fi
   "${DC[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
+  rm -rf "$SMOKE_WORK" 2>/dev/null || {
+    docker run --rm -v "$SMOKE_WORK:/w" --entrypoint sh "$IMAGE" -c 'rm -rf /w/* /w/.[!.]*' >/dev/null 2>&1 || true
+    rm -rf "$SMOKE_WORK" 2>/dev/null || true
+  }
   docker rmi -f "$IMAGE" >/dev/null 2>&1 || true
-  rm -rf "$SMOKE_WORK"
+  if [ $rc -eq 0 ]; then smoke_assert_clean || rc=1; fi
   exit $rc
 }
 trap cleanup EXIT
@@ -98,7 +105,8 @@ rows_complete() {
 assert_eq() { [ "$1" = "$2" ] || { echo "FAIL: $3: got '$1', want '$2'" >&2; exit 1; }; }
 
 echo "== up"
-"${DC[@]}" up -d
+open_perms
+"${DC[@]}" up -d --pull never
 smoke_wait "container healthy" 150 container_healthy
 
 echo "== documented smoke commands (docs/QUICKSTART.md, verbatim)"
@@ -143,7 +151,8 @@ send_and_wait "second smoke message" 2
 
 echo "== down, up on the same volumes"
 "${DC[@]}" down
-"${DC[@]}" up -d
+open_perms
+"${DC[@]}" up -d --pull never
 smoke_wait "container healthy after down/up" 150 container_healthy
 assert_eq "$(stamp_schema)" 2 "stamp after down/up"
 assert_eq "$(rows_complete)" "['smoke-ok', 'smoke-ok']" "rows after down/up"
