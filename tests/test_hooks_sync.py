@@ -99,3 +99,10 @@ def test_unmanaged_hook_mixed_into_managed_group_survives(ws):
 def test_all_wired_hook_files_exist():
     for c in commands(json.loads((PACKAGE_ROOT / "config" / "claude-settings.json").read_text()), "PreToolUse"):
         assert (PACKAGE_ROOT / c.replace("$WORKSPACE_ROOT/", "")).exists(), c
+
+
+def test_merged_settings_have_exactly_one_inject_recall(ws):
+    sync_mod.sync(ws)
+    sync_mod.sync(ws)  # a second sync must not duplicate it
+    cmds = commands(load(ws), "UserPromptSubmit")
+    assert sum("inject-recall.py" in c for c in cmds) == 1

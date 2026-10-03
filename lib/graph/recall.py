@@ -232,6 +232,22 @@ def recall(store, query, limit=10, kinds=None, entity=None, domain=None,
     return out
 
 
+def top_facts(store, agent="", limit=50) -> list:
+    """Top-N live `fact` observations by importance (newest first on ties), for
+    spawn-time injection. Shared facts (no agent) plus the agent's own. Never
+    loads a model."""
+    limit = max(1, min(int(limit), 200))
+    where, args = _filters(["fact"], None, None)
+    agent_sql = "AND (o.agent IS NULL OR o.agent = '' OR o.agent = ?)" if agent else ""
+    with store.read() as conn:
+        rows = conn.execute(
+            f"SELECT o.content, o.domain, e.name AS subject FROM observations o "
+            f"LEFT JOIN entities e ON e.id = o.entity_id WHERE {where} {agent_sql} "
+            "ORDER BY o.importance DESC, o.id DESC LIMIT ?",
+            (*args, *([agent] if agent else []), limit)).fetchall()
+    return [dict(r) for r in rows]
+
+
 def legacy_blend(store, query, limit=10) -> dict:
     """1.x episode recall: 0.75 * vec01 + 0.25 * importance/10; LIKE fallback."""
     limit = max(1, min(int(limit), 100))

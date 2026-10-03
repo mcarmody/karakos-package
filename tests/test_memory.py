@@ -14,6 +14,49 @@ import pytest
 from conftest import import_script, PACKAGE_ROOT
 
 
+@pytest.fixture
+def memory_db(tmp_workspace):
+    """1.x memory.db for the legacy writer tests. Retired with bin/memory-maintenance.py in 4.3."""
+    db_path = tmp_workspace / "data" / "memory" / "memory.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS episodes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            summary TEXT NOT NULL,
+            importance REAL DEFAULT 5.0,
+            base_importance REAL,
+            channel TEXT,
+            tags TEXT,
+            agents TEXT,
+            created_at TIMESTAMP,
+            inserted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            consolidated_at TIMESTAMP DEFAULT NULL,
+            embedding BLOB
+        );
+        CREATE TABLE IF NOT EXISTS facts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            subject TEXT NOT NULL,
+            content TEXT NOT NULL,
+            confidence REAL DEFAULT 0.8,
+            domain TEXT DEFAULT 'general',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS patterns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            agent TEXT NOT NULL,
+            pattern_type TEXT NOT NULL,
+            content TEXT NOT NULL,
+            confidence REAL DEFAULT 0.7,
+            reinforcement_count INTEGER DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP
+        );
+    """)
+    conn.commit()
+    return conn, db_path
+
+
 class TestMemoryDatabaseInit:
     """Test memory database initialization."""
 
