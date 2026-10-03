@@ -79,6 +79,8 @@ def write_agents_config(workspace: Path, agents, shards=None) -> None:
         json.dumps({"permissions": {"allow": [], "deny": []}}))
 
 
+ARGV_WAIT_S = 3.0   # argv(): how long to wait for the fake CLI's argv file
+
 class Harness:
     def __init__(self, tmp_workspace, agents=["a", "b"], shards=None, write_config=True,
                  work_stealing=None, steering=None):
@@ -272,13 +274,13 @@ class Harness:
             return []
         return [json.loads(l)["text"] for l in path.read_text().splitlines() if l]
 
-    def argv(self, shard, wait_s=3.0):
+    def argv(self, shard):
         """argv (without the program name) of the shard's latest spawn. The fake
         CLI writes it from its own process just after exec, so a test can get
         here first; poll briefly (the writer is another process, so a blocking
         wait cannot starve it). None if it never appears."""
         path = self.log_dir / f"{self.session_id(shard)}.argv.json"
-        deadline = time.monotonic() + wait_s
+        deadline = time.monotonic() + ARGV_WAIT_S
         while True:
             if path.exists():
                 try:
