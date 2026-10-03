@@ -87,8 +87,11 @@ def test_merge_at_tool_boundary(harness):
 
 def test_no_boundary_runs_as_next_turn(harness):
     h = fixture(harness)
+    # B carries a delay so the state between the two results is observable: with
+    # none, the fake emits B's result ~5 ms after A's, inside one 20 ms poll, and
+    # `len(results) == 1` is never seen (CI flake, 2026-10-03, runs on #212 and #213).
     h.script(rules=[{"match": "A-msg", "step": {"text": "r-A", "delay_ms": 600}},
-                    {"match": "B-msg", "step": {"text": "r-B"}}])
+                    {"match": "B-msg", "step": {"text": "r-B", "delay_ms": 400}}])
 
     async def scenario():
         async with h:
