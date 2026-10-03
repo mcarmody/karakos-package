@@ -183,7 +183,7 @@ Discord message → Relay CaptureAdapter → JSONL append → Dashboard reads
 
 **Status:** PASS
 **Evidence:**
-- `bin/memory-maintenance.py` exists (11.5KB, consolidation logic)
+- Nightly consolidation job exists (1.x consolidation script; replaced by `lib/monitor_jobs/memory_consolidate.py` in 2.0)
 - SQLite schema: `episodes`, `facts`, `patterns` tables
 - Embedding support via fastembed (BAAI/bge-small-en-v1.5)
 - Decay formula: `effective_score = importance - (days * DECAY_RATE)`
@@ -368,7 +368,7 @@ poke.sh [--agent NAME] [--source LABEL] [--reply-channel NAME] [--silent] MESSAG
 ```python
 schedule.every(30).minutes.do(heartbeat)
 schedule.every(10).minutes.do(health_monitor)
-schedule.every(6).hours.do(memory_maintenance)
+schedule.every(6).hours.do(memory_consolidation)
 schedule.every(24).hours.at("03:00").do(purge_old_data)
 schedule.every().week.do(check_updates)
 ```

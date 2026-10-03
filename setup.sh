@@ -469,6 +469,11 @@ EOF
             --channel general
     fi
 
+    # Build queue database (spec 3.3): same schema function the migrator uses.
+    # The queue stays off until config/build-queue.yaml says `enabled: true`.
+    python3 "${SCRIPT_DIR}/lib/buildq.py" init --db "${SCRIPT_DIR}/data/build-queue.db" \
+        || warn "could not create data/build-queue.db (run karakos migrate)"
+
     # Create channels.json
     CHANNELS_JSON="{\"server_id\": \"$DISCORD_SERVER_ID\", \"channels\": {\"general\": {\"id\": \"$CHANNEL_GENERAL\"}, \"signals\": {\"id\": \"$CHANNEL_SIGNALS\"}"
 

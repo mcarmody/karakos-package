@@ -244,7 +244,7 @@ Replaces cron, with the container's full environment. The loop ticks every
 | Wedge check | every 1 min | `bin/wedge-check.py` |
 | Flush deferred messages | every 5 min | `bin/flush-deferred-messages.py` |
 | Claude CLI rollback guard | at startup, then hourly | `bin/cli-upgrade-watchdog.sh` |
-| Memory maintenance | daily 03:00 | `bin/memory-maintenance.py` |
+| Memory consolidation | daily 03:00 | `lib/monitor_jobs/memory_consolidate.py` (also `bin/graph-consolidate.py [--dry-run]`) |
 | Health monitor | daily 04:00 | `bin/health-monitor.py` |
 | Data purge | daily 04:30 | `bin/purge-data.py` |
 | Update check | Mondays 05:00 | `bin/check-updates.sh` — pokes signals on a new release |
@@ -502,8 +502,10 @@ the model, so an install with nothing embedded never loads it.
   empty or missing graph spawns with no block.
 
 **Writing memory:** `memory.remember` and the `graph` tool write observations,
-entities and edges through `GraphStore`. The nightly 1.x maintenance job
-(`bin/memory-maintenance.py`) is replaced in step 4.3.
+entities and edges through `GraphStore`. The nightly `memory-consolidate`
+job (`lib/graph/consolidate.py`) builds episodes from the previous day's
+messages, decays and archives them, merges duplicates, tidies entities and
+backfills embeddings.
 
 ## Protected paths
 
@@ -546,7 +548,7 @@ data/                                  # named volume
 ├── health/
 │   ├── agents/<agent>.json            # liveness beacons
 │   ├── relay.json  scheduler.json
-│   ├── mcp-tools.json  memory-maintenance.json
+│   ├── mcp-tools.json  memory-consolidate.json
 │   ├── claude-cli.json                # known-good CLI version
 │   └── wedge-check-state.json
 ├── taskboard.json

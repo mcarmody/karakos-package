@@ -70,14 +70,14 @@ class TestHealthFileChecks:
         assert "error" in reason
 
     def test_memory_has_longer_threshold(self, tmp_workspace, monkeypatch):
-        """Memory maintenance only runs daily — 48h threshold."""
+        """Memory consolidation only runs daily — 48h threshold."""
         monitor = self._make_monitor(tmp_workspace, monkeypatch)
         health_dir = tmp_workspace / "data" / "health"
 
         old = (datetime.now() - timedelta(hours=24)).isoformat()
-        (health_dir / "memory-maintenance.json").write_text(json.dumps({"timestamp": old}))
+        (health_dir / "memory-consolidate.json").write_text(json.dumps({"timestamp": old}))
 
-        healthy, _ = monitor.check_health_file("memory-maintenance.json", 172800)
+        healthy, _ = monitor.check_health_file("memory-consolidate.json", 172800)
         assert healthy is True
 
     def test_utc_aware_timestamp_is_fresh(self, tmp_workspace, monkeypatch):
@@ -138,7 +138,7 @@ class TestHealthFileChecks:
             "scheduler": PACKAGE_ROOT / "bin" / "scheduler.py",
         }
         health_file_writers = {
-            "memory-maintenance.json": PACKAGE_ROOT / "bin" / "memory-maintenance.py",
+            "memory-consolidate.json": PACKAGE_ROOT / "lib" / "monitor_jobs" / "memory_consolidate.py",
         }
         files = monitor._health_files()
         for job in job_registry.BUILTIN:
@@ -151,7 +151,7 @@ class TestHealthFileChecks:
                 assert job.health_file in files
                 assert job.health_file in health_file_writers[job.health_file].read_text()
         assert set(files) == {"mcp-tools.json", "relay.json", "scheduler.json",
-                              "memory-maintenance.json"}
+                              "memory-consolidate.json"}
         sched = (PACKAGE_ROOT / "bin" / "scheduler.py").read_text()
         assert "heartbeats.touch" in sched and "job_registry.load_jobs" in sched
 
@@ -160,7 +160,7 @@ class TestHealthFileChecks:
         v = monitor.verdict()
         assert set(v) == {"healthy", "issues", "components"}
         assert set(v["components"]) == {"mcp-tools.json", "relay.json", "scheduler.json",
-                                        "memory-maintenance.json"}
+                                        "memory-consolidate.json"}
         assert v["healthy"] is False and len(v["issues"]) == 4
 
 

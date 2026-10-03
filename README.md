@@ -213,7 +213,7 @@ local embeddings, so recall costs no API calls.
 caps are enforced at the point a message is queued, and warnings post to your
 signals channel before the cap bites.
 
-**Scheduled work.** Heartbeats, health sweeps, memory maintenance and data
+**Scheduled work.** Heartbeats, health sweeps, memory consolidation and data
 purges run on a built-in scheduler. Agents can also schedule arbitrary
 one-off work at runtime — "check back in ten minutes" is a real mechanism,
 and it survives a container restart.

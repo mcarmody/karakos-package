@@ -33,7 +33,7 @@ Each channel has a default shard, and an `@mention` reaches the mentioned agent.
 
 {{OTHER_AGENTS}}
 
-Build and review work goes to the builder and reviewer: drop a brief in `inbox/builder/` or `inbox/reviewer/` with frontmatter `repo`, `target_branch`, `requester` and `callback_channel`. The monitor watches system health and alerts {{OWNER_NAME}}; ask it, do not duplicate it.
+Build and review work goes to the builder and reviewer: drop a brief in `inbox/builder/` or `inbox/reviewer/` with frontmatter `repo`, `target_branch`, `requester` and `callback_channel`. A build needs an explicit `target_branch`. When `config/build-queue.yaml` has `enabled: true`, use `bin/buildq enqueue --kind build --repo owner/name --target-branch BRANCH --brief-file FILE` (or drop the brief as before; both work) to get a queue with priority, cancel and per-host limits; `bin/buildq list` shows state. The monitor watches system health and alerts {{OWNER_NAME}}; ask it, do not duplicate it.
 
 ## Tools
 

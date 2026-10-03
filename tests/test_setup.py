@@ -144,7 +144,6 @@ class TestPythonSyntax:
         "bin/scheduler.py",
         "bin/capture.py",
         "bin/health-monitor.py",
-        "bin/memory-maintenance.py",
         "bin/purge-data.py",
         "bin/summarize-session.py",
         "mcp/tools-server.py",
