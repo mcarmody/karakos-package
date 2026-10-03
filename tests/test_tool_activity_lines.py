@@ -103,7 +103,7 @@ def drive(ags, lines, *, channel_id=CHANNEL, config=None):
     """Run one turn's stream through read_agent_response, capturing posts."""
     posted = []
 
-    async def fake_post(agent, cid, content, reply_to=None, dead_letter=False):
+    async def fake_post(agent, cid, content, reply_to=None, dead_letter=False, queue_message_id=None):
         posted.append({"channel_id": cid, "content": content,
                        "dead_letter": dead_letter})
         return f"discord-{len(posted)}"

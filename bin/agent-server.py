@@ -39,6 +39,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import ask_handler  # noqa: E402
 import hive as hive_lib  # noqa: E402
 import msgqueue  # noqa: E402
+import outbox as outbox_lib  # noqa: E402
+import post_guard  # noqa: E402
 import registry as agent_registry  # noqa: E402
 import procreap  # noqa: E402
 import prompt_compose  # noqa: E402
@@ -62,7 +64,7 @@ AGENTS_CONFIG_PATH = WORKSPACE_ROOT / "config" / "agents.yaml"
 CHANNELS_CONFIG_PATH = WORKSPACE_ROOT / "config" / "channels.json"
 CLAUDE_SETTINGS_PATH = WORKSPACE_ROOT / "config" / "claude-settings.json"
 STREAM_LOG_DIR = WORKSPACE_ROOT / "logs" / "agent-streams"
-DEAD_LETTER_PATH = WORKSPACE_ROOT / "data" / "discord-dead-letter.jsonl"
+OUTBOX_PATH = WORKSPACE_ROOT / "data" / "outbox" / "outbox.db"
 
 # Raw stream-json events are teed to logs/agent-streams/{agent}_*.jsonl as
 # they are read (#148). The manual summarizer reads the tail of the newest
@@ -74,9 +76,9 @@ STREAM_LOG_MAX_BYTES = int(os.environ.get("STREAM_LOG_MAX_BYTES", str(16 * 1024 
 AGENT_SERVER_TOKEN = os.environ.get("AGENT_SERVER_TOKEN", "")
 OWNER_DISCORD_ID = os.environ.get("OWNER_DISCORD_ID", "0")
 
-# Attempts per chunk before a reply is dead-lettered. Applies to failures that
-# might clear on their own (5xx, network); a 403 is not one of those and is
-# dead-lettered on the first try — see post_to_discord.
+# Attempts per chunk on the direct (non-durable) path: tool lines, notices, and
+# the fallback when the outbox store is unusable. Durable replies use the
+# outbox retry policy (lib/outbox.py) instead.
 POST_MAX_ATTEMPTS = int(os.environ.get("DISCORD_POST_MAX_ATTEMPTS", "3"))
 POST_RETRY_BASE_SEC = float(os.environ.get("DISCORD_POST_RETRY_BASE_SEC", "1.0"))
 
@@ -1567,8 +1569,10 @@ def split_discord_message(text: str, max_length: int = MAX_DISCORD_MSG_LEN) -> L
     cut so no chunk carries a dangling fence. Discord rejects anything over
     2000 with a 400 and the message is lost, so the result is size-checked.
     """
+    if not text or not text.strip():
+        return []
     if len(text) <= max_length:
-        return [text] if text else []
+        return [text]
 
     # Headroom for the "\n```" balance_fences appends and the "```lang\n"
     # it prepends to the next chunk.
@@ -1580,93 +1584,90 @@ def split_discord_message(text: str, max_length: int = MAX_DISCORD_MSG_LEN) -> L
             chunk = chunk[max_length:]
         if chunk:
             safe.append(chunk)
-    return safe if safe else [text]
-def _write_dead_letter(agent: str, channel_id: str, content: str, reason: str,
-                       attempts: int) -> None:
-    """Record a reply that was generated but could not be delivered.
+    return safe
 
-    The agent ran, the tokens were spent, the answer exists — and without this
-    the only trace is a log line. Writing it somewhere durable is what makes it
-    recoverable, and what lets /health say the delivery path is broken instead
-    of everything looking idle and fine.
 
-    Never raises: this is the error path, and a failure to record a failure
-    must not take down the response loop on top of it.
-    """
+# =============================================================================
+# Outbox glue (step 6.1)
+# =============================================================================
+# One broken-store log per process: a reply is never lost to a broken store, it
+# falls back to the direct path, but the operator hears about it once.
+_outbox_conn = None
+_outbox_wake: Optional[asyncio.Event] = None
+_outbox_task: Optional[asyncio.Task] = None
+_outbox_broken_logged = False
+OUTBOX_CLOCK = time.time
+
+
+def _outbox_now() -> float:
+    return OUTBOX_CLOCK()
+
+
+def _outbox_broken(what: str, exc: BaseException) -> None:
+    global _outbox_broken_logged
+    if not _outbox_broken_logged:
+        _outbox_broken_logged = True
+        log.error(f"Discord outbox unavailable ({what}: {type(exc).__name__}: {exc}); "
+                  f"posting directly")
+
+
+def _outbox_store(create: bool = True):
+    """The open outbox connection, or None. `create=False` never creates the file."""
+    global _outbox_conn
+    if _outbox_conn is not None:
+        return _outbox_conn
+    if not create and not OUTBOX_PATH.is_file():
+        return None
     try:
-        DEAD_LETTER_PATH.parent.mkdir(parents=True, exist_ok=True)
-        record = {
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "agent": agent,
-            "channel_id": channel_id,
-            "reason": reason,
-            "attempts": attempts,
-            "content": content,
-        }
-        with open(DEAD_LETTER_PATH, "a") as f:
-            f.write(json.dumps(record) + "\n")
-        log.error(
-            f"DEAD LETTER: {agent}'s reply for channel {channel_id} "
-            f"({len(content)} chars) undelivered after {attempts} attempt(s): "
-            f"{reason}. Written to {DEAD_LETTER_PATH}"
-        )
+        _outbox_conn = outbox_lib.open_store(OUTBOX_PATH)
     except Exception as e:
-        log.error(f"Failed to write dead letter (reply is now lost): {e}")
+        _outbox_broken("open", e)
+        return None
+    return _outbox_conn
+
+
+def _outbox_notify() -> None:
+    if _outbox_wake is not None:
+        _outbox_wake.set()
 
 
 def dead_letter_count() -> int:
-    """How many replies are sitting undelivered. 0 if the file is absent."""
+    """Rows in the outbox that gave up (`dead`). Kept under its old name for /health."""
+    conn = _outbox_store(create=False)
+    if conn is None:
+        return 0
     try:
-        if not DEAD_LETTER_PATH.exists():
-            return 0
-        with open(DEAD_LETTER_PATH) as f:
-            return sum(1 for line in f if line.strip())
+        return outbox_lib.stats(conn, _outbox_now())["dead"]
     except Exception as e:
-        log.error(f"Could not count dead letters: {e}")
+        _outbox_broken("stats", e)
         return 0
 
 
-async def post_to_discord(agent: str, channel_id: str, content: str,
-                          reply_to: Optional[str] = None,
-                          dead_letter: bool = False) -> Optional[str]:
-    """Post message to Discord as agent, splitting if over 2000 chars.
+def split_discord_message_visible(text: str) -> List[str]:
+    """Chunks of `text` that have something visible in them."""
+    return [c for c in split_discord_message(text) if post_guard.has_visible(c)]
 
-    `dead_letter=True` marks this content as agent output worth preserving if
-    delivery fails — a reply someone is waiting on. It is off by default so
-    that incidentals (tool-event lines, cost updates, the crash notice) do not
-    fill the queue with things nobody would replay.
+
+async def _post_direct(agent: str, token: str, channel_id: str, content: str,
+                       reply_to: Optional[str] = None) -> Optional[str]:
+    """Direct, in-turn delivery: retried POST_MAX_ATTEMPTS times per chunk.
+
+    Used for incidental posts (tool lines, notices) and as the fallback when
+    the outbox store is unusable. `content` is already rendered; blank chunks
+    are dropped here, so this path cannot post an empty message.
+    Returns the last message id, or None if nothing was posted or any chunk failed.
     """
-    global http_session
-
-    # Skip posting if channel_id is "0" (silent mode)
-    if channel_id == "0":
-        return None
-
-    # Get agent's Discord token, fallback to primary agent
-    token = AGENT_TOKENS.get(agent)
-    if not token:
-        # Use first available token as fallback
-        if AGENT_TOKENS:
-            token = list(AGENT_TOKENS.values())[0]
-            content = f"[{agent}] {content}"
-        else:
-            log.warning(f"No Discord tokens configured, cannot post for {agent}")
-            return None
-
     url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
     headers = {
         "Authorization": f"Bot {token}",
         "Content-Type": "application/json"
     }
-
-    # Discord does not render Markdown tables; turn them into a monospace
-    # block first (no PNG: this path only sends JSON), then split fence-safely.
-    content, _ = tengwar.render_for_discord(content)
-    chunks = split_discord_message(content)
+    chunks = [c for c in split_discord_message(content) if post_guard.has_visible(c)]
+    if not chunks:
+        log.info(f"skip post (empty) agent={agent} channel={channel_id}")
+        return None
     last_msg_id = None
     failed = 0
-    attempts_used = 0
-    last_reason = "unknown"
 
     for idx, chunk in enumerate(chunks):
         payload = {"content": chunk}
@@ -1690,14 +1691,10 @@ async def post_to_discord(agent: str, channel_id: str, content: str,
                             f"Rate limited posting to {channel_id}, retry after {retry_after}s "
                             f"(attempt {attempt}/{POST_MAX_ATTEMPTS})"
                         )
-                        last_reason = "rate limited"
                         await asyncio.sleep(retry_after)
-                    elif resp.status in (401, 403, 404):
-                        # Permission revoked, token rejected, channel gone. None
-                        # of these clear by trying again — retrying only delays
-                        # the moment the reply is recorded as undeliverable.
-                        body = (await resp.text())[:200]
-                        last_reason = f"HTTP {resp.status} ({body})"
+                    elif 400 <= resp.status < 500:
+                        # Permission revoked, token rejected, channel gone, bad
+                        # body. None of these clear by trying again.
                         log.error(
                             f"Discord API error {resp.status} on chunk "
                             f"{idx + 1}/{len(chunks)} ({len(chunk)} chars); "
@@ -1705,7 +1702,6 @@ async def post_to_discord(agent: str, channel_id: str, content: str,
                         )
                         break
                     else:
-                        last_reason = f"HTTP {resp.status}"
                         log.error(
                             f"Discord API error {resp.status} on chunk "
                             f"{idx + 1}/{len(chunks)} ({len(chunk)} chars) "
@@ -1715,7 +1711,6 @@ async def post_to_discord(agent: str, channel_id: str, content: str,
                         if attempt < POST_MAX_ATTEMPTS:
                             await asyncio.sleep(POST_RETRY_BASE_SEC * attempt)
             except Exception as e:
-                last_reason = f"{type(e).__name__}: {e}"
                 log.error(
                     f"Error posting chunk {idx + 1}/{len(chunks)} to Discord "
                     f"(attempt {attempt}/{POST_MAX_ATTEMPTS}): {e}"
@@ -1723,28 +1718,281 @@ async def post_to_discord(agent: str, channel_id: str, content: str,
                 if attempt < POST_MAX_ATTEMPTS:
                     await asyncio.sleep(POST_RETRY_BASE_SEC * attempt)
 
-        attempts_used = max(attempts_used, attempt)
         if not posted:
             failed += 1
 
     # A chunk that never landed is a piece of the reply the user will never
     # see. Returning the id of a sibling chunk reports the whole message as
-    # delivered and the loss goes unnoticed — which is how two replies
-    # vanished silently before this was caught.
+    # delivered and the loss goes unnoticed.
     if failed:
         log.error(
             f"post_to_discord: {failed} of {len(chunks)} chunk(s) failed for "
             f"{agent} in {channel_id}; message is incomplete"
         )
-        if dead_letter:
-            _write_dead_letter(
-                agent, channel_id, content,
-                f"{failed} of {len(chunks)} chunk(s) failed: {last_reason}",
-                attempts_used,
-            )
+        return None
+    return last_msg_id
+
+
+def _discord_error_detail(status: Optional[int], body: str) -> str:
+    """`HTTP <status>` plus Discord's own error message/code, never the request content."""
+    out = f"HTTP {status}"
+    try:
+        j = json.loads(body)
+        if isinstance(j, dict):
+            if j.get("code") is not None:
+                out += f" code={j.get('code')}"
+            if isinstance(j.get("message"), str):
+                out += f" {j['message'][:100]}"
+    except Exception:
+        pass
+    return out
+
+
+async def outbox_send_row(row: Dict[str, Any]) -> Optional[str]:
+    """Send one claimed (`sending`) outbox row, from `chunks_done` onward.
+
+    One POST per chunk. Every payload carries a per-chunk nonce with
+    enforce_nonce, so a POST that succeeded just before a crash is deduplicated
+    by Discord on the retry (delivery is at-least-once, narrowed by the nonce).
+    Records each delivered chunk, then marks the row delivered and returns the
+    last message id; a failure records its kind and returns None (the row goes
+    back to pending with backoff, or dead). Tokens come from AGENT_TOKENS and
+    never touch the database.
+    """
+    conn = _outbox_store()
+    if conn is None:
+        return None
+    rid, agent, channel_id = row["id"], row["agent"], row["channel_id"]
+    token = AGENT_TOKENS.get(agent) or (next(iter(AGENT_TOKENS.values()), None))
+    if not token:
+        outbox_lib.record_failure(conn, rid, "retry", None, "no Discord token configured",
+                                  None, _outbox_now())
+        return None
+    chunks = [c for c in split_discord_message(row["content"]) if post_guard.has_visible(c)]
+    if not chunks:
+        log.info(f"skip post (empty) agent={agent} channel={channel_id}")
+        outbox_lib.record_failure(conn, rid, "permanent", None, "empty after chunking", None,
+                                  _outbox_now())
+        return None
+    url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
+    headers = {"Authorization": f"Bot {token}", "Content-Type": "application/json"}
+    ids = json.loads(row.get("message_ids") or "[]")
+    for idx in range(row.get("chunks_done") or 0, len(chunks)):
+        payload: Dict[str, Any] = {
+            "content": chunks[idx],
+            "nonce": f"{rid[3:15]}-{idx}",
+            "enforce_nonce": True,
+        }
+        if idx == 0 and row.get("reply_to"):
+            payload["message_reference"] = {"message_id": row["reply_to"]}
+        if row.get("flags"):
+            payload["flags"] = row["flags"]
+        status: Optional[int] = None
+        retry_after = None
+        detail = ""
+        try:
+            async with http_session.post(url, headers=headers, json=payload) as resp:
+                status = resp.status
+                if status in (200, 201):
+                    data = await resp.json()
+                    msg_id = str(data.get("id"))
+                    outbox_lib.record_chunk(conn, rid, msg_id, _outbox_now())
+                    ids.append(msg_id)
+                    continue
+                if status == 429:
+                    try:
+                        retry_after = (await resp.json()).get("retry_after")
+                    except Exception:
+                        retry_after = None
+                    if retry_after is None:
+                        retry_after = getattr(resp, "headers", {}).get("Retry-After")
+                    try:
+                        retry_after = float(retry_after) if retry_after is not None else None
+                    except (TypeError, ValueError):
+                        retry_after = None
+                    detail = "HTTP 429 rate limited"
+                else:
+                    try:
+                        body = await resp.text()
+                    except Exception:
+                        body = ""
+                    detail = _discord_error_detail(status, body)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            status, detail = None, f"{type(e).__name__}: {str(e)[:100]}"
+        kind = outbox_lib.classify(status)
+        log.error(f"Discord outbox: chunk {idx + 1}/{len(chunks)} for {rid} failed ({detail})")
+        outbox_lib.record_failure(conn, rid, kind, status, detail, retry_after, _outbox_now())
+        _outbox_notify()
+        return None
+    outbox_lib.mark_delivered(conn, rid, _outbox_now())
+    last = ids[-1] if ids else None
+    if last and row.get("queue_message_id"):
+        await _writeback_discord_id(row["queue_message_id"], last)
+    return last
+
+
+async def _writeback_discord_id(queue_message_id: str, discord_id: str) -> None:
+    """Record a delivered reply's Discord id on its message_queue row(s), so the
+    crash sweep never sees it as unposted. Best effort: never blocks delivery.
+    Rows of the same turn (same agent, channel, response, processed_at) share
+    the reply, so they are marked together."""
+    try:
+        await db.execute(
+            "UPDATE message_queue SET discord_response_id = ? WHERE discord_response_id IS NULL "
+            "AND (message_id = ? OR (processed_at IS NOT NULL AND (agent, channel_id, response, processed_at) = "
+            "(SELECT agent, channel_id, response, processed_at FROM message_queue "
+            "WHERE message_id = ? AND processed_at IS NOT NULL)))",
+            (discord_id, queue_message_id, queue_message_id))
+        await db.commit()
+    except Exception as e:
+        log.warning(f"Discord outbox: could not write id back for {queue_message_id} "
+                    f"({type(e).__name__}: {e})")
+
+
+async def outbox_pass(now: Optional[float] = None) -> int:
+    """One loop pass: claim every due row and send it. Returns rows attempted."""
+    conn = _outbox_store(create=False)
+    if conn is None:
+        return 0
+    try:
+        rows = outbox_lib.claim_due(conn, _outbox_now() if now is None else now)
+    except Exception as e:
+        _outbox_broken("claim", e)
+        return 0
+    for row in rows:
+        try:
+            await outbox_send_row(row)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.error(f"Discord outbox: sending {row['id']} raised {type(e).__name__}: {e}")
+            try:
+                outbox_lib.record_failure(conn, row["id"], "retry", None, type(e).__name__,
+                                          None, _outbox_now())
+            except Exception:
+                pass
+    return len(rows)
+
+
+async def outbox_loop() -> None:
+    """Background delivery: wait for an enqueue or the next retry time, send due rows."""
+    global _outbox_wake
+    _outbox_wake = asyncio.Event()
+    conn = _outbox_store(create=False)
+    if conn is not None:
+        try:
+            n = outbox_lib.recover_sending(conn, _outbox_now())
+            log.debug(f"outbox: store opened, {n} row(s) recovered")
+        except Exception as e:
+            _outbox_broken("recover", e)
+    while True:
+        _outbox_wake.clear()
+        try:
+            if await outbox_pass():
+                continue
+            timeout = 30.0
+            conn = _outbox_store(create=False)
+            if conn is not None:
+                nxt = outbox_lib.next_due(conn)
+                if nxt is not None:
+                    timeout = max(0.05, min(nxt - _outbox_now(), 30.0))
+            try:
+                await asyncio.wait_for(_outbox_wake.wait(), timeout)
+            except asyncio.TimeoutError:
+                pass
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.error(f"Discord outbox loop error: {type(e).__name__}: {e}")
+            await asyncio.sleep(5)
+
+
+async def post_to_discord(agent: str, channel_id: str, content: str,
+                          reply_to: Optional[str] = None,
+                          dead_letter: bool = False,
+                          queue_message_id: Optional[str] = None) -> Optional[str]:
+    """Post message to Discord as agent, splitting if over 2000 chars.
+
+    Empty/whitespace text and a reply that is exactly PASS are never posted
+    (post_guard): returns None, no HTTP request, no outbox row, one INFO line.
+
+    `dead_letter=True` means *durable*: the content is a reply someone is
+    waiting on, so it goes into the outbox (data/outbox/outbox.db) and survives
+    outages and restarts. The inline caller owns the row and runs one delivery
+    pass, returning the last message id if every chunk landed, else None (the
+    row is back in the outbox with backoff, not lost). If an older row for the
+    same (agent, channel) is waiting, the new one is queued behind it and None
+    is returned at once, so a fresh reply never overtakes one in backoff. If
+    the store is unusable the call falls back to the direct path.
+    Delivery is at-least-once, narrowed by a per-chunk nonce.
+    `queue_message_id` is the originating message_queue row; the outbox stores
+    it so the crash sweep finds the reply by key, and delivery writes the
+    Discord id back to that row.
+
+    With `dead_letter=False` (tool lines, cost updates, notices) the direct
+    path runs: DISCORD_POST_MAX_ATTEMPTS tries per chunk, nothing stored.
+    """
+    global http_session
+
+    # Skip posting if channel_id is "0" (silent mode)
+    if channel_id == "0":
         return None
 
-    return last_msg_id
+    # Get agent's Discord token, fallback to primary agent
+    token = AGENT_TOKENS.get(agent)
+    prefix = ""
+    if not token:
+        # Use first available token as fallback
+        if AGENT_TOKENS:
+            token = list(AGENT_TOKENS.values())[0]
+            prefix = f"[{agent}] "
+        else:
+            log.warning(f"No Discord tokens configured, cannot post for {agent}")
+            return None
+
+    # Discord does not render Markdown tables; turn them into a monospace
+    # block first (no PNG: this path only sends JSON). Rendering can empty a
+    # message, so the guard runs on the rendered text.
+    rendered, _ = tengwar.render_for_discord(content)
+    ok, reason = post_guard.post_decision(rendered)
+    if not ok:
+        log.info(f"skip post ({reason}) agent={agent} channel={channel_id}")
+        return None
+    rendered = prefix + rendered
+    chunks = split_discord_message_visible(rendered)
+    if not chunks:
+        log.info(f"skip post (empty) agent={agent} channel={channel_id}")
+        return None
+
+    if dead_letter:
+        conn = _outbox_store()
+        if conn is not None:
+            try:
+                rid, claimed = outbox_lib.enqueue(
+                    conn, agent, channel_id, rendered, reply_to=reply_to, claimed=True,
+                    now=_outbox_now(), content_sha=outbox_lib.content_sha(content),
+                    chunks_total=len(chunks),
+                    queue_message_id=queue_message_id)
+            except Exception as e:
+                _outbox_broken("enqueue", e)
+            else:
+                _outbox_notify()
+                if not claimed:
+                    return None
+                # No direct fallback from here: some chunks may already be out.
+                # A store error leaves the row `sending`; recover_sending
+                # re-sends it at boot with the same nonces.
+                try:
+                    row = outbox_lib.get(conn, rid)
+                    return await outbox_send_row(row) if row else None
+                except Exception as e:
+                    _outbox_broken("inline send", e)
+                    return None
+
+    return await _post_direct(agent, token, channel_id, rendered, reply_to)
+
 
 def gateway_agent() -> Optional[str]:
     """The agent whose bot token bin/relay.py logs in with.
@@ -1779,6 +2027,12 @@ async def post_discord_payload(agent: str, channel_id: str,
     it can report.
     """
     if not channel_id or channel_id == "0":
+        return None
+    # Same rule as post_to_discord: a body with no visible text, no embeds and
+    # no components is an empty post, which Discord answers with a 400.
+    if not (post_guard.has_visible(payload.get("content")) or payload.get("embeds")
+            or payload.get("components")):
+        log.info(f"skip post (empty) agent={agent} channel={channel_id}")
         return None
     token = AGENT_TOKENS.get(agent)
     if not token:
@@ -2257,41 +2511,83 @@ async def crash_recovery():
 
         await db.commit()
 
-    # Retry posting messages that completed but weren't posted
+    # Retry posting messages that completed but weren't posted. Only recent
+    # rows (24 h): an older unposted row is logged once and left alone rather
+    # than reposted on every boot. PASS and blank rows are never posted, and a
+    # reply the outbox already owns or delivered is never posted a second time.
     async with db.execute(
-        "SELECT * FROM message_queue WHERE processed = ? AND discord_response_id IS NULL AND channel_id != '0'",
+        "SELECT * FROM message_queue WHERE processed = ? AND discord_response_id IS NULL "
+        "AND channel_id != '0' AND processed_at >= datetime('now', '-24 hours')",
         (STATUS_COMPLETE,)
     ) as cursor:
         unposted = await cursor.fetchall()
+    async with db.execute(
+        "SELECT COUNT(*) FROM message_queue WHERE processed = ? AND discord_response_id IS NULL "
+        "AND channel_id != '0' AND response IS NOT NULL AND response != '' "
+        "AND (processed_at IS NULL OR processed_at < datetime('now', '-24 hours'))",
+        (STATUS_COMPLETE,)
+    ) as cursor:
+        stale = (await cursor.fetchone())[0]
+    if stale:
+        log.info(f"Leaving {stale} unposted response(s) older than 24h alone")
 
     if unposted:
         log.warning(f"Found {len(unposted)} unposted responses, retrying")
         for msg in unposted:
-            if msg["response"]:
-                # Deliberately no dead_letter=True. These rows are already
-                # durable in the queue and are retried on every startup, so
-                # dead-lettering them would append a fresh copy of the same
-                # reply each time the server came up against a channel that is
-                # still unreachable.
-                discord_id = await post_to_discord(msg["agent"], msg["channel_id"], msg["response"])
-                if discord_id:
-                    # Commit per-message, not once after the whole loop. The
-                    # record of delivery (discord_response_id written) and the
-                    # delivery itself (post_to_discord succeeding) need to be
-                    # atomic with each other, not just with the DB. A batched
-                    # commit after the loop means a crash partway through
-                    # leaves every already-posted-but-not-yet-committed
-                    # message's discord_response_id at NULL, so the *next*
-                    # crash_recovery() sweep finds and reposts them — the
-                    # recovery path duplicating exactly what it exists to
-                    # prevent. Committing immediately after each successful
-                    # post bounds the risk to the single message in flight at
-                    # crash time, not the whole batch.
-                    await db.execute(
-                        "UPDATE message_queue SET discord_response_id = ? WHERE message_id = ?",
-                        (discord_id, msg["message_id"])
-                    )
-                    await db.commit()
+            if not msg["response"] or not post_guard.post_decision(msg["response"])[0]:
+                continue
+            poster = STATE.agent_of(msg["agent"])
+            matched = None
+            conn = _outbox_store()
+            if conn is not None:
+                try:
+                    sha = outbox_lib.content_sha(msg["response"])
+                    processed = datetime.strptime(
+                        msg["processed_at"], "%Y-%m-%d %H:%M:%S"
+                    ).replace(tzinfo=timezone.utc).timestamp()
+                    # Stable key first: a row enqueued on any earlier boot,
+                    # still pending or delivered later by the loop, is found
+                    # however long ago. Content/time is only the fallback for
+                    # rows without a key.
+                    matched = outbox_lib.find_by_queue_id(conn, msg["message_id"])
+                    if matched is None:
+                        matched = outbox_lib.find_for_reply(
+                            conn, poster, msg["channel_id"], sha, processed)
+                    if matched is None:
+                        # Fallback for keyless rows enqueued by this sweep.
+                        matched = outbox_lib.find_for_reply(
+                            conn, poster, msg["channel_id"], sha, _outbox_now())
+                except Exception as e:
+                    _outbox_broken("sweep lookup", e)
+            if matched is not None:
+                if matched["status"] != "delivered":
+                    continue  # the outbox owns delivery; dead rows are the operator's
+                ids = json.loads(matched.get("message_ids") or "[]")
+                discord_id = ids[-1] if ids else None
+            else:
+                # Through the outbox (durable), so the reply survives another
+                # outage instead of being reposted on every boot.
+                discord_id = await post_to_discord(poster, msg["channel_id"], msg["response"],
+                                                   dead_letter=True,
+                                                   queue_message_id=msg["message_id"])
+            if discord_id:
+                # Commit per-message, not once after the whole loop. The
+                # record of delivery (discord_response_id written) and the
+                # delivery itself (post_to_discord succeeding) need to be
+                # atomic with each other, not just with the DB. A batched
+                # commit after the loop means a crash partway through
+                # leaves every already-posted-but-not-yet-committed
+                # message's discord_response_id at NULL, so the *next*
+                # crash_recovery() sweep finds and reposts them — the
+                # recovery path duplicating exactly what it exists to
+                # prevent. Committing immediately after each successful
+                # post bounds the risk to the single message in flight at
+                # crash time, not the whole batch.
+                await db.execute(
+                    "UPDATE message_queue SET discord_response_id = ? WHERE message_id = ?",
+                    (discord_id, msg["message_id"])
+                )
+                await db.commit()
 
 # =============================================================================
 # HTTP API
@@ -2396,8 +2692,84 @@ async def handle_message(request):
 
     return web.json_response({"status": "queued", "message_id": message_id}, status=202)
 
+def outbox_health() -> Dict[str, Any]:
+    zero = {"pending": 0, "sending": 0, "dead": 0, "oldest_pending_age_s": None}
+    conn = _outbox_store(create=False)
+    if conn is None:
+        return zero
+    try:
+        return outbox_lib.stats(conn, _outbox_now())
+    except Exception as e:
+        _outbox_broken("stats", e)
+        return zero
+
+
+def _authorized(request) -> bool:
+    auth_header = request.headers.get("Authorization", "")
+    return auth_header.startswith("Bearer ") and auth_header[7:] == AGENT_SERVER_TOKEN
+
+
+async def handle_outbox_list(request):
+    """GET /outbox?status=&limit= - rows without content (content only for
+    status=dead with include_content=1)."""
+    if not _authorized(request):
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    conn = _outbox_store(create=False)
+    if conn is None:
+        return web.json_response({"rows": []})
+    q = request.query
+    try:
+        limit = int(q.get("limit", "50"))
+    except ValueError:
+        limit = 50
+    rows = outbox_lib.list_rows(conn, q.get("status") or None, limit,
+                                include_content=(q.get("status") == "dead"
+                                                 and q.get("include_content") == "1"))
+    return web.json_response({"rows": rows})
+
+
+async def handle_outbox_get(request):
+    """GET /outbox/{id} - the row (no content) and its audit events."""
+    if not _authorized(request):
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    conn = _outbox_store(create=False)
+    row = outbox_lib.show(conn, request.match_info["id"]) if conn is not None else None
+    if row is None:
+        return web.json_response({"error": "not found"}, status=404)
+    return web.json_response(row)
+
+
+async def _outbox_verb(request, fn):
+    if not _authorized(request):
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    conn = _outbox_store(create=False)
+    rid = request.match_info["id"]
+    if conn is None or outbox_lib.get(conn, rid) is None:
+        return web.json_response({"error": "not found"}, status=404)
+    changed = fn(conn, rid, _outbox_now())
+    if changed:
+        _outbox_notify()
+    row = outbox_lib.get(conn, rid)
+    return web.json_response({"id": rid, "changed": changed, "status": row["status"]},
+                             status=200 if changed else 409)
+
+
+async def handle_outbox_retry(request):
+    """POST /outbox/{id}/retry - dead or discarded back to pending, attempts reset."""
+    return await _outbox_verb(request, outbox_lib.retry)
+
+
+async def handle_outbox_discard(request):
+    """POST /outbox/{id}/discard - stop delivering (and counting) a pending or dead row."""
+    return await _outbox_verb(request, outbox_lib.discard)
+
+
 async def handle_health(request):
-    """GET /health - Health check"""
+    """GET /health - Health check.
+
+    `dead_letters` is the number of `dead` outbox rows. `dead_letter_path` is
+    DEPRECATED: it now names the outbox file; read `outbox` instead.
+    """
     # Check bearer token
     auth_header = request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer ") or auth_header[7:] != AGENT_SERVER_TOKEN:
@@ -2437,8 +2809,8 @@ async def handle_health(request):
             "shards": {i: shard_status[i] for i in mine},
         }
 
-    # A non-zero count means replies were generated and never delivered. It is
-    # reported here because that failure is otherwise invisible — every agent
+    # A non-zero count means replies were generated and gave up (outbox `dead`
+    # rows). It is reported here because that failure is otherwise invisible — every agent
     # looks idle and healthy while its answers are going nowhere.
     undelivered = dead_letter_count()
 
@@ -2452,7 +2824,9 @@ async def handle_health(request):
         "agents": agent_status,
         "shards": shard_status,
         "dead_letters": undelivered,
-        "dead_letter_path": str(DEAD_LETTER_PATH),
+        # Deprecated: now the outbox file; kept so existing readers do not break.
+        "dead_letter_path": str(OUTBOX_PATH),
+        "outbox": outbox_health(),
     })
 
 def _paused_entry(shard):
@@ -4013,6 +4387,13 @@ async def graceful_shutdown(sig):
     if db:
         await db.close()
 
+    if _outbox_task is not None:
+        _outbox_task.cancel()
+        try:
+            await _outbox_task
+        except (asyncio.CancelledError, Exception):
+            pass
+
     # Close HTTP session
     if http_session:
         await http_session.close()
@@ -4077,6 +4458,10 @@ async def startup(app):
     except Exception as e:
         log.warning(f"orphan-key check skipped: {e}")
 
+    # Outbox delivery loop (recovers rows a crash left in `sending` first).
+    global _outbox_task
+    _outbox_task = asyncio.create_task(outbox_loop())
+
     # Crash recovery
     await crash_recovery()
     await hive_startup_sweep()
@@ -4131,6 +4516,10 @@ def create_app(with_lifecycle: bool = True) -> web.Application:
 
     app.router.add_post("/message", handle_message)
     app.router.add_get("/health", handle_health)
+    app.router.add_get("/outbox", handle_outbox_list)
+    app.router.add_get("/outbox/{id}", handle_outbox_get)
+    app.router.add_post("/outbox/{id}/retry", handle_outbox_retry)
+    app.router.add_post("/outbox/{id}/discard", handle_outbox_discard)
     app.router.add_get("/agents", handle_agents)
     app.router.add_post("/agents/{name}/reset", handle_agent_reset)
     app.router.add_post("/agents/{name}/reload", handle_agent_reload)

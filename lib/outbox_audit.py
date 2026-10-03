@@ -1,9 +1,13 @@
-"""Audit message delivery through one adapter (`read_state`) that 6.1 swaps.
+"""Audit message delivery through one adapter (`read_state`).
+
+Source `outbox` (data/outbox/outbox.db, step 6.1) when that file exists, else the
+legacy dead-letter file; `unavailable` if the store cannot be read.
 
 Reads only: never deletes or retries (the flusher and the outbox own that)."""
 from __future__ import annotations
 
 import json
+import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,22 +32,8 @@ class OutboxState:
     newest_dead_at: Optional[float] = None   # additive: lets audit see an mtime change
 
 
-def read_state(workspace, now=None) -> OutboxState:
-    ws = Path(workspace)
-    now = time.time() if now is None else now
-    if (ws / "data" / "outbox" / "outbox.db").exists():
-        # 6.1 fills this branch with its own outbox layout.
-        return OutboxState(source="outbox")
-    st = OutboxState()
-    dead = ws / "data" / "discord-dead-letter.jsonl"
-    try:
-        mt = dead.stat().st_mtime
-        with open(dead, "rb") as f:
-            st.dead = sum(1 for line in f if line.strip())
-        if st.dead:
-            st.newest_dead_at, st.newest_dead_age_s = mt, max(now - mt, 0.0)
-    except OSError:
-        pass
+def _spool(st: OutboxState, ws: Path, now: float) -> None:
+    """Inbound deferral state (the inbound spool, unchanged by the outbox)."""
     ddir = ws / "data" / "deferred-messages"
     ages = []
     for p in ddir.glob("*.json") if ddir.is_dir() else []:
@@ -57,6 +47,53 @@ def read_state(workspace, now=None) -> OutboxState:
         d = ddir / sub
         if d.is_dir():
             st.invalid += sum(1 for p in d.iterdir() if p.is_file())
+
+
+def _read_outbox(db: Path, now: float) -> OutboxState:
+    """Counts from data/outbox/outbox.db, opened read-only."""
+    st = OutboxState(source="outbox")
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2)
+        try:
+            pend, oldest = con.execute(
+                "SELECT COUNT(*), MIN(created_at) FROM outbox "
+                "WHERE status IN ('pending','sending')").fetchone()
+            dead, newest = con.execute(
+                "SELECT COUNT(*), MAX(updated_at) FROM outbox WHERE status='dead'").fetchone()
+        finally:
+            con.close()
+    except sqlite3.Error as e:
+        if "no such table" in str(e):    # an empty store: nothing queued
+            return st
+        return OutboxState(source="unavailable")
+    st.pending = pend or 0
+    st.oldest_pending_age_s = max(now - oldest, 0.0) if oldest is not None else None
+    st.dead = dead or 0
+    if st.dead and newest is not None:
+        st.newest_dead_at, st.newest_dead_age_s = newest, max(now - newest, 0.0)
+    return st
+
+
+def read_state(workspace, now=None) -> OutboxState:
+    ws = Path(workspace)
+    now = time.time() if now is None else now
+    db = ws / "data" / "outbox" / "outbox.db"
+    # The file, not the directory: the store creates the directory first.
+    if db.exists():
+        st = _read_outbox(db, now)
+        _spool(st, ws, now)
+        return st
+    st = OutboxState()
+    dead = ws / "data" / "discord-dead-letter.jsonl"
+    try:
+        mt = dead.stat().st_mtime
+        with open(dead, "rb") as f:
+            st.dead = sum(1 for line in f if line.strip())
+        if st.dead:
+            st.newest_dead_at, st.newest_dead_age_s = mt, max(now - mt, 0.0)
+    except OSError:
+        pass
+    _spool(st, ws, now)
     return st
 
 
@@ -66,7 +103,8 @@ def audit(state: OutboxState, config, prev) -> list:
     if state.dead and (state.dead != prev.get("dead")
                        or state.newest_dead_at != prev.get("newest_dead_at")):
         out.append(make("outbox-dead", "discord", "warn",
-                        f"{state.dead} undelivered Discord message(s) in the dead-letter file",
+                        f"{state.dead} undelivered Discord message(s) in the "
+                        + ("outbox (dead)" if state.source == "outbox" else "dead-letter file"),
                         detail={"dead": state.dead}))
     if state.pending and (state.oldest_pending_age_s or 0) > STUCK_S:
         out.append(make("outbox-stuck", "discord", "critical",

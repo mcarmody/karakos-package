@@ -149,7 +149,7 @@ class Harness:
         await self.stop()
 
     async def _record_discord(self, agent, channel_id, content, reply_to=None,
-                              dead_letter=False):
+                              dead_letter=False, queue_message_id=None):
         self.discord.append({"agent": agent, "channel_id": channel_id,
                              "content": content, "reply_to": reply_to,
                              "dead_letter": dead_letter})

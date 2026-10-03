@@ -40,11 +40,12 @@ Liveness for the nav header and the roster's per-agent liveness and queue depth.
     }
   },
   "dead_letters": 0,
-  "dead_letter_path": "/workspace/data/discord-dead-letter.jsonl"
+  "dead_letter_path": "/workspace/data/outbox/outbox.db",
+  "outbox": { "pending": 0, "sending": 0, "dead": 0, "oldest_pending_age_s": null }
 }
 ```
 
-`state` is whatever the server holds for the agent: on `release/2.0` that is `IDLE`, `PROCESSING` or `ERROR_RECOVERY`, or `UNKNOWN` for an agent that has not started. Treat it as an open string. `session_id` is truncated to 8 characters. `context_tokens` 0 means unknown. `dead_letters` above 0 means replies were generated and not delivered.
+`state` is whatever the server holds for the agent: on `release/2.0` that is `IDLE`, `PROCESSING` or `ERROR_RECOVERY`, or `UNKNOWN` for an agent that has not started. Treat it as an open string. `session_id` is truncated to 8 characters. `context_tokens` 0 means unknown. `dead_letters` above 0 means replies were generated and not delivered (outbox rows that gave up). `dead_letter_path` is deprecated and now names the outbox file.
 
 `/health` keeps its per-agent `shards` as a map `{shard_id: {context_tokens}}`; it is not the shard list. The dashboard reads shard rows from `/agents` only and uses `/health` for `alive`, `session_id` and the queue depth of an agent that reports no shard rows.
 
