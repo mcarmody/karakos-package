@@ -698,10 +698,13 @@ def load_stored_facts(agent: str = "", limit: int = 50) -> str:
     """
     try:
         from lib.graph.recall import top_facts
+        from lib.graph.schema import GraphNotInitialised
         from lib.graph.store import open_graph
         store = open_graph(WORKSPACE_ROOT / "data", create=False)
         facts = top_facts(store, agent, limit)
-    except Exception as e:  # GraphNotInitialised included
+    except GraphNotInitialised:
+        return ""  # fresh install: no block, no log line
+    except Exception as e:
         log.debug(f"No stored facts for {agent}: {e}")
         return ""
     lines = []
