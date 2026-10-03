@@ -31,6 +31,7 @@ import socket
 import subprocess
 import threading
 import time
+import sys
 from pathlib import Path
 
 import pytest
@@ -414,26 +415,11 @@ def test_scheduler_runs_flusher_every_five_minutes():
         "run_flush_deferred_messages does not invoke the flusher script"
     )
 
-    for node in ast.walk(_function(tree, "main")):
-        if not (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "do"
-            and node.args
-            and isinstance(node.args[0], ast.Name)
-            and node.args[0].id == "run_flush_deferred_messages"
-        ):
-            continue
-        # Walk down schedule.every(5).minutes.do(...): .do's owner is the
-        # .minutes attribute, whose owner is the every(5) call.
-        minutes = node.func.value
-        assert isinstance(minutes, ast.Attribute) and minutes.attr == "minutes"
-        every = minutes.value
-        assert (
-            isinstance(every, ast.Call)
-            and every.args
-            and isinstance(every.args[0], ast.Constant)
-            and every.args[0].value == 5
-        ), "flusher is scheduled, but not at the 5-minute cadence the spool promises"
-        return
-    raise AssertionError("main() never schedules run_flush_deferred_messages")
+    # The cadence lives in the job table (lib/job_registry.py).
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+    import job_registry
+    job = {j.name: j for j in job_registry.BUILTIN}["flush-deferred"]
+    assert job.run == "scheduler:run_flush_deferred_messages"
+    assert job.schedule == job_registry.Every(300), (
+        "flusher is scheduled, but not at the 5-minute cadence the spool promises"
+    )
