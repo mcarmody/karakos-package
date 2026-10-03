@@ -197,3 +197,9 @@ def test_spawn_argv_settings_carry_new_hooks(tmp_workspace, monkeypatch):
     text = json.dumps(used["hooks"])
     assert "bash-safety-rails.py" in text and "block-bare-ssh.py" in text
     assert "sleep-poll" not in text
+
+
+def test_shipped_settings_register_inject_recall_once():
+    config = json.loads(SETTINGS_PATH.read_text())
+    commands = [h["command"] for g in config["hooks"]["UserPromptSubmit"] for h in g["hooks"]]
+    assert sum("inject-recall.py" in c for c in commands) == 1
