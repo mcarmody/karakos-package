@@ -180,6 +180,14 @@ global. Tests must not read `HOME`, bind real ports or touch Discord;
 `tests/test_no_home_access.py` enforces this. The `Harness` signatures are
 frozen by `tests/test_harness_api.py`.
 
+**Known load flakes.** Under full-suite load a few harness tests have timed out
+and then passed alone or on rerun: `test_depth_cap_two_for_calls` and
+`test_two_shards_calling_each_other_is_refused_at_once` (hive timeouts, in
+`tests/test_hive_harness.py`) and `test_no_boundary_runs_as_next_turn` (a
+`wait_for` in `tests/test_steering_harness.py`). They are timing sensitivity, not
+logic failures: rerun the test alone before treating one as a regression, and
+give a new harness wait a generous timeout.
+
 ## Using the Builder Agent
 
 The builder agent receives specs as markdown files in its inbox and implements them on feature branches.
@@ -428,6 +436,7 @@ want to edit:
 | `COST_DAILY_LIMIT` / `COST_MONTHLY_LIMIT` | Spend caps in USD, enforced when a message is queued |
 | `COST_WARNING_THRESHOLD` | Fraction of a cap that triggers a warning, default 0.75 |
 | `MAX_CONCURRENT_BUILDERS` / `MAX_CONCURRENT_REVIEWERS` | Parallel dispatches |
+| `KARAKOS_REPLY_CLASSIFIER` | `off` disables the reply gate's classifier tier install-wide ([DISCORD_SETUP.md](DISCORD_SETUP.md#shared-channels-optional)) |
 | `GUEST_TURN_LIMIT` | Turns a bot author may consume, default 12 |
 | `DISCORD_POST_MAX_ATTEMPTS` | Per-chunk tries for incidental posts (tool lines, notices), default 3 |
 | `DISCORD_OUTBOX_MAX_ATTEMPTS` / `DISCORD_OUTBOX_MAX_AGE_S` | Outbox retries (default 12) and age limit (default 86400 s) before a reply is marked dead |
@@ -559,8 +568,8 @@ object to that agent's entry in `config/agents.yaml`:
 
 ```yaml
 agents:
-  researcher:
-    name: researcher
+  helper:
+    name: helper
     role: custom
     env:
       ANTHROPIC_SMALL_FAST_MODEL: claude-haiku-4-5
@@ -598,10 +607,10 @@ default.** To silence it for an agent, set `tool_streaming` in that agent's
 
 ```yaml
 agents:
-  researcher:
-    name: researcher
+  helper:
+    name: helper
     role: custom
-    system_prompt: agents/researcher/SYSTEM_PROMPT.md
+    system_prompt: agents/helper/SYSTEM_PROMPT.md
     tool_streaming: false
 ```
 

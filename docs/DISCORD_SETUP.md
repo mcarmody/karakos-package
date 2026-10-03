@@ -205,6 +205,9 @@ logged once and treated as off.
 | `edit_reroute` | `false`, `true`, or `{"window_s": 900, "max_followups": 3}` | When a person edits a message an agent already received: a still-queued message is rewritten in place, otherwise the agent gets a follow-up with the old and new text. An edit after a `PASS` or empty reply is ignored. | Read Message History |
 | `suppress_embeds` | `false`, `true` | Agent text replies and tool lines are posted with link previews suppressed. Ask prompts keep their embeds. Messages already posted are not changed. | none |
 
+`true` for `threads` means `after_s` 60 and `max_lines` 40; `true` for `edit_reroute`
+means `window_s` 900 and `max_followups` 3.
+
 Reaction notices and edits need the relay to be able to read the message, so the
 bot must be able to see the channel's history. Changes to `channels.json` are
 picked up by the relay within seconds and by the server on its next agent reload.

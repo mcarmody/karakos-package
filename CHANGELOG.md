@@ -14,6 +14,8 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- Documentation for 2.0 (ANDURIL 7.2): UPGRADING rewritten around `bin/karakos migrate` with a drain checklist, ARCHITECTURE restructured for the registry, shards, hive, graph memory, outbox and credentials, new EXTENDING sections (shards, hive, memory, prompts, build queue, upgrade seams, native-deployment lessons), a QUICKSTART with smoke-tagged check commands, `docs/TEST_RESULTS.md` marked historical, and `tests/test_docs.py` to keep them honest.
+
 - Operator switches (ANDURIL 6.4): `/pause [minutes]` holds an agent's queue (the turn in progress finishes; `data/operator-pause.json`, survives restarts; `POST /agents/{name}/pause|resume`), `/resume`, `/effort <level>` (agent-level `--effort` override in `data/runtime-overrides.json`, applied after the turn when busy; `POST /agents/{name}/effort`), and `/interrupt` with an optional `message`. `GET /agents` shards gain `effort`/`effort_source`. A registry `effort:` key, previously inert, is now passed to the CLI as `--effort`.
 - Turn logs are redacted: the stream-log tee, `turn_events` rows and tool lines mask credential-shaped strings and the values of secret-named environment variables (`lib/redact.py`). Existing logs are not rewritten (ANDURIL 6.4).
 
