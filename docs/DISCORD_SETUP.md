@@ -177,6 +177,38 @@ Two rules apply to every bot regardless of that key:
 
 Set `GUEST_TURN_LIMIT` in `config/.env` to change the cap.
 
+## Optional behaviours
+
+Four small behaviours that make a busy channel and a long-running agent easier
+to live with. Every one is **off by default**, so an upgraded install behaves
+exactly as before. They are set in `config/channels.json`: a top-level `"ux"`
+object applies to every channel, and a channel's own `"ux"` object overrides it
+key by key. A key set in neither place is off. A wrong type or an unknown key is
+logged once and treated as off.
+
+```json
+{
+  "ux": {"suppress_embeds": true},
+  "channels": {
+    "general": {
+      "id": "...",
+      "ux": {"threads": {"after_s": 60}, "edit_reroute": true, "reaction_notices": "owner"}
+    }
+  }
+}
+```
+
+| Key | Values (default off) | What it does | Discord permissions |
+|---|---|---|---|
+| `threads` | `false`, `true`, or `{"after_s": 60, "max_lines": 40}` | Once a turn has run `after_s` seconds, its tool-activity lines move into a public thread opened on the first tool line. The final reply stays in the channel. The per-turn line cap rises from 12 to `max_lines`. If a thread cannot be created, the lines stay in the channel. Replies inside the thread route as the parent channel. | Create Public Threads, Send Messages in Threads |
+| `reaction_notices` | `false`, `"owner"` (or `true`), `"humans"` | Tells the agent when a person reacts to one of its messages. The agent normally answers `PASS`, which is not posted. One notice per user and message per minute, at most 10 per channel per minute. | Read Message History |
+| `edit_reroute` | `false`, `true`, or `{"window_s": 900, "max_followups": 3}` | When a person edits a message an agent already received: a still-queued message is rewritten in place, otherwise the agent gets a follow-up with the old and new text. An edit after a `PASS` or empty reply is ignored. | Read Message History |
+| `suppress_embeds` | `false`, `true` | Agent text replies and tool lines are posted with link previews suppressed. Ask prompts keep their embeds. Messages already posted are not changed. | none |
+
+Reaction notices and edits need the relay to be able to read the message, so the
+bot must be able to see the channel's history. Changes to `channels.json` are
+picked up by the relay within seconds and by the server on its next agent reload.
+
 ## Operational Commands
 
 These are real Discord application commands: type `/` in any channel the bot

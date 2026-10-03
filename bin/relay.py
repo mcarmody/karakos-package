@@ -10,6 +10,7 @@ Adapters:
 
 import asyncio
 import discord
+import hashlib
 import json
 import logging
 import os
@@ -33,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import ask_handler  # noqa: E402
 import build_dispatcher  # noqa: E402
 import build_hosts  # noqa: E402
+import discord_ux  # noqa: E402
 import registry as agent_registry  # noqa: E402
 import reply_classifier  # noqa: E402
 import reply_gate_config  # noqa: E402
@@ -518,6 +520,11 @@ AGENT_SERVER_URL = os.environ.get("AGENT_SERVER_URL", f"http://localhost:{AGENT_
 AGENT_SERVER_TOKEN = os.environ.get("AGENT_SERVER_TOKEN", "")
 OWNER_DISCORD_ID = int(os.environ.get("OWNER_DISCORD_ID", "0"))
 
+# Reaction notices (6.2): one per (user, message) per cooldown, and at most
+# REACTION_NOTICE_RATE per channel per minute.
+REACTION_NOTICE_COOLDOWN_S = 60
+REACTION_NOTICE_RATE = 10
+
 # Dispatch config
 DISPATCH_INBOX_DIR = WORKSPACE_ROOT / "inbox"
 DISPATCH_POLL_INTERVAL = 30
@@ -654,6 +661,19 @@ def maybe_reload_config():
         if st["failed"] != current:
             log.error(f"config reload failed, keeping previous config: {e}")
         st["failed"] = current
+
+
+_ux_cache = {"src": None, "cfg": None}
+
+
+def ux_config() -> "discord_ux.UxConfig":
+    """Parsed channels.json "ux" blocks; re-parsed when the config is reloaded."""
+    if _ux_cache["src"] is not channels_config or _ux_cache["cfg"] is None:
+        cfg, warnings = discord_ux.parse_ux(channels_config)
+        for w in warnings:
+            log.warning(f"channels.json ux: {w}")
+        _ux_cache["src"], _ux_cache["cfg"] = channels_config, cfg
+    return _ux_cache["cfg"]
 
 
 def sys_command_default(channel_name) -> Optional[str]:
@@ -874,7 +894,7 @@ class DiscordAdapter(discord.Client):
         # keep answering in, and that is only knowable from our own traffic.
         if message.author == self.user:
             self.reply_gate.note_agent_post(message.channel.id)
-            own_name = self.get_channel_name(str(message.channel.id))
+            own_name, _ = self.resolve_channel(message.channel)
             if own_name and ((channels_config.get("channels", {}).get(own_name) or {})
                              .get("reply_gate")):
                 self.reply_gate.note_message(
@@ -891,7 +911,10 @@ class DiscordAdapter(discord.Client):
 
         maybe_reload_config()
 
-        channel_name = self.get_channel_name(str(message.channel.id))
+        # A thread is not listed in channels.json; it resolves to its parent.
+        own_name = self.get_channel_name(str(message.channel.id))
+        channel_name, thread_parent = self.resolve_channel(message.channel)
+        parent_name = channel_name if own_name is None else None
         channel_config = {}
         if channel_name:
             channel_config = channels_config.get("channels", {}).get(channel_name, {}) or {}
@@ -976,8 +999,9 @@ class DiscordAdapter(discord.Client):
             return
 
         route = routing.route_message(
-            registry_obj, channel_name, target_agent, bool(message.author.bot),
+            registry_obj, own_name, target_agent, bool(message.author.bot),
             channel_opt_out=channel_config.get("route") is False,
+            parent_channel_name=parent_name,
         ) if registry_obj is not None else None
         if route is None:
             return  # No routing
@@ -1495,6 +1519,204 @@ class DiscordAdapter(discord.Client):
                 return name
         return None
 
+    def resolve_channel_ids(self, channel_id, parent_id=None):
+        """(effective channel name, parent id when resolved through a thread).
+
+        A thread has its own id, which channels.json never lists, so a message
+        in one is evaluated as its parent channel (6.2). The thread's own id
+        still names the conversation; only the policy lookups use the parent.
+        A thread under an unlisted parent resolves to (None, None): B24 holds."""
+        name = self.get_channel_name(str(channel_id))
+        if name is not None or not parent_id:
+            return name, None
+        parent_name = self.get_channel_name(str(parent_id))
+        return parent_name, (str(parent_id) if parent_name else None)
+
+    def resolve_channel(self, channel):
+        return self.resolve_channel_ids(
+            channel.id, getattr(channel, "parent_id", None))
+
+    # -- Optional behaviours (6.2): reaction notices and edit reroute ---------
+
+    async def _lookup_channel(self, channel_id):
+        channel = self.get_channel(channel_id)
+        if channel is None:
+            try:
+                channel = await self.fetch_channel(channel_id)
+            except Exception:
+                return None
+        return channel
+
+    def _ux_state(self):
+        st = getattr(self, "_ux_runtime", None)
+        if st is None:
+            st = self._ux_runtime = {"seen": {}, "rate": {}}
+        return st
+
+    async def on_raw_reaction_add(self, payload):
+        """Tell an agent that a person reacted to one of its messages."""
+        try:
+            await self._reaction_notice(payload)
+        except Exception as e:
+            log.warning("reaction notice failed: %s", e)
+
+    async def _reaction_notice(self, payload):
+        if payload.guild_id and str(payload.guild_id) not in self.server_ids:
+            return
+        maybe_reload_config()
+        if payload.user_id in discord_id_to_agent or (
+                self.user is not None and payload.user_id == self.user.id):
+            return
+        member = getattr(payload, "member", None)
+        if member is not None and getattr(member, "bot", False):
+            return
+        if not ux_config().any_on():
+            return
+        channel = await self._lookup_channel(payload.channel_id)
+        if channel is None:
+            return
+        name, thread_parent = self.resolve_channel(channel)
+        if name is None:
+            return
+        mode = ux_config().for_channel(name).reaction_notices
+        if mode is None:
+            return
+        if mode == "owner":
+            if not OWNER_DISCORD_ID or payload.user_id != OWNER_DISCORD_ID:
+                return
+        elif member is None:
+            # "humans": without the member we cannot rule out a bot.
+            try:
+                user = self.get_user(payload.user_id) or await self.fetch_user(payload.user_id)
+            except Exception:
+                return
+            if user is None or getattr(user, "bot", False):
+                return
+            member = user
+
+        st = self._ux_state()
+        now = time.monotonic()
+        key = (payload.user_id, payload.message_id)
+        last = st["seen"].get(key)
+        if last is not None and now - last < REACTION_NOTICE_COOLDOWN_S:
+            return
+        recent = st["rate"].setdefault(payload.channel_id, deque())
+        while recent and now - recent[0] >= 60:
+            recent.popleft()
+        if len(recent) >= REACTION_NOTICE_RATE:
+            return
+
+        try:
+            msg = await channel.fetch_message(payload.message_id)
+        except Exception as e:
+            log.info("reaction notice: could not fetch message %s: %s", payload.message_id, e)
+            return
+        agent = discord_id_to_agent.get(getattr(msg.author, "id", None))
+        if agent is None:
+            return
+        route = routing.route_message(
+            registry_obj, name, agent, False,
+            channel_opt_out=(channels_config.get("channels", {}).get(name) or {}).get("route") is False,
+        ) if registry_obj is not None else None
+        if route is None:
+            return
+
+        st["seen"][key] = now
+        recent.append(now)
+        if len(st["seen"]) > 2048:
+            for k in [k for k, t in st["seen"].items() if now - t >= REACTION_NOTICE_COOLDOWN_S]:
+                st["seen"].pop(k, None)
+
+        emoji = str(payload.emoji)
+        reactor = (getattr(member, "display_name", None) if member is not None else None) \
+            or f"user {payload.user_id}"
+        body = {
+            "agent": route.agent,
+            "shard": route.shard,
+            "channel": name,
+            "channel_id": str(payload.channel_id),
+            "server": "discord",
+            "author": reactor,
+            "author_id": str(payload.user_id),
+            "is_bot": False,
+            "content": discord_ux.reaction_notice_text(reactor, emoji, msg.content or ""),
+            "message_id": "reaction:{}:{}:{}".format(
+                msg.id, payload.user_id, hashlib.sha1(emoji.encode()).hexdigest()[:8]),
+            "mentions_agent": False,
+            "attachments": [],
+        }
+        if thread_parent:
+            body["thread_parent_id"] = thread_parent
+        try:
+            async with self.http_session.post(
+                f"{AGENT_SERVER_URL}/message", json=body,
+                headers={"Authorization": f"Bearer {AGENT_SERVER_TOKEN}"},
+            ) as resp:
+                if resp.status != 202:
+                    log.info("reaction notice not queued: HTTP %s", resp.status)
+        except Exception as e:
+            log.info("reaction notice send failed: %s", e)
+
+    async def on_raw_message_edit(self, payload):
+        """Reroute a person's edit of a message an agent may already have seen."""
+        try:
+            await self._message_edited(payload)
+        except Exception as e:
+            log.warning("edit reroute failed: %s", e)
+
+    async def _message_edited(self, payload):
+        data = getattr(payload, "data", None) or {}
+        if "content" not in data:
+            return  # a link unfurl or pin, not an edit
+        if payload.guild_id and str(payload.guild_id) not in self.server_ids:
+            return
+        author = data.get("author") or {}
+        if author.get("bot"):
+            return
+        maybe_reload_config()
+        if not ux_config().any_on():
+            return
+        channel = await self._lookup_channel(payload.channel_id)
+        if channel is None:
+            return
+        name, _ = self.resolve_channel(channel)
+        if name is None or ux_config().for_channel(name).edit_reroute is None:
+            return
+
+        content = data.get("content") or ""
+        author_id = author.get("id")
+        msg = None
+        try:
+            msg = await channel.fetch_message(payload.message_id)
+        except Exception as e:
+            log.info("edit reroute: could not fetch %s, using raw text: %s", payload.message_id, e)
+        if msg is not None:
+            if getattr(msg.author, "bot", False):
+                return
+            author_id = msg.author.id
+            content = msg.content or content
+            try:
+                block = await self.resolve_reply_context(msg)
+            except Exception:
+                block = None
+            if block:
+                content = f"{block}\n{content}" if content else block
+        if author_id is None:
+            return
+        cached = getattr(payload, "cached_message", None)
+        ok, detail, body = await self.agent_server_post_json("/message/edit", {
+            "server": "discord",
+            "message_id": str(payload.message_id),
+            "channel_id": str(payload.channel_id),
+            "author_id": str(author_id),
+            "content": content,
+            "before": getattr(cached, "content", None) if cached is not None else None,
+        })
+        if not ok:
+            log.info("edit reroute not delivered: %s", detail)
+        else:
+            log.info("edit of %s: %s", payload.message_id, body.get("status"))
+
     async def download_attachments(self, message: discord.Message) -> List[Dict]:
         """Save a message's attachments locally and describe them for the agent.
 
@@ -1588,7 +1810,7 @@ class DiscordAdapter(discord.Client):
     async def send_to_agent_server(self, message: discord.Message, route):
         """Send message to agent server"""
         agent = route.agent
-        channel_name = self.get_channel_name(str(message.channel.id))
+        channel_name, thread_parent = self.resolve_channel(message.channel)
         if not channel_name:
             channel_name = "unknown"
 
@@ -1617,6 +1839,8 @@ class DiscordAdapter(discord.Client):
             "mentions_agent": any(m.id in discord_id_to_agent for m in message.mentions),
             "attachments": attachments,
         }
+        if thread_parent:
+            payload["thread_parent_id"] = thread_parent
 
         try:
             async with self.http_session.post(

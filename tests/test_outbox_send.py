@@ -721,8 +721,8 @@ def test_only_guarded_functions_post_channel_messages():
                 continue
             for call in _posts_to_messages(func):
                 src = ast.get_source_segment(path.read_text(), func)
-                if "/messages" not in src:
-                    continue   # not a channel-messages URL (e.g. an interaction callback)
+                if "/messages" not in src or "/threads" in src:
+                    continue   # not a channel-messages URL (an interaction callback, a thread create)
                 assert func.name in allowed, f"{path.name}:{func.name} posts to channel messages unguarded"
                 seen.add(func.name)
                 if func.name == "post_discord_payload":
