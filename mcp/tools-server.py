@@ -18,6 +18,9 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _handshake import initialize_result  # noqa: E402
+
 WORKSPACE = Path(os.environ.get("WORKSPACE_ROOT", "/workspace"))
 SKILLS_DIR = WORKSPACE / "skills"
 HEALTH_FILE = WORKSPACE / "data" / "health" / "mcp-tools.json"
@@ -1211,7 +1214,20 @@ def main():
         method = request.get("method", "")
         params = request.get("params", {})
 
-        if method == "tools/list":
+        if method == "initialize":
+            response = {
+                "jsonrpc": "2.0",
+                "result": initialize_result(params, "karakos-tools"),
+                "id": req_id,
+            }
+
+        elif method == "ping":
+            response = {"jsonrpc": "2.0", "result": {}, "id": req_id}
+
+        elif method.startswith("notifications/"):
+            continue  # notifications get no reply
+
+        elif method == "tools/list":
             # Return all registered tools
             tools_list = []
             for tool in all_tools:
@@ -1281,6 +1297,8 @@ def main():
                             "error": {"code": -32603, "message": str(e)},
                             "id": req_id,
                         }
+        elif "id" not in request:
+            continue  # unknown notification: ignore
         else:
             response = {
                 "jsonrpc": "2.0",
