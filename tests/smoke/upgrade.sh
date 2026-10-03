@@ -52,6 +52,7 @@ cleanup() {
   local rc=$?
   smoke_guard
   cd "$OLD" 2>/dev/null || true
+  if [ $rc -ne 0 ]; then smoke_diag "$TAG" "$ARTIFACTS"; fi
   if [ $rc -ne 0 ] && [ -n "$ARTIFACTS" ]; then
     mkdir -p "$ARTIFACTS"
     "${DC[@]}" logs --no-color > "$ARTIFACTS/compose-logs-$TAG.txt" 2>&1 || true

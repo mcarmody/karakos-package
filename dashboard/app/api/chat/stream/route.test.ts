@@ -92,7 +92,7 @@ describe("GET /api/chat/stream — terminal status", () => {
   });
 
   it("sends status forbidden for an agent the account may not read", async () => {
-    process.env.DASHBOARD_PERMISSIONS = JSON.stringify({ mike: { agents: ["herald"] } });
+    process.env.DASHBOARD_PERMISSIONS = JSON.stringify({ alpha: { agents: ["relay"] } });
     vi.resetModules();
     apiMod = await import("@/lib/api");
     ({ GET } = await import("./route"));

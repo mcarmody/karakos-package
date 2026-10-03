@@ -46,6 +46,8 @@ open_perms() {   # the container user is not the runner's uid; let it write the 
 cleanup() {
   local rc=$?
   smoke_guard
+  cd "$INSTALL" 2>/dev/null || true
+  if [ $rc -ne 0 ]; then smoke_diag fresh "$ARTIFACTS"; fi
   if [ $rc -ne 0 ] && [ -n "$ARTIFACTS" ]; then
     mkdir -p "$ARTIFACTS"
     "${DC[@]}" logs --no-color > "$ARTIFACTS/compose-logs.txt" 2>&1 || true

@@ -25,5 +25,5 @@ TAGS = ["v1.0.0", "v1.1.1", "v1.3", "v1.5.0",
 def test_upgrade_from_tag(tag):
     require_docker()
     proc = subprocess.run(["bash", str(SCRIPT), tag], capture_output=True, text=True, timeout=1500)
-    assert proc.returncode == 0, f"{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}"
+    assert proc.returncode == 0, f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
     assert f"upgrade smoke [{tag}]: PASS" in proc.stdout
