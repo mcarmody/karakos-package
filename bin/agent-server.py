@@ -2223,6 +2223,8 @@ async def read_agent_response(
 # 39953b5c9, f6b5baaaf) and rate-limit breaker (2548524f9), minus the
 # tmux/PTY pane mechanics.
 
+GENERIC_TURN_ERROR = "The agent hit an error and the turn did not complete."
+
 WALL_USAGE = "usage"
 WALL_MODEL = "model"
 
@@ -2469,6 +2471,17 @@ async def process_agent_queue(agent: str):
             return
         agent_wall_strikes.pop(agent, None)
 
+        # Any other errored turn: the `result` text is raw CLI output (an
+        # OAuth failure body, a stack trace), not a reply. It never goes to
+        # the channel; the server log keeps a redacted copy and the row is
+        # marked failed rather than complete.
+        final_status = STATUS_COMPLETE
+        if metadata and metadata.get("is_error"):
+            log.error(f"{agent} turn ended with is_error; raw result (redacted): "
+                      f"{redact_for_log(response_text, 500)!r}")
+            response_text = GENERIC_TURN_ERROR
+            final_status = STATUS_CRASHED
+
         # Post response to Discord
         discord_msg_id = None
         if response_text and channel_id != "0":
@@ -2482,7 +2495,7 @@ async def process_agent_queue(agent: str):
             SET processed = ?, response = ?, discord_response_id = ?, processed_at = CURRENT_TIMESTAMP
             WHERE message_id IN ({','.join('?' * len(message_ids))})
             """,
-            (STATUS_COMPLETE, response_text, discord_msg_id, *message_ids)
+            (final_status, response_text, discord_msg_id, *message_ids)
         )
         await db.commit()
 

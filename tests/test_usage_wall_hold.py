@@ -188,10 +188,10 @@ def test_replays_after_reset_and_completes(ags):
     _run(ags, scenario)
 
 
-def test_ordinary_error_still_completes(ags):
+def test_ordinary_error_is_a_failed_turn_not_complete(ags):
     async def scenario():
         _wire(ags, [("boom", {"is_error": True})])
         await _insert(ags)
         await ags.process_agent_queue("amos")
-        assert (await _row(ags))["processed"] == ags.STATUS_COMPLETE
+        assert (await _row(ags))["processed"] == ags.STATUS_CRASHED
     _run(ags, scenario)
