@@ -31,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import ask_handler  # noqa: E402
 import registry as agent_registry  # noqa: E402
+import routing  # noqa: E402
 import tengwar  # noqa: E402
 
 # =============================================================================
@@ -496,7 +497,60 @@ def load_config():
             if bot_id:
                 discord_id_to_agent[int(bot_id)] = agent_name
 
+    _config_state["mtimes"] = _config_mtimes()
     log.info(f"Loaded config for {len(agent_config)} agents, {len(channels_config.get('channels', {}))} channels")
+
+
+# Config freshness: a shard added by the server's /reload must take effect here
+# without restarting the relay.
+CONFIG_RECHECK_S = 5
+_config_state = {"mtimes": None, "checked": 0.0, "failed": None}
+
+
+def _config_mtimes():
+    out = []
+    for p in (AGENTS_CONFIG_PATH, CHANNELS_CONFIG_PATH):
+        try:
+            out.append(p.stat().st_mtime_ns)
+        except OSError:
+            out.append(None)
+    return tuple(out)
+
+
+def maybe_reload_config():
+    """Re-run load_config when agents.yaml or channels.json changed (checked at
+    most every CONFIG_RECHECK_S). A failed load keeps the previous config and
+    logs once per file version."""
+    global agent_config, channels_config, registry_obj
+    st = _config_state
+    if st["mtimes"] is None:
+        return  # never loaded here; nothing to compare against
+    now = time.monotonic()
+    if now - st["checked"] < CONFIG_RECHECK_S:
+        return
+    st["checked"] = now
+    current = _config_mtimes()
+    if current == st["mtimes"]:
+        return
+    saved = (agent_config, channels_config, registry_obj, dict(discord_id_to_agent))
+    try:
+        load_config()
+        if registry_obj is None:
+            raise RuntimeError("agent registry unusable")
+        st["failed"] = None
+    except Exception as e:
+        agent_config, channels_config, registry_obj = saved[:3]
+        discord_id_to_agent.clear()
+        discord_id_to_agent.update(saved[3])
+        if st["failed"] != current:
+            log.error(f"config reload failed, keeping previous config: {e}")
+        st["failed"] = current
+
+
+def sys_command_default(channel_name) -> Optional[str]:
+    """The agent a system command targets by default in a channel. Routing
+    (lib/routing.py) does not use this; commands run in channels it refuses."""
+    return default_agent_for(channel_name)
 
 
 def default_agent_for(channel_name) -> Optional[str]:
@@ -720,21 +774,19 @@ class DiscordAdapter(discord.Client):
         # Capture message
         await self.capture_message(message)
 
-        # Determine target agent
-        target_agent = None
+        maybe_reload_config()
 
-        # Check for bot mention
-        for mention in message.mentions:
-            if mention.bot and mention.id in discord_id_to_agent:
-                target_agent = discord_id_to_agent[mention.id]
-                break
-
-        # Fall back to channel default agent
         channel_name = self.get_channel_name(str(message.channel.id))
         channel_config = {}
         if channel_name:
             channel_config = channels_config.get("channels", {}).get(channel_name, {}) or {}
-        channel_default = default_agent_for(channel_name)
+
+        # The mentioned agent (if any); routing is decided below.
+        target_agent = None
+        for mention in message.mentions:
+            if mention.bot and mention.id in discord_id_to_agent:
+                target_agent = discord_id_to_agent[mention.id]
+                break
 
         # System commands run here, not in the agent. An agent that has stopped
         # reading its queue cannot process its own `/clear`, and that is the
@@ -746,7 +798,7 @@ class DiscordAdapter(discord.Client):
         parsed = parse_sys_command(message.content)
         if parsed:
             await self.handle_sys_command(message, parsed[0], parsed[1],
-                                          target_agent, channel_default)
+                                          target_agent, sys_command_default(channel_name))
             return
 
         agent_ids = set(discord_id_to_agent.keys())
@@ -786,14 +838,21 @@ class DiscordAdapter(discord.Client):
                     )
                     return
 
-            if not target_agent:
-                target_agent = channel_default
+        # B24: a mention only routes in a channel listed in channels.json.
+        if channel_name is None:
+            if target_agent:
+                log.info(f"route channel={message.channel.id} unlisted, mention ignored")
+            return
 
-        if not target_agent:
+        route = routing.route_message(
+            registry_obj, channel_name, target_agent, bool(message.author.bot),
+            channel_opt_out=channel_config.get("route") is False,
+        ) if registry_obj is not None else None
+        if route is None:
             return  # No routing
 
-        # Send to agent server
-        await self.send_to_agent_server(message, target_agent)
+        log.info(f"route channel={channel_name} -> {route.shard} ({route.reason})")
+        await self.send_to_agent_server(message, route)
 
     async def allow_bot_message(self, message: discord.Message,
                                 target_agent: Optional[str],
@@ -1395,8 +1454,9 @@ class DiscordAdapter(discord.Client):
                     log.info("Could not fetch replied-to message %s: %s", ref_id, e)
         return format_reply_context(target)
 
-    async def send_to_agent_server(self, message: discord.Message, agent: str):
+    async def send_to_agent_server(self, message: discord.Message, route):
         """Send message to agent server"""
+        agent = route.agent
         channel_name = self.get_channel_name(str(message.channel.id))
         if not channel_name:
             channel_name = "unknown"
@@ -1414,6 +1474,7 @@ class DiscordAdapter(discord.Client):
 
         payload = {
             "agent": agent,
+            "shard": route.shard,
             "channel": channel_name,
             "channel_id": str(message.channel.id),
             "server": "discord",
@@ -1433,7 +1494,7 @@ class DiscordAdapter(discord.Client):
                 headers={"Authorization": f"Bearer {AGENT_SERVER_TOKEN}"}
             ) as resp:
                 if resp.status == 202:
-                    log.info(f"Queued message for {agent} from {message.author.display_name}")
+                    log.info(f"Queued message for {route.shard} from {message.author.display_name}")
                 else:
                     text = await resp.text()
                     log.error(f"Agent server error {resp.status}: {text}")

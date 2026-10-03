@@ -269,6 +269,19 @@ bin/poke.sh --agent primary --silent "run the nightly sweep"
 
 For file-based dispatch, drop files in `inbox/{agent-name}/`.
 
+### Routing
+
+The relay sends each Discord message to a shard (`lib/routing.py`), in this order:
+
+1. A channel that is not in `channels.json` is never routed, mention or not.
+2. An `@mention` of a known agent goes to the shard that owns the channel if it belongs to that agent, else to that agent's first shard.
+3. A bot never routes on a channel default (it must `@mention`).
+4. Otherwise the shard that lists the channel in `agents.yaml` gets it.
+5. A listed channel no shard owns goes to the primary agent's first shard.
+6. Otherwise nothing is routed.
+
+Set `"route": false` on a channel in `channels.json` to switch off rule 5 for it (rules 2 and 4 still apply). The relay re-reads `agents.yaml` and `channels.json` when they change, so a shard added by `/reload` needs no relay restart.
+
 ## Self-Modification
 
 The system can modify itself through the builder agent:

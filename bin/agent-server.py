@@ -2276,18 +2276,22 @@ async def handle_message(request):
     if not isinstance(attachments, list):
         return web.json_response({"error": "attachments must be a list"}, status=400)
 
-    # A shard id selects that shard; an agent id selects the agent's first shard
-    # (2.2 replaces that with channel routing). An unknown shard hint with a
-    # valid agent falls back to the agent's first shard rather than failing.
+    # The relay sends the shard it routed to (2.2). An agent id alone selects
+    # the agent's first shard. An unknown shard with a valid agent falls back to
+    # that agent's first shard (the relay's config can lag a registry reload).
     specs = effective_specs()
-    known_shards = {sp.id for sp in specs}
-    if shard_hint and shard_hint in known_shards:
+    owners = {sp.id: sp.agent for sp in specs}
+    claimed_agent = agent
+    if shard_hint and shard_hint in owners:
         agent = shard_hint
+        if claimed_agent and claimed_agent in owners.values() \
+                and owners[shard_hint] != claimed_agent:
+            log.warning(f"message shard {shard_hint!r} belongs to agent "
+                        f"{owners[shard_hint]!r}, not {claimed_agent!r}; using the shard")
     else:
-        if shard_hint:
-            log.warning(f"/message: unknown shard {shard_hint!r}; "
-                        f"falling back to the first shard of agent {agent!r}")
-        agent = shards_lib.first_shard(specs, agent) if agent else None
+        agent = shards_lib.first_shard(specs, claimed_agent) if claimed_agent else None
+        if shard_hint and agent:
+            log.warning(f"message for unknown shard {shard_hint}, using {agent}")
     if not agent:
         return web.json_response({"error": "Invalid agent"}, status=400)
 
