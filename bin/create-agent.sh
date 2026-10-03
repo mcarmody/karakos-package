@@ -28,7 +28,7 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: create-agent.sh [OPTIONS] AGENT_NAME"
             echo ""
             echo "Options:"
-            echo "  --template NAME        Base template: primary, relay, builder, reviewer (default: primary)"
+            echo "  --template NAME        Base template: primary, monitor, builder, reviewer (default: primary)"
             echo "  --model MODEL          Claude model: opus, sonnet, haiku (default: sonnet)"
             echo "  --discord-token TOKEN  Discord bot token (optional)"
             echo "  --ephemeral            Don't persist to agents.yaml"
@@ -57,6 +57,12 @@ fi
 if [[ ! "$AGENT_NAME" =~ ^[a-z][a-z0-9-]*$ ]]; then
     echo "Error: agent name must be lowercase alphanumeric (got: $AGENT_NAME)" >&2
     exit 1
+fi
+
+# `relay` was the 1.x name of the monitor template.
+if [[ "$TEMPLATE" == "relay" ]]; then
+    echo "Note: template 'relay' is now 'monitor'; using monitor." >&2
+    TEMPLATE="monitor"
 fi
 
 # Check template exists

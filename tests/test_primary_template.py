@@ -53,7 +53,7 @@ def jarvis(real_template_workspace, monkeypatch):
 def test_composition_default_shard(jarvis):
     out = pc.compose_system_prompt(jarvis, "jarvis")
     assert "Jarvis" in out and "`jarvis`" in out
-    assert "- #general" in out and "- **Relay** (" in out
+    assert "- #general" in out and "- **Monitor** (" in out
     assert "## Shards and the hive" in out
     assert "{{" not in out
     assert len(out) <= 9000, len(out)
@@ -155,7 +155,7 @@ def test_onboarding_primary_with_persona_is_empty(server):
 def test_onboarding_non_primary_is_empty(server, role):
     ws, mod = server
     if role == "monitor":
-        aid = "relay"
+        aid = "monitor"
     else:
         aid = f"x-{role}"
         registry.write_agent(ws, aid, {"name": aid, "role": role})

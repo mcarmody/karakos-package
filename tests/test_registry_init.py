@@ -50,7 +50,7 @@ def test_overlong_name_refused(ws):
 
 def test_primary_equal_monitor_refused(ws):
     with pytest.raises(registry.RegistryError, match="equals the monitor id"):
-        registry.init_registry(ws, "relay", "Relay")
+        registry.init_registry(ws, "monitor", "Monitor")
 
 
 def test_existing_registry_refused(ws):
@@ -64,15 +64,15 @@ def test_document_shape(ws):
     registry.init_registry(ws, "jarvis", "Jarvis", channels=["general"])
     doc = yaml.safe_load((ws / "config" / "agents.yaml").read_text())
     p = doc["agents"]["jarvis"]
-    assert "system_prompt" not in p and "system_prompt" not in doc["agents"]["relay"]
+    assert "system_prompt" not in p and "system_prompt" not in doc["agents"]["monitor"]
     assert p["prompt"] == {"section": "agents/jarvis/SYSTEM_PROMPT.md", "core": True,
                            "house_style": True}
     assert p["context_budget_tokens"] == 150000
     assert "token_budget_4h" not in p and "handoff_on_reset" not in p
     assert p["shards"] == [{"id": "jarvis", "channels": ["general"]}]
-    m = doc["agents"]["relay"]
+    m = doc["agents"]["monitor"]
     assert m["role"] == "monitor" and m["model"] == "haiku"
-    assert m["prompt"]["section"] == "agents/templates/relay.md"
+    assert m["prompt"]["section"] == "agents/templates/monitor.md"
     assert registry.load_registry(ws).primary().id == "jarvis"
 
 

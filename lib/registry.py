@@ -444,9 +444,16 @@ def write_agent(workspace, agent_id, body):
 # --------------------------------------------------------------------------
 
 LEGACY_BACKUP_SUFFIX = ".pre-2.0"
+MONITOR_TEMPLATE = "agents/templates/monitor.md"
+# The monitor reads logs and error strings, so it holds no shell: deny rules survive
+# --dangerously-skip-permissions, which also keeps AGENT_SERVER_TOKEN out of its reach.
+MONITOR_DISALLOWED_TOOLS = ["Bash", "Write", "Edit", "NotebookEdit", "WebFetch", "WebSearch"]
+RESERVED_MONITOR_IDS = ("relay", "scheduler", "mcp-tools", "server")   # component names
 _DEFAULT_MONITOR = {"name": "relay", "role": "monitor", "model": "haiku",
+                    "max_turns": 10, "timeout": 300,
                     "dashboard_chat": False,
-                    "prompt": {"section": "agents/templates/relay.md",
+                    "disallowed_tools": list(MONITOR_DISALLOWED_TOOLS),
+                    "prompt": {"section": MONITOR_TEMPLATE,
                                "core": True, "house_style": True}}
 
 
@@ -493,6 +500,7 @@ def legacy_to_registry_dict(old, channels=None):
     if "monitor" not in roles.values():
         mid = "relay" if "relay" not in agents else "monitor"
         agents[mid] = {**_DEFAULT_MONITOR, "name": mid,
+                       "disallowed_tools": list(MONITOR_DISALLOWED_TOOLS),
                        "prompt": dict(_DEFAULT_MONITOR["prompt"])}
     chans = (channels or {}).get("channels") if isinstance(channels, dict) else None
     if isinstance(chans, dict):
@@ -579,8 +587,8 @@ def clean_display_name(name):
     return name
 
 
-def init_registry(workspace, primary_id, primary_name, monitor_id="relay", monitor_name=None,
-                  monitor_template="agents/templates/relay.md", channels=None,
+def init_registry(workspace, primary_id, primary_name, monitor_id="monitor", monitor_name=None,
+                  monitor_template=MONITOR_TEMPLATE, channels=None,
                   context_budget=150000):
     """Write a fresh config/agents.yaml (primary + monitor). Refuses an existing
     file. The document is built as a dict and dumped by yaml.safe_dump, so no name
@@ -590,6 +598,9 @@ def init_registry(workspace, primary_id, primary_name, monitor_id="relay", monit
         raise RegistryError([f"{path} already exists; refusing to overwrite"])
     primary_name = clean_display_name(primary_name) or primary_id
     monitor_name = clean_display_name(monitor_name) if monitor_name else monitor_id
+    if monitor_id in RESERVED_MONITOR_IDS:
+        raise RegistryError([f"monitor id '{monitor_id}' is reserved (it names a system "
+                             f"component); choose another"])
     if primary_id == monitor_id:
         raise RegistryError([f"primary id '{primary_id}' equals the monitor id; choose another name"])
     doc = {
@@ -620,6 +631,7 @@ def init_registry(workspace, primary_id, primary_name, monitor_id="relay", monit
                 "tool_streaming": False,
                 "stream_to_channel": False,
                 "dashboard_chat": False,
+                "disallowed_tools": list(MONITOR_DISALLOWED_TOOLS),
             },
         },
     }
@@ -637,9 +649,9 @@ def _init_main(ws, args):
     ap.add_argument("--workspace", default=ws)
     ap.add_argument("--primary-id", default=None)
     ap.add_argument("--primary-name", required=True)
-    ap.add_argument("--monitor-id", default="relay")
+    ap.add_argument("--monitor-id", default="monitor")
     ap.add_argument("--monitor-name", default=None)
-    ap.add_argument("--monitor-template", default="agents/templates/relay.md")
+    ap.add_argument("--monitor-template", default=MONITOR_TEMPLATE)
     ap.add_argument("--channel", action="append", default=None)
     ap.add_argument("--context-budget", type=int, default=150000)
     a = ap.parse_args(args)
