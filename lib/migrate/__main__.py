@@ -18,6 +18,8 @@ def main(argv=None) -> int:
     p.add_argument("--dry-run", action="store_true", help="print the plan; write nothing")
     p.add_argument("--auto", action="store_true", help="non-interactive (Docker)")
     p.add_argument("--force", action="store_true", help="proceed on unknown schema")
+    p.add_argument("--parity-queries", type=int, default=50, metavar="N",
+                   help="memory recall-parity queries (default 50; 0 disables)")
     p.add_argument("--to-backup", metavar="DIR", help="restore a backup directory")
     p.add_argument("--root", default=os.environ.get("WORKSPACE_ROOT", "/workspace"),
                    help=argparse.SUPPRESS)
@@ -37,7 +39,8 @@ def main(argv=None) -> int:
 
     from lib.migrate import runner
     return runner.run(data, config, backup_root=root / "backups",
-                      dry_run=a.dry_run, force=a.force)
+                      dry_run=a.dry_run, force=a.force,
+                      parity_queries=a.parity_queries)
 
 
 if __name__ == "__main__":

@@ -20,6 +20,10 @@ class Context:
     backup_dir: Optional[Path]
     detected: Detected
     log: logging.Logger
+    force: bool = False
+    parity_queries: int = 50
+    # report section -> lines; written to migration-reports/migration-report.md
+    report: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -30,6 +34,10 @@ class Step:
     detect: Callable[[Context], bool]
     apply: Callable[[Context], None]
     verify: Callable[[Context], None]
+    # optional: dry-run lines for this step (must write nothing)
+    plan: Optional[Callable[[Context], List[str]]] = None
+    # optional: lines naming data the step cannot carry (fork policy)
+    preflight: Optional[Callable[[Context], List[str]]] = None
 
 
 _NAME = re.compile(r"^(\d\d)_")
@@ -101,7 +109,7 @@ def unreferenced_env_report(config_dir) -> List[str]:
 
 
 def run(data_dir, config_dir, backup_root=None, steps=None, dry_run=False,
-        force=False, out=print) -> int:
+        force=False, parity_queries=50, out=print) -> int:
     data_dir, config_dir = Path(data_dir), Path(config_dir)
     steps = load_steps() if steps is None else steps
     log = logging.getLogger("karakos.migrate")
@@ -125,10 +133,31 @@ def run(data_dir, config_dir, backup_root=None, steps=None, dry_run=False,
             out("dry-run: would refuse without --force")
             return EXIT_OK
 
-    ctx = Context(data_dir, config_dir, None, detected, log)
+    ctx = Context(data_dir, config_dir, None, detected, log, force=force,
+                  parity_queries=parity_queries)
     plan = [s for s in steps if s.detect(ctx)]
     out("plan: " + (", ".join(s.name for s in plan) or "no data steps") + ", stamp")
+    left_behind = []
+    for s in plan:
+        if s.preflight:
+            left_behind += s.preflight(ctx)
+    if left_behind:
+        out("data this migration does not recognise:")
+        for line in left_behind:
+            out(f"  - {line}")
+        if not force:
+            if dry_run:
+                out("dry-run: would refuse without --force")
+                return EXIT_OK
+            out("refusing: unrecognised data (use --force to proceed; it stays only "
+                "in the retained original files)")
+            return EXIT_REFUSED
+        ctx.report["Left behind"] = list(left_behind)
     if dry_run:
+        for s in plan:
+            if s.plan:
+                for line in s.plan(ctx):
+                    out(line)
         for line in unreferenced_env_report(config_dir):
             out(line)
         out("dry-run: nothing written")
@@ -153,9 +182,21 @@ def run(data_dir, config_dir, backup_root=None, steps=None, dry_run=False,
             out(f"restore with: python3 -m lib.migrate --to-backup {ctx.backup_dir}")
             return EXIT_STEP_FAILED
 
+    _write_report(ctx)
     guard.write_stamp(data_dir, migrated_from=_from_version(detected))
     out(f"migrated to schema {SCHEMA_VERSION}")
     return EXIT_OK
+
+
+def _write_report(ctx: Context) -> None:
+    if not ctx.report:
+        return
+    out = ["# Migration report", ""]
+    for section, lines in ctx.report.items():
+        out += [f"## {section}", ""] + list(lines) + [""]
+    d = Path(ctx.data_dir) / "migration-reports"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "migration-report.md").write_text("\n".join(out))
 
 
 def _from_version(d: Detected):
