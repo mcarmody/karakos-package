@@ -9,6 +9,7 @@ Port: 18791 (configurable via AGENT_SERVER_PORT env var)
 """
 
 import asyncio
+import errno
 import json
 import logging
 import os
@@ -863,13 +864,27 @@ async def kill_agent_subprocess(agent: str):
     deliberate_kills.add(agent)
 
     log.info(f"Killing {agent} subprocess (PID {proc.pid})")
+    def _already_dead(exc: BaseException) -> bool:
+        # The process exited between the lookup and the signal (or the
+        # respawn watcher reaped it): nothing left to kill.
+        return isinstance(exc, ProcessLookupError) or (
+            isinstance(exc, OSError) and exc.errno == errno.ESRCH)
+
     try:
         proc.terminate()
         await asyncio.wait_for(proc.wait(), timeout=5)
     except asyncio.TimeoutError:
         log.warning(f"{agent} didn't terminate, sending SIGKILL")
-        proc.kill()
-        await proc.wait()
+        try:
+            proc.kill()
+            await proc.wait()
+        except OSError as e:
+            if not _already_dead(e):
+                raise
+    except OSError as e:
+        if not _already_dead(e):
+            raise
+        log.info(f"{agent} subprocess already gone at kill time")
 
     agent_processes.pop(agent, None)
 
