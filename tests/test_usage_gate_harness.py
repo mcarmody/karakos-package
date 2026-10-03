@@ -111,6 +111,8 @@ def test_budget_pauses_the_agent_with_hysteresis_and_one_notice(harness, clock):
             await h.send("a-2", "two")
             await settle(h)
             assert len(queued(h, "a")) == 1 and len(queued(h, "a-2")) == 1
+            await h.wait_for(lambda: any("token budget" in d["content"]
+                                         and d["channel_id"] == "1" for d in h.discord))
             await h.send("a", "one-more")  # same pause: no second human notice
             await settle(h)
             human = [d for d in h.discord if d["channel_id"] == "1"
@@ -156,7 +158,8 @@ def test_budget_pause_answers_queued_calls(harness, clock):
                    " author, is_bot, content, message_id, call_id, reply_to_agent)"
                    " VALUES ('a', 'call', '0', 'local', 'b', 1, 'q', 'call-1', 'c1', 'b')")
             await h.send("a", "hello")
-            await settle(h)
+            await h.wait_for(lambda: any(r["response"] == "callee_paused"
+                                         for r in h.queue_rows("a")))
             rows = {r["message_id"]: r for r in h.queue_rows("a")}
             assert rows["call-1"]["processed"] == 4
             assert rows["call-1"]["response"] == "callee_paused"
@@ -182,7 +185,8 @@ def test_governor_defers_machine_rows_only(harness, clock):
             assert [r["content"] for r in queued(h, "a")] == ["hb1"]
             assert h.sent_to("a") == []
             await h.poke("a", "heartbeat", "hb2")
-            await settle(h)
+            await h.wait_for(lambda: any(r["response"] == "superseded"
+                                         for r in h.queue_rows("a")))
             rows = {r["content"]: r for r in h.queue_rows("a")}
             assert rows["hb1"]["response"] == "superseded" and rows["hb1"]["processed"] == 4
             assert rows["hb2"]["processed"] == 0
