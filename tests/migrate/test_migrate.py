@@ -177,6 +177,21 @@ def test_backup_restore_round_trip_with_open_wal_writer(tmp_path):
     assert (root / ".env").read_text() == "TOKEN=abc\n"
 
 
+def test_restore_survives_unowned_destination_metadata(tmp_path, monkeypatch):
+    """A container user may write a bind-mounted file it does not own but not set its times
+    (utime -> EPERM). Restore must still put the contents back (upgrade-smoke, 2026-10-03)."""
+    root = tmp_path / "ws"
+    make_install(root).close()
+    out = bk.backup(root / "data", root / "config", root / "backups")
+    (root / ".env").write_text("changed")
+
+    def no_stat(src, dst, **kw):
+        raise PermissionError(1, "Operation not permitted")
+    monkeypatch.setattr(bk.shutil, "copystat", no_stat)
+    bk.restore(out)
+    assert (root / ".env").read_text() == "TOKEN=abc\n"
+
+
 def test_restore_detects_tampered_backup(tmp_path):
     root = tmp_path / "ws"
     make_install(root).close()

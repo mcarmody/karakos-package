@@ -15,6 +15,17 @@ class BackupError(Exception):
     pass
 
 
+
+def _copy(src, dst) -> None:
+    """Copy contents, then metadata best effort. A container user that does not own an existing
+    destination (a bind mount) may write it but not set its times or mode: copy2 raised EPERM
+    from utime there and aborted the restore half way."""
+    shutil.copyfile(src, dst)
+    try:
+        shutil.copystat(src, dst)
+    except PermissionError:
+        pass
+
 def _sha256(p: Path) -> str:
     h = hashlib.sha256()
     with open(p, "rb") as f:
@@ -52,7 +63,7 @@ def _copy_file(src: Path, dst: Path) -> None:
         _sqlite_copy(src, dst)
     else:
         dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dst)
+        _copy(src, dst)
 
 
 def backup(data_dir, config_dir, dest) -> Path:
@@ -136,7 +147,7 @@ def restore(backup_dir, data_dir=None, config_dir=None) -> None:
             for sfx in _SKIP_SUFFIXES:
                 Path(str(dst) + sfx).unlink(missing_ok=True)
         dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(backup_dir / "files" / e["path"], dst)
+        _copy(backup_dir / "files" / e["path"], dst)
     _prune(m, roots, kept, backup_dir)
     # a restore returns the data dir to its pre-migration state: no stamp
     (roots["data"] / ".schema-version").unlink(missing_ok=True)
