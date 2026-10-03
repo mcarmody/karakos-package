@@ -75,6 +75,11 @@ COMMANDS = [
          "type": INTEGER, "required": False, "min_value": 1, "max_value": 1440},
         AGENT_OPTION]),
     _cmd("resume", "Release a paused agent's queue", [AGENT_OPTION]),
+    _cmd("effort", "Set an agent's effort level (default removes the override)", [
+        {"name": "level", "description": "Effort level", "type": STRING, "required": True,
+         "choices": [{"name": v, "value": v} for v in
+                     ("low", "medium", "high", "xhigh", "max", "default")]},
+        AGENT_OPTION]),
 
     # --- shaped arguments ---
     _cmd("logs", "Tail a service log", [

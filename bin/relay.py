@@ -94,8 +94,10 @@ SYS_COMMANDS = frozenset({"clear", "reload", "status", "usage"})
 SLASH_COMMANDS = frozenset({
     "status", "health", "usage", "help",
     "cost", "clear", "reload", "interrupt", "kill", "flush",
-    "logs", "pause", "resume",
+    "logs", "pause", "resume", "effort",
 })
+
+EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max", "default")
 
 # Commands that report on the whole install rather than one agent, so they
 # neither need nor accept a target and must not be blocked by "which agent?".
@@ -129,6 +131,8 @@ def slash_args(cmd: str, options: Dict) -> str:
         return " ".join(p for p in (s("service"), s("lines")) if p)
     if cmd == "pause":
         return s("minutes")
+    if cmd == "effort":
+        return s("level")
     # Everything else is either untargeted or agent-targeted, and the target
     # travels as `mentioned` (the same slot a text-path @mention fills), not
     # as args — so there is nothing left to rebuild.
@@ -1227,8 +1231,31 @@ class DiscordAdapter(discord.Client):
             await self.sys_reply(
                 message,
                 f"`{agent}` resumed." if ok else f"resume failed for `{agent}` — {detail}")
+        elif cmd == "effort":
+            await self.sys_effort(message, agent, args)
         elif cmd == "cost":
             await self.sys_cost(message, agent)
+
+    async def sys_effort(self, message, agent: str, args: str):
+        """Set the agent-level effort override (owner only, via handle_sys_command)."""
+        level = args.strip().lower()
+        if level not in EFFORT_LEVELS:
+            await self.sys_reply(message, "effort level must be one of "
+                                 + ", ".join(EFFORT_LEVELS) + ".")
+            return
+        ok, detail, body = await self.agent_server_post_json(
+            f"/agents/{agent}/effort", {"level": level})
+        if not ok:
+            await self.sys_reply(message, f"effort failed for `{agent}` — {detail}")
+            return
+        applied, deferred = body.get("applied") or [], body.get("deferred") or []
+        now = body.get("effort") or "the CLI default"
+        parts = [f"`{agent}` effort is now {now}."]
+        if applied:
+            parts.append("Applied now: " + ", ".join(f"`{x}`" for x in applied) + ".")
+        if deferred:
+            parts.append("After the current turn: " + ", ".join(f"`{x}`" for x in deferred) + ".")
+        await self.sys_reply(message, " ".join(parts))
 
     async def sys_pause(self, message, agent: str, args: str):
         """Hold the agent's queue (owner only, via handle_sys_command)."""

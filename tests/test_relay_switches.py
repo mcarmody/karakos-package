@@ -123,3 +123,38 @@ def test_slash_args_for_pause(relay):
     assert relay.slash_args("pause", {"minutes": 15, "agent": "a"}) == "15"
     assert relay.slash_args("pause", {}) == ""
     assert "pause" not in relay.SYS_COMMANDS and "resume" not in relay.SYS_COMMANDS
+
+
+# -- effort -----------------------------------------------------------------------
+
+def test_effort_posts_level_and_reports_applied_and_deferred(relay, owner):
+    ad = Adapter(relay, {"/agents/a/effort": (
+        True, "", {"effort": "max", "applied": ["a"], "deferred": ["a-2"]})})
+    out = ad.run(message(), "effort", "max")
+    assert ad.calls == [("/agents/a/effort", {"level": "max"})]
+    assert "effort is now max" in out[0]
+    assert "Applied now: `a`" in out[0] and "After the current turn: `a-2`" in out[0]
+
+
+def test_effort_default_and_unknown_level(relay, owner):
+    ad = Adapter(relay, {"/agents/b/effort": (True, "", {"effort": None, "applied": ["b"],
+                                                         "deferred": []})})
+    out = ad.run(message(), "effort", "default", mentioned="b")
+    assert ad.calls == [("/agents/b/effort", {"level": "default"})]
+    assert "the CLI default" in out[0]
+    ad2 = Adapter(relay)
+    out = ad2.run(message(), "effort", "extreme")
+    assert ad2.calls == [] and "must be one of" in out[0]
+
+
+def test_effort_failure_and_owner_gate(relay, owner):
+    ad = Adapter(relay, {"/agents/a/effort": (False, "agent server returned 400: x", {})})
+    assert "effort failed for `a`" in ad.run(message(), "effort", "low")[0]
+    ad = Adapter(relay)
+    assert "Permission denied" in ad.run(message(author_id=1), "effort", "low")[0]
+    assert ad.calls == []
+
+
+def test_slash_args_for_effort(relay):
+    assert relay.slash_args("effort", {"level": "xhigh"}) == "xhigh"
+    assert "effort" in relay.SLASH_COMMANDS and "effort" not in relay.SYS_COMMANDS

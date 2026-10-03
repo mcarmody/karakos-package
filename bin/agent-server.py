@@ -53,6 +53,7 @@ import tengwar  # noqa: E402
 import turn_loop  # noqa: E402
 import usage_gate  # noqa: E402
 import operator_pause  # noqa: E402
+import runtime_overrides  # noqa: E402
 from lib.migrate.guard import require_stamp  # noqa: E402
 
 # =============================================================================
@@ -838,6 +839,11 @@ async def start_agent_subprocess(shard: str):
 
     if persona_content:
         cmd.extend(["--append-system-prompt", persona_content])
+
+    # Effort (6.4): runtime override, else the registry key, else the CLI default.
+    effort, _src = runtime_overrides.effective_effort(WORKSPACE_ROOT, agent, config)
+    if effort and await asyncio.to_thread(runtime_overrides.cli_supports_effort):
+        cmd.extend(["--effort", effort])
 
     # Steering (2.5): the CLI replays each user line it consumes, which is the
     # server's only signal of which steered lines the model has seen.
@@ -3059,6 +3065,11 @@ async def handle_health(request):
         "outbox": outbox_health(),
     })
 
+def effort_info(agent):
+    """(effective level or None, source) for an agent; every shard shares it."""
+    return runtime_overrides.effective_effort(WORKSPACE_ROOT, agent, agent_config.get(agent, {}))
+
+
 def _paused_entry(shard):
     """null, or {reason, until} while this shard is held: an operator pause
     ("manual") first, then the usage gate. The one read of the paused view."""
@@ -3098,6 +3109,8 @@ async def handle_agents(request):
                 "channels": list(sp.channels),
                 "last_channel": agent_last_channel.get(sp.id),
                 "paused": _paused_entry(sp.id),
+                "effort": effort_info(sp.agent)[0],
+                "effort_source": effort_info(sp.agent)[1],
                 "stolen_total": STATE.stolen_total.get(sp.id, 0),
                 "steer_pending": len(STATE.steer[sp.id].entries) if sp.id in STATE.steer else 0,
                 "steered_total": STATE.steered_total.get(sp.id, 0),
@@ -3321,6 +3334,75 @@ async def handle_agent_interrupt(request):
     if len(targets) > 1:
         body["shards"] = hit
     return web.json_response(body)
+
+
+# Shards whose effort change waits for the turn in flight (spec 6.4).
+effort_pending: set = set()
+effort_respawning: set = set()
+
+
+def effort_on_turn_end(shard, result):
+    """A PROCESSING shard's effort change lands after its turn: the reply has
+    posted, new claims are held, then the subprocess respawns (session kept)."""
+    if shard not in effort_pending:
+        return
+    effort_pending.discard(shard)
+    effort_respawning.add(shard)
+
+    async def respawn():
+        try:
+            await reload_agent(shard)
+        finally:
+            effort_respawning.discard(shard)
+        await turn_loop.drain_shard(STATE, shard)
+
+    result.followups.append(respawn)
+
+
+def effort_before_claim(shard):
+    return "effort-respawn" if shard in effort_respawning else None
+
+
+async def handle_agent_effort(request):
+    """POST /agents/{name}/effort {"level": low|medium|high|xhigh|max|default}.
+    Agent-level: the owning agent of {name} (every shard) takes the level."""
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer ") or auth_header[7:] != AGENT_SERVER_TOKEN:
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    targets = _resolve_request_targets(request)
+    if not targets:
+        return web.json_response({"error": "Unknown agent"}, status=404)
+    body_in = {}
+    if request.can_read_body:
+        try:
+            parsed = await request.json()
+            body_in = parsed if isinstance(parsed, dict) else {}
+        except ValueError:
+            body_in = {}
+    level = body_in.get("level")
+    valid = agent_registry.EFFORTS + (runtime_overrides.DEFAULT,)
+    if level not in valid:
+        return web.json_response(
+            {"error": f"level must be one of {', '.join(valid)}"}, status=400)
+    if level != runtime_overrides.DEFAULT and not await asyncio.to_thread(
+            runtime_overrides.cli_supports_effort):
+        return web.json_response(
+            {"error": "effort is not supported by this CLI version"}, status=400)
+    agent = STATE.agent_of(targets[0])
+    runtime_overrides.set_effort(WORKSPACE_ROOT, agent, level)
+    shards = [sp.id for sp in effective_specs() if sp.agent == agent]
+    applied, deferred = [], []
+    for sh in shards:
+        if sh in agent_processes and agent_states.get(sh) == "PROCESSING":
+            effort_pending.add(sh)
+            deferred.append(sh)
+        elif sh in agent_processes:
+            await reload_agent(sh)
+            applied.append(sh)
+        else:
+            applied.append(sh)      # nothing running: the next spawn reads it
+    return web.json_response({"effort": effort_info(agent)[0],
+                              "applied": applied, "deferred": deferred})
 
 
 async def handle_agent_pause(request):
@@ -4740,6 +4822,10 @@ async def startup(app):
     # Account breaker, token budget and weekly governor (spec 2.7).
     usage_gate.install(STATE)
 
+    # Effort change after a turn (spec 6.4): hold claims, respawn, drain.
+    STATE.hooks.register("before_claim", effort_before_claim)
+    STATE.hooks.register("on_turn_end", effort_on_turn_end)
+
     # Operator pause (spec 6.4): /pause holds the queue, /resume releases it.
     operator_pause.install(
         STATE, on_change=lambda sh: write_agent_beacon(
@@ -4847,6 +4933,7 @@ def create_app(with_lifecycle: bool = True) -> web.Application:
     app.router.add_post("/agents/{name}/session/finalize", handle_session_finalize)
     app.router.add_post("/agents/{name}/register", handle_agent_register)
     app.router.add_post("/agents/{name}/interrupt", handle_agent_interrupt)
+    app.router.add_post("/agents/{name}/effort", handle_agent_effort)
     app.router.add_post("/agents/{name}/pause", handle_agent_pause)
     app.router.add_post("/agents/{name}/resume", handle_agent_resume)
     app.router.add_post("/agents/{name}/kill", handle_agent_kill)
