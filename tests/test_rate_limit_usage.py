@@ -29,6 +29,7 @@ import pytest
 
 PACKAGE_ROOT = Path(__file__).parent.parent
 AGENT_SERVER = PACKAGE_ROOT / "bin" / "agent-server.py"
+TURN_LOOP = PACKAGE_ROOT / "lib" / "turn_loop.py"
 RELAY_PATH = PACKAGE_ROOT / "bin" / "relay.py"
 
 FIVE_HOURS = 5 * 3600
@@ -388,11 +389,11 @@ def test_the_stream_reader_records_rate_limit_events():
     """
     import ast
 
-    tree = ast.parse(AGENT_SERVER.read_text())
+    tree = ast.parse(TURN_LOOP.read_text())  # moved from agent-server.py (2.0)
     reader = next(
         node for node in ast.walk(tree)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name == "read_agent_response"
+        and node.name == "read_events"
     )
     called = {
         getattr(n.func, "id", None) or getattr(n.func, "attr", None)

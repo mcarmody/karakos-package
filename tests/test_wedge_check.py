@@ -36,6 +36,7 @@ PACKAGE_ROOT = Path(__file__).parent.parent
 WEDGE_CHECK = PACKAGE_ROOT / "bin" / "wedge-check.py"
 SCHEDULER = PACKAGE_ROOT / "bin" / "scheduler.py"
 AGENT_SERVER = PACKAGE_ROOT / "bin" / "agent-server.py"
+TURN_LOOP = PACKAGE_ROOT / "lib" / "turn_loop.py"
 
 
 @pytest.fixture
@@ -291,8 +292,8 @@ def test_the_agent_server_writes_a_beacon_from_its_stream_loop():
     while the state stays PROCESSING — which is the exact pair `find_wedged`
     keys on.
     """
-    tree = ast.parse(AGENT_SERVER.read_text())
-    assert "write_agent_beacon" in _names_called(tree, "read_agent_response")
+    tree = ast.parse(TURN_LOOP.read_text())  # moved from agent-server.py (2.0)
+    assert "write_agent_beacon" in _names_called(tree, "read_events")
 
 
 def test_the_agent_server_marks_the_agent_idle_when_a_turn_ends():
@@ -300,17 +301,18 @@ def test_the_agent_server_marks_the_agent_idle_when_a_turn_ends():
     turn leaves a beacon that looks wedged forever — and the check would page
     about every healthy agent that had ever answered anything.
     """
-    tree = ast.parse(AGENT_SERVER.read_text())
+    tree = ast.parse(TURN_LOOP.read_text())  # moved from agent-server.py (2.0)
     node = next(
         n for n in ast.walk(tree)
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and n.name == "read_agent_response"
+        and n.name == "read_events"
     )
     states_written = {
         c.args[1].value
         for c in ast.walk(node)
         if isinstance(c, ast.Call)
-        and getattr(c.func, "id", None) == "write_agent_beacon"
+        and (getattr(c.func, "id", None) or getattr(c.func, "attr", None))
+        == "write_agent_beacon"
         and len(c.args) > 1 and isinstance(c.args[1], ast.Constant)
     }
     assert "IDLE" in states_written

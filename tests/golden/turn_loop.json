@@ -1,0 +1,445 @@
+{
+ "cost": [
+  {
+   "agent": "a",
+   "cost_delta": 0.001,
+   "duration_ms": 0.0,
+   "input_tokens": 10,
+   "output_tokens": 5,
+   "session_id": "s10",
+   "session_total": 0.001
+  },
+  {
+   "agent": "a",
+   "cost_delta": 0.001,
+   "duration_ms": 0.0,
+   "input_tokens": 10,
+   "output_tokens": 5,
+   "session_id": "s10",
+   "session_total": 0.002
+  },
+  {
+   "agent": "a",
+   "cost_delta": 0.001,
+   "duration_ms": 0.0,
+   "input_tokens": 10,
+   "output_tokens": 5,
+   "session_id": "s10",
+   "session_total": 0.003
+  },
+  {
+   "agent": "a",
+   "cost_delta": 0.001,
+   "duration_ms": 0.0,
+   "input_tokens": 10,
+   "output_tokens": 5,
+   "session_id": "s10",
+   "session_total": 0.001
+  },
+  {
+   "agent": "b",
+   "cost_delta": 0.001,
+   "duration_ms": 0.0,
+   "input_tokens": 10,
+   "output_tokens": 5,
+   "session_id": "s11",
+   "session_total": 0.001
+  },
+  {
+   "agent": "b",
+   "cost_delta": 0.001,
+   "duration_ms": 0.0,
+   "input_tokens": 10,
+   "output_tokens": 5,
+   "session_id": "s11",
+   "session_total": 0.002
+  }
+ ],
+ "discord": [
+  {
+   "agent": "a",
+   "channel_id": "10",
+   "content": "batch reply for [<ts>] harness: queued 0\n\n[<ts>] harness: queued 1\n\n[<ts>] harness: queued 2",
+   "dead_letter": true,
+   "reply_to": null
+  },
+  {
+   "agent": "a",
+   "channel_id": "10",
+   "content": "-# \u2699 Read \u2014 /x",
+   "dead_letter": false,
+   "reply_to": null
+  },
+  {
+   "agent": "a",
+   "channel_id": "10",
+   "content": "tooled",
+   "dead_letter": true,
+   "reply_to": null
+  },
+  {
+   "agent": "a",
+   "channel_id": "10",
+   "content": "The agent hit an error and the turn did not complete.",
+   "dead_letter": true,
+   "reply_to": null
+  },
+  {
+   "agent": "a",
+   "channel_id": "10",
+   "content": "dying",
+   "dead_letter": true,
+   "reply_to": null
+  },
+  {
+   "agent": "a",
+   "channel_id": "10",
+   "content": "\ud83d\udd04 a restarted \u2014 the subprocess exited unexpectedly (code 1). Context was cleared; recent conversation may need a recap.",
+   "dead_letter": false,
+   "reply_to": null
+  },
+  {
+   "agent": "a",
+   "channel_id": "10",
+   "content": "back",
+   "dead_letter": true,
+   "reply_to": null
+  },
+  {
+   "agent": "b",
+   "channel_id": "20",
+   "content": "b ok",
+   "dead_letter": true,
+   "reply_to": null
+  },
+  {
+   "agent": "b",
+   "channel_id": "20",
+   "content": "\u23f8\ufe0f usage limit reached \u2014 your message is held and will be processed after <hh:mm> UTC.",
+   "dead_letter": false,
+   "reply_to": null
+  }
+ ],
+ "log": [
+  [
+   "INFO",
+   "Sent message to a (3 queued messages)"
+  ],
+  [
+   "INFO",
+   "a stream log: <ws>/logs/agent-streams/a_<stamp>.jsonl"
+  ],
+  [
+   "INFO",
+   "a session tools (2): ['Read', 'Bash']"
+  ],
+  [
+   "INFO",
+   "a ctx=1010 turn_in=10 out=5"
+  ],
+  [
+   "INFO",
+   "a processed 3 messages"
+  ],
+  [
+   "INFO",
+   "Sent message to a (1 queued messages)"
+  ],
+  [
+   "INFO",
+   "a called tool: Read"
+  ],
+  [
+   "INFO",
+   "a called tool: Bash"
+  ],
+  [
+   "INFO",
+   "a ctx=1010 turn_in=10 out=5"
+  ],
+  [
+   "INFO",
+   "a processed 1 messages"
+  ],
+  [
+   "INFO",
+   "Sent message to a (1 queued messages)"
+  ],
+  [
+   "INFO",
+   "a ctx=1010 turn_in=10 out=5"
+  ],
+  [
+   "ERROR",
+   "a turn ended with is_error; raw result (redacted): 'raw cli failure'"
+  ],
+  [
+   "INFO",
+   "a processed 1 messages"
+  ],
+  [
+   "INFO",
+   "Sent message to a (1 queued messages)"
+  ],
+  [
+   "INFO",
+   "Interrupting a (session preserved)"
+  ],
+  [
+   "INFO",
+   "Killing a subprocess (PID=<n>)"
+  ],
+  [
+   "INFO",
+   "a turn discarded (interrupted)"
+  ],
+  [
+   "INFO",
+   "a subprocess terminated"
+  ],
+  [
+   "INFO",
+   "a processed 1 messages"
+  ],
+  [
+   "INFO",
+   "a env overrides: ['FAKE_CLAUDE_INIT_DELAY_MS', 'FAKE_CLAUDE_LOG_DIR', 'FAKE_CLAUDE_MCP_FAILED', 'FAKE_CLAUDE_QUEUED', 'FAKE_CLAUDE_SCRIPT']"
+  ],
+  [
+   "INFO",
+   "Starting a subprocess (model=fake-model, session=<sid8>)"
+  ],
+  [
+   "INFO",
+   "a subprocess started (PID=<n>)"
+  ],
+  [
+   "INFO",
+   "Sent message to a (1 queued messages)"
+  ],
+  [
+   "INFO",
+   "a session tools (2): ['Read', 'Bash']"
+  ],
+  [
+   "INFO",
+   "a processed 1 messages"
+  ],
+  [
+   "WARNING",
+   "a subprocess exited unexpectedly (code 1), respawning"
+  ],
+  [
+   "INFO",
+   "a env overrides: ['FAKE_CLAUDE_INIT_DELAY_MS', 'FAKE_CLAUDE_LOG_DIR', 'FAKE_CLAUDE_MCP_FAILED', 'FAKE_CLAUDE_QUEUED', 'FAKE_CLAUDE_SCRIPT']"
+  ],
+  [
+   "INFO",
+   "Starting a subprocess (model=fake-model, session=<sid8>)"
+  ],
+  [
+   "INFO",
+   "a subprocess started (PID=<n>)"
+  ],
+  [
+   "INFO",
+   "Sent message to a (1 queued messages)"
+  ],
+  [
+   "INFO",
+   "a session tools (2): ['Read', 'Bash']"
+  ],
+  [
+   "INFO",
+   "a ctx=1010 turn_in=10 out=5"
+  ],
+  [
+   "INFO",
+   "a processed 1 messages"
+  ],
+  [
+   "INFO",
+   "Sent message to b (1 queued messages)"
+  ],
+  [
+   "INFO",
+   "b stream log: <ws>/logs/agent-streams/b_<stamp>.jsonl"
+  ],
+  [
+   "INFO",
+   "b session tools (2): ['Read', 'Bash']"
+  ],
+  [
+   "INFO",
+   "b ctx=1010 turn_in=10 out=5"
+  ],
+  [
+   "INFO",
+   "b processed 1 messages"
+  ],
+  [
+   "INFO",
+   "Sent message to b (1 queued messages)"
+  ],
+  [
+   "INFO",
+   "b ctx=1010 turn_in=10 out=5"
+  ],
+  [
+   "WARNING",
+   "b hit a usage wall; holding 1 message(s) until <epoch>"
+  ]
+ ],
+ "queue": {
+  "a": [
+   {
+    "agent": "a",
+    "author": "harness",
+    "channel_id": "10",
+    "claimed": true,
+    "content": "queued 0",
+    "discord_response_id": "discord-1",
+    "held": false,
+    "message_id": "m0",
+    "processed": 2,
+    "response": "batch reply for [<ts>] harness: queued 0\n\n[<ts>] harness: queued 1\n\n[<ts>] harness: queued 2"
+   },
+   {
+    "agent": "a",
+    "author": "harness",
+    "channel_id": "10",
+    "claimed": true,
+    "content": "queued 1",
+    "discord_response_id": "discord-1",
+    "held": false,
+    "message_id": "m1",
+    "processed": 2,
+    "response": "batch reply for [<ts>] harness: queued 0\n\n[<ts>] harness: queued 1\n\n[<ts>] harness: queued 2"
+   },
+   {
+    "agent": "a",
+    "author": "harness",
+    "channel_id": "10",
+    "claimed": true,
+    "content": "queued 2",
+    "discord_response_id": "discord-1",
+    "held": false,
+    "message_id": "m2",
+    "processed": 2,
+    "response": "batch reply for [<ts>] harness: queued 0\n\n[<ts>] harness: queued 1\n\n[<ts>] harness: queued 2"
+   },
+   {
+    "agent": "a",
+    "author": "harness",
+    "channel_id": "10",
+    "claimed": true,
+    "content": "use tools",
+    "discord_response_id": "discord-3",
+    "held": false,
+    "message_id": "m3",
+    "processed": 2,
+    "response": "tooled"
+   },
+   {
+    "agent": "a",
+    "author": "harness",
+    "channel_id": "10",
+    "claimed": true,
+    "content": "break",
+    "discord_response_id": "discord-4",
+    "held": false,
+    "message_id": "m4",
+    "processed": 3,
+    "response": "The agent hit an error and the turn did not complete."
+   },
+   {
+    "agent": "a",
+    "author": "harness",
+    "channel_id": "10",
+    "claimed": true,
+    "content": "stuck",
+    "discord_response_id": null,
+    "held": false,
+    "message_id": "m5",
+    "processed": 2,
+    "response": ""
+   },
+   {
+    "agent": "a",
+    "author": "harness",
+    "channel_id": "10",
+    "claimed": true,
+    "content": "boom",
+    "discord_response_id": "discord-5",
+    "held": false,
+    "message_id": "m6",
+    "processed": 2,
+    "response": "dying"
+   },
+   {
+    "agent": "a",
+    "author": "harness",
+    "channel_id": "10",
+    "claimed": true,
+    "content": "after respawn",
+    "discord_response_id": "discord-7",
+    "held": false,
+    "message_id": "m7",
+    "processed": 2,
+    "response": "back"
+   }
+  ],
+  "b": [
+   {
+    "agent": "b",
+    "author": "harness",
+    "channel_id": "20",
+    "claimed": true,
+    "content": "hello b",
+    "discord_response_id": "discord-8",
+    "held": false,
+    "message_id": "m8",
+    "processed": 2,
+    "response": "b ok"
+   },
+   {
+    "agent": "b",
+    "author": "harness",
+    "channel_id": "20",
+    "claimed": false,
+    "content": "walled",
+    "discord_response_id": null,
+    "held": true,
+    "message_id": "m9",
+    "processed": 0,
+    "response": "You've hit your session limit"
+   }
+  ]
+ },
+ "sessions": [
+  {
+   "agent": "a",
+   "compaction_count": 0,
+   "context_tokens": 1010,
+   "input_tokens": 10,
+   "last_compacted": null,
+   "session_id": "s10"
+  },
+  {
+   "agent": "b",
+   "compaction_count": 0,
+   "context_tokens": 1010,
+   "input_tokens": 10,
+   "last_compacted": null,
+   "session_id": "s11"
+  },
+  {
+   "agent": "monitor",
+   "compaction_count": 0,
+   "context_tokens": 0,
+   "input_tokens": 0,
+   "last_compacted": null,
+   "session_id": "s12"
+  }
+ ]
+}
