@@ -1,0 +1,444 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * Lamplight — hour-driven palette.
+ * Values are the HEARTH palette.
+ * data-hour is set pre-paint by the inline script in app/layout.tsx and
+ * re-checked every minute by LampShell. Legacy vars (--bg-base etc.) are
+ * aliased at the bottom so untouched routes inherit the palette.
+ */
+
+/*
+ * --sh-sign flips the shadow's x-offset at the desktop/tablet boundary
+ *: phone casts its near/far shadow down-left
+ * (negative x, light from top-right of a narrow column); at >=768 the
+ * column is wider and the lamp still hangs off the content area's
+ * top-right, so the shadow reads down-*right* instead (positive x) — light
+ * arriving from the other side. Every bucket's --sh-near/--sh-far below
+ * wraps its x-offset in calc(...* var(--sh-sign)) so this one flip (see the
+ * @media block further down) re-derives all eight palettes instead of
+ * duplicating them.
+ */
+:root { --sh-sign: 1; }
+/* App-shell height. iOS standalone's 100dvh is not consistently wrong by a
+   fixed amount — some loads report it short (793 on an 852pt screen),
+   others report it correct (852) already. A prior version of this rule
+   unconditionally added env(safe-area-inset-top) to dvh, assuming the
+   shortfall was always exactly that inset; on a load where dvh was
+   ALREADY 852, that addition overshot to 911 — 59px past the real
+   screen — and shoved the shelf below the physical bottom edge entirely. The one number that has read correctly, matching real
+   screen height, on every single on-device measurement taken that day
+   (standalone PWA mode) is 100lvh. No arithmetic on top of it.
+
+   THIS IS STANDALONE-ONLY. Standalone was dropped
+   (mobile-browser use only) and this
+   guard should have been restored to match — layout.tsx's own comment
+   ("a (display-mode: standalone) media rule flips --app-height from
+   100dvh to 100lvh") describes exactly this split, but the unconditional
+   :root rule below it never got the media-query wrapper back, so every
+   ordinary mobile-browser tab was silently getting the standalone value.
+   In a plain browser tab, lvh reports the height as if the toolbar were
+   scrolled away; AppShell is position:fixed with no page-level scroll to
+   ever trigger that, so the toolbar never hides and the shell was
+   permanently taller than the visible viewport — the composer, pinned to
+   the bottom of that oversized box, rendered below the fold. dvh tracks the
+   real visible viewport live in normal browser use; it's only standalone
+   mode where it lies, so that's the only place lvh belongs now. */
+:root { --app-height: 100dvh; }
+@media (display-mode: standalone) {
+  :root { --app-height: 100lvh; }
+}
+
+:root,
+[data-hour="dusk"] {
+  --bg: #241c17; --ink: #f2e3d1; --accent: #e0a35c; --on-accent: #2a1c10; --hand: #f6dfc0;
+  --slip-near: linear-gradient(158deg, #463629, #382b21);
+  --slip-far: linear-gradient(158deg, #3a2d23, #2f251d);
+  --shelf: linear-gradient(to bottom, #1e1712, #171109);
+  --lamp: radial-gradient(circle, rgba(255, 206, 143, 0.52), rgba(255, 188, 118, 0.14) 55%, transparent 72%);
+  --cone: linear-gradient(202deg, rgba(255, 208, 150, 0.2), rgba(255, 190, 120, 0.05) 46%, transparent 70%);
+  --floor: linear-gradient(to bottom, transparent, rgba(9, 5, 3, 0.6));
+  --sh-near: calc(-6px * var(--sh-sign)) 10px 20px rgba(0, 0, 0, 0.24);
+  --sh-far: calc(-4px * var(--sh-sign)) 7px 14px rgba(0, 0, 0, 0.18);
+  --surface: #2f251d; --elevated: #463629;
+  --lit: rgba(255, 236, 205, 0.18);
+}
+
+[data-hour="dawn"] {
+  --bg: #f0e6dd; --ink: #3a2e26; --accent: #c2724a; --on-accent: #fff7f1; --hand: #6b503a;
+  --slip-near: linear-gradient(158deg, #fffaf4, #f2e7db);
+  --slip-far: linear-gradient(158deg, #f2e7db, #e8dbcd);
+  --shelf: linear-gradient(to bottom, #fdf8f3, #f1e6da);
+  --lamp: radial-gradient(circle, rgba(255, 206, 168, 0.5), rgba(240, 180, 140, 0.14) 55%, transparent 72%);
+  --cone: linear-gradient(202deg, rgba(255, 214, 180, 0.34), rgba(240, 190, 150, 0.08) 46%, transparent 70%);
+  --floor: linear-gradient(to bottom, transparent, rgba(120, 90, 70, 0.12));
+  --sh-near: calc(-5px * var(--sh-sign)) 9px 18px rgba(90, 64, 44, 0.16);
+  --sh-far: 0 4px 10px rgba(90, 64, 44, 0.1);
+  --surface: #e8dbcd; --elevated: #fffaf4;
+  --lit: rgba(255, 255, 255, 0.6);
+}
+
+[data-hour="morning"] {
+  --bg: #fbf7f0; --ink: #2b241c; --accent: #bf7433; --on-accent: #fff9f2; --hand: #7a5a34;
+  --slip-near: linear-gradient(158deg, #fffefb, #f5efe5);
+  --slip-far: linear-gradient(158deg, #f5efe5, #ece4d7);
+  --shelf: linear-gradient(to bottom, #fffefc, #f7f1e7);
+  --lamp: radial-gradient(circle, rgba(255, 244, 214, 0.72), rgba(255, 232, 186, 0.2) 55%, transparent 74%);
+  --cone: linear-gradient(202deg, rgba(255, 246, 222, 0.5), rgba(255, 236, 196, 0.12) 48%, transparent 72%);
+  --floor: linear-gradient(to bottom, transparent, rgba(120, 95, 60, 0.08));
+  --sh-near: 0 5px 14px rgba(124, 98, 62, 0.11);
+  --sh-far: 0 3px 9px rgba(124, 98, 62, 0.07);
+  --surface: #ece4d7; --elevated: #fffefb;
+  --lit: rgba(255, 255, 255, 0.65);
+}
+
+[data-hour="day"] {
+  --bg: #f8f2e8; --ink: #2b231b; --accent: #c07636; --on-accent: #fff8f0; --hand: #7a5a34;
+  --slip-near: linear-gradient(158deg, #fffdf8, #f4ece0);
+  --slip-far: linear-gradient(158deg, #f4ece0, #ebe1d3);
+  --shelf: linear-gradient(to bottom, #fffdf9, #f6efe4);
+  --lamp: radial-gradient(circle, rgba(255, 235, 190, 0.66), rgba(255, 225, 170, 0.18) 55%, transparent 74%);
+  --cone: linear-gradient(202deg, rgba(255, 238, 200, 0.44), rgba(255, 230, 180, 0.1) 48%, transparent 72%);
+  --floor: linear-gradient(to bottom, transparent, rgba(120, 95, 60, 0.09));
+  --sh-near: 0 5px 14px rgba(124, 98, 62, 0.12);
+  --sh-far: 0 3px 9px rgba(124, 98, 62, 0.08);
+  --surface: #ebe1d3; --elevated: #fffdf8;
+  --lit: rgba(255, 255, 255, 0.65);
+}
+
+[data-hour="afternoon"] {
+  --bg: #f7ece0; --ink: #31261d; --accent: #c26f2f; --on-accent: #fff7ee; --hand: #75512c;
+  --slip-near: linear-gradient(158deg, #fffaf2, #f2e6d7);
+  --slip-far: linear-gradient(158deg, #f2e6d7, #e9dbc9);
+  --shelf: linear-gradient(to bottom, #fdf7ee, #f3e8da);
+  --lamp: radial-gradient(circle, rgba(255, 220, 160, 0.6), rgba(250, 200, 140, 0.16) 55%, transparent 73%);
+  --cone: linear-gradient(202deg, rgba(255, 224, 172, 0.4), rgba(250, 205, 150, 0.1) 48%, transparent 71%);
+  --floor: linear-gradient(to bottom, transparent, rgba(110, 80, 50, 0.12));
+  --sh-near: calc(-3px * var(--sh-sign)) 7px 16px rgba(110, 80, 50, 0.14);
+  --sh-far: 0 4px 10px rgba(110, 80, 50, 0.09);
+  --surface: #e9dbc9; --elevated: #fffaf2;
+  --lit: rgba(255, 255, 255, 0.6);
+}
+
+[data-hour="golden"] {
+  --bg: #4a352a; --ink: #fbe9d4; --accent: #e59a4e; --on-accent: #33210f; --hand: #f8dcb8;
+  --slip-near: linear-gradient(158deg, #6a4c39, #57402f);
+  --slip-far: linear-gradient(158deg, #5a4232, #4a3628);
+  --shelf: linear-gradient(to bottom, #3d2b21, #2f2018);
+  --lamp: radial-gradient(circle, rgba(255, 196, 120, 0.6), rgba(255, 178, 100, 0.18) 55%, transparent 72%);
+  --cone: linear-gradient(202deg, rgba(255, 204, 140, 0.28), rgba(255, 184, 110, 0.07) 46%, transparent 70%);
+  --floor: linear-gradient(to bottom, transparent, rgba(30, 16, 8, 0.4));
+  --sh-near: calc(-7px * var(--sh-sign)) 11px 20px rgba(40, 22, 10, 0.24);
+  --sh-far: calc(-5px * var(--sh-sign)) 8px 14px rgba(40, 22, 10, 0.16);
+  --surface: #4a3628; --elevated: #6a4c39;
+  --lit: rgba(255, 236, 205, 0.2);
+}
+
+[data-hour="night"] {
+  --bg: #16110d; --ink: #e8d5be; --accent: #e0a35c; --on-accent: #1d1410; --hand: #f0dabb;
+  --slip-near: linear-gradient(158deg, #302419, #261c14);
+  --slip-far: linear-gradient(158deg, #251b14, #1e150f);
+  --shelf: linear-gradient(to bottom, #120d09, #0c0806);
+  --lamp: radial-gradient(circle, rgba(255, 196, 128, 0.42), rgba(240, 175, 105, 0.1) 55%, transparent 72%);
+  --cone: linear-gradient(202deg, rgba(255, 198, 136, 0.15), rgba(240, 175, 105, 0.04) 46%, transparent 70%);
+  --floor: linear-gradient(to bottom, transparent, rgba(0, 0, 0, 0.72));
+  --sh-near: calc(-5px * var(--sh-sign)) 9px 18px rgba(0, 0, 0, 0.28);
+  --sh-far: calc(-4px * var(--sh-sign)) 7px 13px rgba(0, 0, 0, 0.2);
+  --surface: #1e150f; --elevated: #302419;
+  --lit: rgba(255, 236, 205, 0.16);
+}
+
+[data-hour="late"] {
+  --bg: #0f0d0c; --ink: #cdbca9; --accent: #c98f4e; --on-accent: #17100b; --hand: #dcc5a6;
+  --slip-near: linear-gradient(158deg, #241a12, #1c140e);
+  --slip-far: linear-gradient(158deg, #1a130e, #150f0b);
+  --shelf: linear-gradient(to bottom, #0c0908, #070505);
+  --lamp: radial-gradient(circle, rgba(226, 170, 105, 0.3), rgba(200, 145, 85, 0.07) 55%, transparent 72%);
+  --cone: linear-gradient(202deg, rgba(226, 170, 105, 0.1), transparent 62%);
+  --floor: linear-gradient(to bottom, transparent, rgba(0, 0, 0, 0.8));
+  --sh-near: calc(-4px * var(--sh-sign)) 8px 15px rgba(0, 0, 0, 0.3);
+  --sh-far: calc(-3px * var(--sh-sign)) 6px 11px rgba(0, 0, 0, 0.22);
+  --surface: #150f0b; --elevated: #241a12;
+  --lit: rgba(255, 236, 205, 0.14);
+}
+
+/* Native form-control chrome (a <select>'s closed box already themes via
+   the CSS above, but its dropdown *list* and default scrollbars are drawn
+   by the OS/browser, not this stylesheet — without an explicit
+   color-scheme they render light-OS-default regardless of the current
+   hour bucket, mismatching a dark bucket's warm-dark surface). Mirrors the
+   same split ÓSANWE's contrast fix uses for --panel/--ground. */
+[data-hour="dusk"], [data-hour="golden"], [data-hour="night"], [data-hour="late"] {
+  color-scheme: dark;
+}
+[data-hour="dawn"], [data-hour="morning"], [data-hour="day"], [data-hour="afternoon"] {
+  color-scheme: light;
+}
+
+/* Desktop/tablet boundary: the lamp is
+   still top-right of the content area, but a wider column reads the light
+   from the other side — flip every bucket's shadow x-offset in one place. */
+@media (min-width: 768px) {
+  :root { --sh-sign: -1; }
+}
+
+/* Semantic colour — one remap, thresholds unchanged */
+:root {
+  --ok: #86a85f;      /* was #22c55e — ok / done / bought */
+  --warn: #dfa14e;    /* was #f59e0b — low / stale / ahead */
+  --err: #cf6b52;     /* was #ef4444 — over / blocked / failed */
+  --review: #a98bc4;  /* was #a855f7 — in-review / proposed */
+  --info: #7fa3c4;    /* was #3b82f6 — ready / recipe / info */
+}
+
+/* Legacy aliases — untouched routes inherit the hour palette through these. */
+:root {
+  --bg-base: var(--bg);
+  --bg-surface: var(--surface);
+  --bg-elevated: var(--elevated);
+  --border: color-mix(in srgb, var(--ink) 14%, transparent);
+  --border-subtle: color-mix(in srgb, var(--ink) 24%, transparent);
+  --text-primary: var(--ink);
+  --text-secondary: color-mix(in srgb, var(--ink) 62%, transparent);
+  --text-muted: color-mix(in srgb, var(--ink) 45%, transparent);
+}
+
+body {
+  background-color: var(--bg);
+  color: var(--ink);
+  margin: 0;
+  font-family: var(--font-sans, ui-sans-serif), system-ui, sans-serif;
+  /* Hour changes fade, never flash (gradients snap — known v1 limit). */
+  transition: background-color 1s ease, color 1s ease;
+}
+
+html, body {
+  /* Same over-correction bug as --app-height above (see that comment) —
+     this rule added env(safe-area-inset-top) on top of html/body's own
+     height, compounding the overshoot. The app shell is position:fixed
+     (AppShell.tsx) and sizes itself independently via --app-height now,
+     so html/body don't need to reach past the viewport at all; they just
+     need to not be SHORTER than it, which min-height already guarantees. */
+  min-height: 100dvh;
+  /* "easy to scroll the whole app around right now and
+     not just the chat." html/body are never meant to scroll — AppShell's
+     h-[100dvh] shell + main's overflow-auto are the only scroll surface —
+     but iOS's elastic rubber-band still drags the whole document unless
+     told not to. overflow:hidden + overscroll-behavior:none on the
+     document kills that; scroll containers opt back in individually. */
+  overflow: hidden;
+  overscroll-behavior: none;
+}
+
+/* Prevent horizontal overflow globally. Background also lives here, not
+   just on body: iOS standalone PWA mode measures 100dvh a hair short of
+   the real visible area (home-indicator strip), leaving a sliver of raw
+   <html> showing below the app shell — unstyled, that sliver is browser
+   white. "bottom space as though a browser bar is
+   there, but in PWA mode it's just white space." */
+html {
+  overflow-x: hidden;
+  /* Belt-and-braces for the standalone letterbox: any WebView canvas the
+     layout viewport can't reach (the phantom bottom strip) shows html's
+     background. Painting it as bg fading into the shelf tone makes a
+     residual strip read as shelf, not void, whatever iOS decides the
+     window is today. */
+  background-color: var(--bg);
+}
+
+/* Safe-area helpers */
+.pb-safe { padding-bottom: env(safe-area-inset-bottom); }
+.pt-safe { padding-top: env(safe-area-inset-top); }
+
+/* Chat composer bottom clearance. Below lg, TabShelf is a fixed overlay
+   (portaled to document.body) that reserves no flex space — the composer
+   pads itself clear of it: ~58px shelf + margin, plus the same safe-area
+   inset the shelf itself pads with. At lg+ there's no shelf. */
+.chat-composer-pad { padding-bottom: calc(10px + env(safe-area-inset-bottom) + 70px); }
+@media (min-width: 1024px) {
+  .chat-composer-pad { padding-bottom: calc(10px + env(safe-area-inset-bottom)); }
+}
+
+/* ---- Lamplight materials ---------------------------------------------- */
+
+/* Near slip: catches the lamp. Lit top edge + near shadow. */
+.slip-near {
+  background: var(--slip-near);
+  box-shadow: var(--sh-near);
+  border-radius: 4px 16px 16px 15px;
+}
+.slip-near.lit, .lit {
+  border-top: 1px solid var(--lit);
+}
+
+/* Far slip: sits in the falloff. No lit edge. */
+.slip-far {
+  background: var(--slip-far);
+  box-shadow: var(--sh-far);
+  border-radius: 4px 14px 14px 13px;
+}
+
+/* >=768: the shadow flip above pairs with a mirrored corner radius — the
+   sharp corner tracks the shadow to whichever side the light now falls
+   away from. */
+@media (min-width: 768px) {
+  .slip-near { border-radius: 16px 4px 15px 16px; }
+  .slip-far { border-radius: 14px 4px 13px 14px; }
+}
+
+/* Shelf (bottom tab bar, headers that need the furniture tone) */
+.shelf {
+  background: var(--shelf);
+  border-top: 1px solid color-mix(in srgb, var(--lit) 55%, transparent);
+}
+
+/* Side shelf (desktop/tablet persistent nav — icon rail or labelled shelf,
+   desktop/tablet). Same furniture tone as .shelf, right border
+   instead of top. */
+.rail {
+  background: var(--shelf);
+  border-right: 1px solid color-mix(in srgb, var(--lit) 55%, transparent);
+}
+
+/* Agent prose never stretches past this measure, no matter the window. */
+.prose-measure {
+  max-width: 720px;
+}
+
+/* Press feedback on everything tappable */
+.press {
+  transition: transform 130ms ease;
+}
+.press:active {
+  transform: scale(0.91);
+}
+
+/* ---- Motion  --------------------------------------- */
+
+@keyframes rise {
+  from { opacity: 0; transform: translateY(14px); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes lift {
+  from { opacity: 0; transform: translateY(26px) scale(0.96); }
+  to { opacity: 1; transform: none; }
+}
+/* Entrance keyframes for dimmed speech levels: MUST land on the target
+   opacity — a keyframe ending at 1 with fill-mode:both permanently
+   overrides the element's own dimming. */
+@keyframes liftD66 {
+  from { opacity: 0; transform: translateY(22px); }
+  to { opacity: 0.66; transform: none; }
+}
+@keyframes liftD34 {
+  from { opacity: 0; transform: translateY(22px); }
+  to { opacity: 0.34; transform: none; }
+}
+@keyframes breathe {
+  0%, 100% { opacity: 0.35; transform: scale(0.82); }
+  50% { opacity: 1; transform: scale(1.12); }
+}
+@keyframes caret {
+  0%, 49% { opacity: 1; }
+  50%, 100% { opacity: 0; }
+}
+/* currentColor, not a fixed token, so a halo dot can be accent (idle) or
+   --warn (something's wrong) by setting the element's own `color`. */
+@keyframes halo {
+  0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, currentColor 50%, transparent); }
+  70% { box-shadow: 0 0 0 11px transparent; }
+}
+/* Opacity-only: animating transform (or any property) on a filtered/huge
+   layer forced continuous re-rasterization — unusable frame rates on
+   iPhone. Opacity composites on the GPU. */
+@keyframes flicker {
+  0%, 100% { opacity: 0.88; }
+  38% { opacity: 1; }
+  64% { opacity: 0.93; }
+}
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.anim-lift { animation: lift 0.7s cubic-bezier(0.16, 0.84, 0.24, 1) both; }
+.anim-rise { animation: rise 0.55s cubic-bezier(0.16, 0.84, 0.24, 1) both; }
+/* Interstitial / thinking entrances — land on the dimmed target opacity,
+   never on 1 (see the "trap" note above liftD66/liftD34). */
+.anim-liftD66 { animation: liftD66 0.6s cubic-bezier(0.16, 0.84, 0.24, 1) both; }
+.anim-liftD34 { animation: liftD34 0.6s cubic-bezier(0.16, 0.84, 0.24, 1) both; }
+
+/* Ops Board "good"/"warn" status dots (masthead pill, Fleet rows) — a class
+   (not an inline `animation` string like the pre-existing halo call sites
+   in today/page.tsx and fleet/page.tsx) so prefers-reduced-motion can turn
+   it off below. Color (idle accent vs --warn) still comes from the
+   element's own `color`, per the halo keyframe's currentColor design. */
+.anim-halo { animation: halo 2.6s ease-out infinite; }
+
+/* Ops Board: clickable rows nudge right on hover —
+   Fleet rows, calendar/PR rows, queue items, anything list-like and
+   clickable across the board, not just one panel. */
+.row {
+  transition: transform 0.15s ease;
+}
+.row:hover {
+  transform: translateX(3px);
+}
+
+/* Ops Board status-strip mini bars (CPU/mem, cost): a light
+   sweep across the filled portion reads as "live," same idea as the mock's
+   .vital-fill shimmer. Token-driven (--ink, not a fixed white) so it stays
+   a subtle glint rather than a glare in the dark/late-hour palettes. */
+.vital-fill {
+  position: relative;
+  overflow: hidden;
+}
+.vital-fill::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    color-mix(in srgb, var(--ink) 22%, transparent),
+    transparent
+  );
+  animation: sweep 2.6s ease-in-out infinite;
+}
+@keyframes sweep {
+  0%, 100% { transform: translateX(-100%); }
+  50% { transform: translateX(220%); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .anim-lift, .anim-rise { animation: none; }
+  /* Dropping the animation must not drop the dimming it was landing on. */
+  .anim-liftD66 { animation: none; opacity: 0.66; }
+  .anim-liftD34 { animation: none; opacity: 0.34; }
+  .press:active { transform: none; }
+  .row:hover { transform: none; }
+  .vital-fill::after { animation: none; display: none; }
+  .anim-halo { animation: none; }
+}
+
+/* ChatSurface parity mode: hover/tap timestamp on grouped messages, and
+   the typing-style working indicator. */
+.chat-msg:focus { outline: none; }
+.chat-ts {
+  max-height: 0;
+  overflow: hidden;
+  opacity: 0;
+  font-size: 11px;
+  transition: opacity 0.15s ease, max-height 0.15s ease;
+}
+.chat-msg:hover .chat-ts,
+.chat-msg:focus .chat-ts { max-height: 18px; opacity: 0.5; margin-top: 4px; }
+.typing-dots { display: inline-flex; gap: 3px; }
+.typing-dots i {
+  width: 5px; height: 5px; border-radius: 50%; background: var(--accent);
+  animation: breathe 1.3s ease-in-out infinite;
+}
+.typing-dots i:nth-child(2) { animation-delay: 0.18s; }
+.typing-dots i:nth-child(3) { animation-delay: 0.36s; }

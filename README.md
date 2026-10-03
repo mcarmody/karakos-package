@@ -162,9 +162,9 @@ release and upgrade on your own schedule; the default is `latest`. See
 and the one the system is designed around.
 
 **Dashboard** at `http://localhost:3000`: status, chat, costs, conversations and
-the fleet. It is the separate `karakos-dashboard` project, built into the image
-from a pinned commit; its pages are documented there, and the routes it uses are
-in [docs/package-backend-contract.md](docs/package-backend-contract.md). Chat
+the fleet. Its source is [`dashboard/`](dashboard/README.md), built into the
+image; the routes it uses are in
+[docs/package-backend-contract.md](docs/package-backend-contract.md). Chat
 replies stay out of Discord.
 
 **Terminal.** `bin/kara` is a small Python CLI that speaks the same HTTP API

@@ -90,7 +90,7 @@ tables exist, not in what the migrator does to your data.
 | Auth and env | The dashboard read the agent server's whole environment | Subprocesses get an allowlist plus the agent's `env:`; the dashboard cookie settings changed ([Auth and env changes](#auth-and-env-changes)) |
 | Outbox | A dead-letter file for failed Discord replies | `data/outbox/outbox.db`: retries with backoff, an audit trail, operator verbs |
 | Prompts | `system_prompt:` per agent | The same prompt keeps working; the 2.0 core, house style and templates are opt-in ([What else changed quietly](#what-else-changed-quietly)) |
-| Dashboard | Built from a `dashboard/` tree in this repo | Built from a pinned `karakos-dashboard` commit (`dashboard.ref`) |
+| Dashboard | An older `dashboard/` tree | A rewritten `dashboard/` tree in this repo: roster, fleet, chat, memory browser, history, costs |
 
 ## Drain checklist
 
@@ -319,10 +319,9 @@ which destroys those volumes: restore from your backup afterwards.
 
 ## Auth and env changes
 
-The dashboard is now the pinned `karakos-dashboard` build in its package
-profile. Its variables are read by that build, not by this repository's code;
-the authoritative table is `docs/package-env-mapping.md` in the
-`karakos-dashboard` repository (it is not copied here).
+The dashboard source is `dashboard/` in this repository. Its variables are
+read by that code, not by the Python side; the authoritative table is in
+[`dashboard/README.md`](../dashboard/README.md#environment-variables).
 
 - **Existing logins stay valid.** The session cookie name (`karakos_session`),
   token format and `SESSION_SECRET` scheme did not change. Do not rotate
@@ -333,11 +332,8 @@ the authoritative table is `docs/package-env-mapping.md` in the
 - **Session lifetime** is 30 days unless `SESSION_MAX_AGE_SECONDS` is set
   (`86400` restores the old 24 hours). The cookie is `SameSite=Lax`.
 - **Passkeys are not in the package profile.**
-- **`DASHBOARD_FETCH_TOKEN` is a maintainer secret, not an operator setting.**
-  It is the repository secret CI uses to read the private `karakos-dashboard`
-  repository. Without it the docker-smoke job is skipped and a release cannot
-  be built. Operators running the published image never need it
-  ([EXTENDING.md](EXTENDING.md#dashboard-build)).
+- **No token or secret is needed to build the image.** The Dockerfile builds
+  `dashboard/` from the checkout ([EXTENDING.md](EXTENDING.md#dashboard-build)).
 
 ## The env allowlist and registry env
 

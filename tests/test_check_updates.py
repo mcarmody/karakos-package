@@ -71,7 +71,7 @@ def world(tmp_path):
     workspace = tmp_path / "workspace"
     (workspace / "dashboard").mkdir(parents=True)
     (workspace / "dashboard" / "package.json").write_text(
-        json.dumps({"name": "karakos-dashboard", "version": "1.0.0"})
+        json.dumps({"name": "karakos-web", "version": "1.0.0"})
     )
     (workspace / ".karakos").mkdir()
     (workspace / ".karakos" / "config.json").write_text(

@@ -15,3 +15,5 @@ inbox/
 *.swo
 docker-compose.override.yml
 docs/
+dashboard/node_modules
+dashboard/.next

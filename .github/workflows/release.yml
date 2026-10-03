@@ -10,7 +10,7 @@ on:
         required: false
 
 permissions:
-  contents: write   # attach the dashboard bundle to the GitHub release
+  contents: read
   packages: write
 
 jobs:
@@ -55,39 +55,6 @@ jobs:
 
           echo "value=$VALUE" >> $GITHUB_OUTPUT
 
-      # karakos-dashboard is private (repo secret DASHBOARD_FETCH_TOKEN, a
-      # read-only token). The SOURCE is fetched, built into a pruned bundle and
-      # never uploaded anywhere: not as an artifact, not as a release asset.
-      # Only the bundle (no source, no source maps) is published. The image
-      # build then uses the bundle (no dashboard compile under QEMU; native
-      # modules are still installed per platform).
-      - name: Fetch pinned dashboard source
-        env:
-          GH_TOKEN: ${{ secrets.DASHBOARD_FETCH_TOKEN }}
-        run: bin/fetch-dashboard.sh
-
-      - name: Set up Node (dashboard build)
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-
-      - name: Read dashboard ref
-        id: ref
-        run: echo "value=$(tr -d '[:space:]' < dashboard.ref)" >> "$GITHUB_OUTPUT"
-
-      - name: Build dashboard bundle
-        run: |
-          bin/build-dashboard-bundle.sh
-          rm -f vendor/karakos-dashboard.tar.gz   # source never leaves this step
-
-      - name: Attach dashboard bundle to the release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.version.outputs.value }}
-        run: |
-          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "$TAG" --notes "Release $TAG"
-          gh release upload "$TAG" vendor/karakos-dashboard-bundle-*.tar.gz vendor/karakos-dashboard-bundle-*.tar.gz.sha256 --clobber
-
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
@@ -117,8 +84,6 @@ jobs:
         with:
           context: .
           platforms: linux/amd64,linux/arm64
-          build-args: |
-            DASHBOARD_REF=${{ steps.ref.outputs.value }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -154,7 +119,7 @@ jobs:
 
           # Verify dashboard was built into the image
           docker run --rm --platform ${{ matrix.platform }} --entrypoint test \
-            "$IMAGE" -f /workspace/dashboard/.dashboard-ref
+            "$IMAGE" -f /workspace/dashboard/.next/BUILD_ID
 
           # Verify the dashboard's native modules load on this platform
           docker run --rm --platform ${{ matrix.platform }} --entrypoint node \

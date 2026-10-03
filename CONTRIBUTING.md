@@ -25,19 +25,22 @@ py_compile` on Python scripts before opening a PR if you touched either.
 
 ## The dashboard
 
-The web dashboard is not in this repo. The image builds
-[`karakos-dashboard`](https://github.com/mcarmody/karakos-dashboard) at the
-commit pinned in `dashboard.ref` (with `dashboard.ref.sha256`); send dashboard
-changes there, then bump the pin here in a one-line PR (both files). The source
-is private and is never committed: see "Dashboard build" in `docs/EXTENDING.md`
-for how to get a build without access.
+The web dashboard is `dashboard/` in this repo, a Next.js app with its own
+`package.json` and lockfile. Work on it like any other part of the package:
 
-**Repository secret `DASHBOARD_FETCH_TOKEN`** (maintainers): a read-only token on
-`karakos-dashboard` that CI uses to fetch the pinned source. The docker-smoke job
-and the release job need it; without it docker-smoke is **skipped**, not failed,
-so a green run without the secret has not built the image.
-`dashboard.bundle.sha256` is empty on purpose: the Next.js output is not
-byte-reproducible, so a bundle is verified against its own `.sha256`.
+```
+cd dashboard
+npm ci
+npm test
+npm run build
+```
+
+The CI `dashboard` job runs the same three commands; the `docker-smoke` job
+builds the image, which builds `dashboard/` too. Neither needs a secret. See
+`dashboard/README.md` for the environment it reads and "Dashboard build" in
+`docs/EXTENDING.md` for how the image is built. A change to a route the
+dashboard calls on the agent server must keep
+`tests/test_agent_server_routes.py` green.
 
 **Tests.** `tests/test_docs.py` checks that the docs match the code: links and
 anchors, backticked paths, environment variables, registry keys, routes, MCP

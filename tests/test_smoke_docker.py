@@ -33,17 +33,17 @@ class TestDockerBuild:
 
     @pytest.mark.slow
     def test_docker_build_has_dashboard(self):
-        """Built image records the dashboard ref and loads its native modules."""
+        """Built image holds the built dashboard and loads its native modules."""
         result = subprocess.run(
             [
                 "docker", "run", "--rm", "--entrypoint", "test", "karakos-test:smoke",
-                "-f", "/workspace/dashboard/.dashboard-ref",
+                "-f", "/workspace/dashboard/.next/BUILD_ID",
             ],
             capture_output=True,
             text=True,
             timeout=30,
         )
-        assert result.returncode == 0, "/workspace/dashboard/.dashboard-ref missing from image"
+        assert result.returncode == 0, "/workspace/dashboard/.next/BUILD_ID missing from image"
         result = subprocess.run(
             [
                 "docker", "run", "--rm", "--entrypoint", "node", "karakos-test:smoke", "-e",
@@ -170,75 +170,11 @@ class TestDockerCompose:
                 env_path.unlink()
 
 
-class TestDashboardPin:
-    """The dashboard is karakos-dashboard at a pinned ref, not a tree in this repo."""
-
-    def test_dashboard_ref_is_a_full_sha(self):
-        ref = (PACKAGE_ROOT / "dashboard.ref").read_text().strip()
-        assert re.fullmatch(r"[0-9a-f]{40}", ref), f"dashboard.ref must be a 40-hex sha, got {ref!r}"
-        assert len((PACKAGE_ROOT / "dashboard.ref").read_text().strip().splitlines()) == 1
-
-    def test_dashboard_ref_sha256_is_hex(self):
-        digest = (PACKAGE_ROOT / "dashboard.ref.sha256").read_text().strip()
-        assert re.fullmatch(r"[0-9a-f]{64}", digest), "dashboard.ref.sha256 must be 64 hex chars"
-
-    def test_bundle_pin_file_exists(self):
-        assert (PACKAGE_ROOT / "dashboard.bundle.sha256").exists()
-
-    def test_dashboard_source_not_tracked(self):
-        out = subprocess.run(
-            ["git", "ls-files", "dashboard", "vendor"],
-            cwd=str(PACKAGE_ROOT), capture_output=True, text=True,
-        ).stdout
-        assert out.strip() == "", f"dashboard source or vendored tarball is tracked:\n{out}"
-        assert not (PACKAGE_ROOT / "dashboard").exists()
-
-
-class TestDockerfileCopyTargets:
-    """Verify COPY sources in the Dockerfile are paths the build stage produces.
-
-    Prevents build failures like #33 where COPY --from=dashboard-build
-    referenced /app/public but no public/ directory existed. The old check
-    looked in the in-repo dashboard/; the stage now builds from a pinned ref,
-    so the check parses the Dockerfile and the stage script instead.
-    """
-
-    def _dockerfile(self):
-        return (PACKAGE_ROOT / "Dockerfile").read_text()
-
-    def test_declares_the_build_args(self):
-        df = self._dockerfile()
-        assert re.search(r"^ARG DASHBOARD_REF\b", df, re.M)
-        assert re.search(r"^ARG NODE_MAJOR\b", df, re.M)
-
-    def test_build_and_runtime_stages_share_node_major(self):
-        df = self._dockerfile()
-        # One ARG NODE_MAJOR before the first FROM, referenced by both stages.
-        first_from = df.index("\nFROM ")
-        assert "ARG NODE_MAJOR=" in df[:first_from]
-        assert re.search(r"^FROM node:\$\{NODE_MAJOR\}-bookworm-slim AS dashboard-build", df, re.M)
-        assert "setup_${NODE_MAJOR}.x" in df
-        assert "setup_20.x" not in df and "node:20" not in df
-
-    def test_dashboard_copy_sources_are_produced_by_the_stage(self):
-        df = self._dockerfile()
-        sources = re.findall(r"COPY\s+(?:--\S+\s+)*--from=dashboard-build\s+(\S+)\s+\S+", df)
-        assert sources, "no COPY --from=dashboard-build lines found"
-        stage = (PACKAGE_ROOT / "bin" / "dashboard-stage.sh").read_text()
-        for src in sources:
-            assert src.startswith("/out/"), f"{src} is not under the stage output dir /out"
-            name = src[len("/out/"):]
-            if name.endswith("*"):  # next.config.*: the stage copies each candidate by name
-                assert name[:-1] + "mjs" in stage, f"stage script does not produce {src}"
-                continue
-            assert name in stage or f'"$OUT/{name}"' in stage, f"stage script does not produce {src}"
-
-
 class TestSessionSecretConsistency:
     """Verify SESSION_SECRET is provisioned by the package.
 
-    The dashboard-side half (one secret definition, no random fallback) lives
-    in karakos-dashboard now; the package must still generate and document it.
+    The dashboard-side half (one secret definition, no random fallback) is
+    tested in dashboard/; the package must still generate and document it.
     """
 
     def test_setup_generates_session_secret(self):

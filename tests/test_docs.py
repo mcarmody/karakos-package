@@ -134,7 +134,7 @@ RUNTIME_FILES = {
     # illustrations and negative examples in the docs
     "agents/builder/inbox/", "lib/migrate/steps/NN_name.py",
 }
-# package-backend-contract.md cites files of the dashboard repository.
+# package-backend-contract.md cites dashboard files, relative to dashboard/.
 NOT_OURS = {"package-backend-contract.md"}
 PATH_RE = re.compile(r"^[A-Za-z0-9_.\-/]+$")
 
@@ -180,7 +180,7 @@ def test_coverage_table_covers_every_step():
     steps = {r.split("|")[1].strip() for r in rows}
     wanted = ["0.5", "1.0", "1.1a / 1.1b", "1.2", "1.3 / 1.3b", "1.4", "1.5", "1.6", "1.7",
               "2.0", "2.1", "2.2", "2.3", "2.4", "2.5", "2.6", "2.7", "3.1", "3.2", "3.3",
-              "4.1", "4.2 / 4.2b", "4.3", "4.4", "5.0 / 5.4", "5.1 / 5.2", "5.3", "5.5",
+              "4.1", "4.2 / 4.2b", "4.3", "4.4", "5.0 / 5.4", "5.1 / 5.2", "5.3b", "5.5",
               "6.1", "6.2", "6.3", "6.4", "7.1"]
     assert set(wanted) <= steps, set(wanted) - steps
     for r in rows:
@@ -194,8 +194,8 @@ def test_coverage_table_covers_every_step():
 
 ENV_SCAN_DIRS = ["bin", "lib", "mcp", "config", "system", "skills"]
 ENV_SCAN_FILES = ["setup.sh", "Dockerfile", "Makefile", "install.sh"]
-# Read by the pinned karakos-dashboard build, not by this repository.
-DASHBOARD_SIDE = {"KARAKOS_COOKIE_SECURE", "SESSION_MAX_AGE_SECONDS", "DASHBOARD_FETCH_TOKEN",
+# Read by the dashboard (dashboard/), not by the Python side.
+DASHBOARD_SIDE = {"KARAKOS_COOKIE_SECURE", "SESSION_MAX_AGE_SECONDS",
                   "DASHBOARD_USER", "DASHBOARD_PASSWORD", "SESSION_SECRET"}
 # Provided by the shell, Docker or the CLI rather than read by package code.
 EXTERNAL = {"PATH", "HOME", "TZ", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN",
