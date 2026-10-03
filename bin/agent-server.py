@@ -1041,7 +1041,9 @@ async def respawn_watcher(shard: str, proc: asyncio.subprocess.Process):
         if agent_processes.get(shard) is not proc:
             return
 
-        # A call row the dead process was answering will never get a reply.
+        # A call row the dead process was answering will never get a reply, and
+        # a dead caller cannot be waiting on a call.
+        await hive_cancel_caller(shard)
         try:
             await db.execute(
                 "UPDATE message_queue SET processed = ? WHERE agent = ? AND processed = ?"
@@ -3436,10 +3438,12 @@ async def hive_startup_sweep():
 
 
 def register_hive_hooks():
+    """Hive's on_turn_end runs first, ahead of any later hook (2.6's handoff
+    registers after it)."""
     for name, fn in (("on_turn_start", hive_on_turn_start),
                      ("on_turn_end", hive_on_turn_end)):
         if fn not in getattr(STATE.hooks, name):
-            STATE.hooks.register(name, fn)
+            getattr(STATE.hooks, name).insert(0, fn)
 
 
 # =============================================================================
@@ -3648,6 +3652,9 @@ async def startup(app):
 
     log.info("Starting Karakos Agent Server")
 
+    # Hive first, so its on_turn_end precedes every other turn hook.
+    register_hive_hooks()
+
     # Initialize HTTP session
     http_session = aiohttp.ClientSession()
 
@@ -3684,7 +3691,6 @@ async def startup(app):
     # Crash recovery
     await crash_recovery()
     await hive_startup_sweep()
-    register_hive_hooks()
 
     # Start shard subprocesses, one at a time in plan order.
     for sid in STATE.shard_ids():

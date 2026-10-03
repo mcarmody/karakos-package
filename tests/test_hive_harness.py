@@ -155,6 +155,17 @@ def test_hive_call_answered_inside_the_callers_turn(harness):
     assert calls[0]["duration_ms"] is not None and calls[0]["answer"] == "42"
 
 
+def test_hive_hook_runs_before_other_turn_hooks(harness):
+    h = harness(agents=["a", "b"])
+
+    async def scenario():
+        async with h:
+            assert h.module.STATE.hooks.on_turn_end[0] is h.module.hive_on_turn_end
+            assert h.module.STATE.hooks.on_turn_start[0] is h.module.hive_on_turn_start
+
+    run(scenario())
+
+
 def test_isolation_sibling_untouched(harness):
     h = harness(agents=["a", "b"], shards=SHARDS)
 
@@ -459,6 +470,10 @@ def test_callee_exits_mid_answer(harness):
     calls = run(scenario())
     assert h.queue_rows("a")[0]["response"] == "error/callee_failed"
     assert calls[0]["status"] == "error"
+    # Deviation from the spec's "row CRASHED by the respawn watcher": the turn's
+    # finish_turn (shard lock held) writes the reply and marks the row COMPLETE
+    # before the watcher gets the lock, so the watcher's UPDATE matches nothing.
+    assert call_rows(h, "b")[0]["processed"] == 2
 
 
 def test_callee_usage_wall_row_is_held_and_never_runs(harness):
@@ -485,11 +500,14 @@ def test_callee_usage_wall_row_is_held_and_never_runs(harness):
         hive.HIVE_MIN_TIMEOUT_S = 5
     # The held row outlives its queue deadline, so 1.2's expiry (or the caller's
     # deadline) ends the call; either way it is skipped and answers nothing.
-    assert h.queue_rows("a")[0]["response"] in ("expired", "timeout")
+    # GET runs 1.2's expire on the callee, so the held QUEUED row always ends as
+    # `expired` (not the caller timeout); it is skipped and answers nothing.
+    assert h.queue_rows("a")[0]["response"] == "expired"
     assert call_rows(h, "b")[0]["processed"] == 4
-    assert reply_rows(h, "a") == [] or json.loads(reply_rows(h, "a")[0]["content"])["error"] == "expired"
+    (reply,) = reply_rows(h, "a")
+    assert json.loads(reply["content"])["error"] == "expired"
     assert len(h.sent_to("b")) == 1
-    assert calls[0]["status"] in ("expired", "timeout")
+    assert calls[0]["status"] == "expired"
 
 
 # -- the caller side ends ----------------------------------------------------------------
