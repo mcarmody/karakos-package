@@ -512,3 +512,10 @@ def test_no_step_writes_logs_or_inbox_and_backup_matches_the_claim(tmp_path, fak
     assert {p: (root / p).read_bytes() for p in before} == before
     bk = next((tmp_path / "backups").glob("pre-2.0-*"))
     assert not (bk / "files" / "logs").exists() and not (bk / "files" / "inbox").exists()
+
+
+def test_host_side_keeps_interpolated_defaults_whole():
+    from lib.migrate.compose import _host_side
+    assert _host_side("${DASHBOARD_PORT:-3000}:${DASHBOARD_PORT:-3000}") == "${DASHBOARD_PORT:-3000}"
+    assert _host_side("127.0.0.1:${AGENT_SERVER_PORT:-18791}:${AGENT_SERVER_PORT:-18791}") == "127.0.0.1:${AGENT_SERVER_PORT:-18791}"
+    assert _host_side("8080:3000") == "8080"
