@@ -80,6 +80,10 @@ if [ ! -d "$WORKSPACE_ROOT/.git" ]; then
         commit --allow-empty -q -m "Initial commit"
 fi
 
+# Regenerate the hooks section of config/claude-settings.json from config/hooks.json
+# (safety rails, opt-in heavy-build block). Idempotent; never blocks startup.
+python3 "$WORKSPACE_ROOT/bin/hooks-sync.py" "$WORKSPACE_ROOT" || true
+
 # Install protected paths git hook
 if [ -f "$WORKSPACE_ROOT/system/check-protected-paths.py" ]; then
     cp "$WORKSPACE_ROOT/system/install-hooks.sh" "$WORKSPACE_ROOT/.git/hooks/pre-commit" 2>/dev/null || true

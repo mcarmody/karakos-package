@@ -1,0 +1,5 @@
+{
+  "heavy_build_block": false,
+  "bare_ssh_hosts": [],
+  "ssh_wrapper": ""
+}

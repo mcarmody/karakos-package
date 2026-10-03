@@ -3,9 +3,8 @@ Tests for issue #93 — bin/wait-for.sh, the sanctioned way to wait on a
 condition (or a fixed delay via --sleep) instead of a sandbox-blocked
 foreground `sleep`.
 
-Ships first because #96 (rewrite_sleep_poll PreToolUse hook) rewrites
-blocked sleep polls to point at this script; if it isn't here yet, the
-rewrite just relocates the failure.
+Originally shipped alongside the sleep-poll rewrite hook (removed in 2.0);
+the script itself stays.
 
 Each test invokes the real script as a subprocess, so removing
 bin/wait-for.sh (or breaking its argument handling) fails every test here

@@ -8,7 +8,16 @@
     "bin/scheduler.py",
     ".karakos/",
     "Dockerfile",
-    "config/protected-paths.json"
+    "config/protected-paths.json",
+    "config/hooks.json",
+    "config/secrets-allow.txt",
+    "bin/hooks-sync.py",
+    "system/check-secrets.py",
+    "system/hooks/bash-safety-rails.py",
+    "system/hooks/block-bare-ssh.py",
+    "system/hooks/block-heavy-build.py",
+    "system/hooks/lib/bashcmd.py",
+    "system/hooks/lib/hookio.py"
   ],
   "tier2_review_required": [
     "bin/",
