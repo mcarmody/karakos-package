@@ -1,8 +1,7 @@
 import { agentFetch } from "@/lib/api";
 
 /**
- * Reload an agent's subprocess via the agent-server. Neutral: no systemctl,
- * tmux or pty code.
+ * Reload an agent's subprocess via the agent-server. Neutral: no process-control code.
  */
 export async function reloadAgent(
   name: string

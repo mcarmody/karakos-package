@@ -378,7 +378,7 @@ html {
 .anim-halo { animation: halo 2.6s ease-out infinite; }
 
 /* Ops Board: clickable rows nudge right on hover —
-   Fleet rows, calendar/PR rows, queue items, anything list-like and
+   Fleet rows, queue items, anything list-like and
    clickable across the board, not just one panel. */
 .row {
   transition: transform 0.15s ease;

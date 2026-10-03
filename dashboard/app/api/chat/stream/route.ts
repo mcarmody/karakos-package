@@ -54,7 +54,7 @@ export async function GET(request: NextRequest) {
 
       let lastSize = 0;
       // Typed turn events (thinking / interstitial / tool) written by the
-      // pty-supervisor's dashboard_events_pump. Cursor is the last relayed
+      // supervisor's dashboard_events_pump. Cursor is the last relayed
       // rowid. The table may not exist yet on a fresh DB — the query is
       // guarded and the guard stays cheap by flipping this off after the
       // first missing-table error.

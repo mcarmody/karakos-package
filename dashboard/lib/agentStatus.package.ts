@@ -7,7 +7,7 @@
  *   config/agents.yaml              role, label, dashboard_chat, shard ids + channels
  *                                   (path: KARAKOS_REGISTRY_PATH)
  *
- * No shards.json, no ssh/systemctl, no pty, no queue broker: this file imports
+ * No ssh or process control, no queue broker: this file imports
  * none of them and is the only thing a package build loads. The registry is
  * read here, never written (the migrator owns every mutation).
  */

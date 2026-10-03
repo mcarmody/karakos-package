@@ -60,7 +60,7 @@ export function sessionCookieOptions() {
 /**
  * Where an account lands after signing in. The per-account permissions model
  * (lib/permissions.ts) owns this and is read here rather than copied into each login route: there are
- * two ways to sign in (password and passkey) and a second copy of this rule
+ * more than one way to sign in and a second copy of this rule
  * is a second place for it to go stale.
  */
 export function homeForUser(username: string): string {

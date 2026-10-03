@@ -182,7 +182,7 @@ export function GhostPill({
   );
 }
 
-/** A stat tile — Fleet's agents/swarms/builds/today-$ row, host metrics. */
+/** A stat tile — the fleet and cost rows, host metrics. */
 export function StatTile({
   label,
   value,

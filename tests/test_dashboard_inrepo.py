@@ -69,7 +69,8 @@ def test_no_profile_gate_or_household_gating_machinery():
 def test_dashboard_copy_carries_no_household_identifiers():
     # Fragments are joined at runtime so this file does not trip the same scan.
     words = ["gide" + "on", "lau" + "ren", "carm" + "ody", "mike" + "carmody", "192." + "168", "kit" + "chen",
-             "gar" + "den", "pan" + "try", "jobh" + "unt", "lam" + "men", "palan" + "tir", "amo" + "s-", "her" + "ald"]
+             "gar" + "den", "pan" + "try", "jobh" + "unt", "lam" + "men", "palan" + "tir", "amo" + "s-", "her" + "ald",
+             "smart" + "-home", "pass" + "key", "dino" + "-diner"]
     pat = re.compile("|".join(re.escape(w) for w in words), re.I)
     hits = []
     for rel in _tracked("dashboard"):

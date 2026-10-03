@@ -59,7 +59,7 @@ const STATUS_DOT: Record<
   },
 };
 
-// Typed mid-turn event from the pty-supervisor's dashboard_events_pump,
+// Typed mid-turn event from the supervisor's dashboard_events_pump,
 // relayed by /api/chat/stream as `{event: {...}}` SSE payloads.
 // Thinking renders at 34%, interstitials at 66%,
 // and neither ever carries conclusions — the final answer is the chunk
@@ -438,7 +438,7 @@ function TurnBoundary({ at }: { at: Date }) {
 
 // A slash command and its output — a distinct system slip, not an agent
 // bubble (no FinalAnswer prose-measure/markdown, no agent-name footer).
-// Monospace throughout so command output (systemctl/journalctl/JSON dumps)
+// Monospace throughout so command output (command output / JSON dumps)
 // reads as a terminal transcript, same visual language as the rest of chat
 // via slip-far + var(--*) tokens.
 function SysSlip({
@@ -1626,7 +1626,7 @@ export default function ChatSurface({ agent: pinnedAgent, variant = "page", disc
       >
       {/* main (AppShell) no longer supplies this on /chat — see AppShell's
           isChat branch — because main itself must not scroll here. Embedded
-          it's the other way round: /smart-home takes AppShell's ordinary
+          it's the other way round: the host page takes AppShell's ordinary
           branch, which already lays down this exact spacer above the page,
           so a second one here would be a double notch gutter. */}
       {!isPanel && <div className="pt-safe lg:hidden" aria-hidden />}
