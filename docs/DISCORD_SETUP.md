@@ -135,6 +135,33 @@ including when people are trading messages quickly. It is silence-biased on
 purpose: staying quiet costs you one word to recover from, and interrupting
 costs you the conversation. Omit the key and the channel behaves as before.
 
+*Optional classifier tier (opt-in, silence on any doubt).* `"reply_gate": true`
+is heuristic only. Make it an object to let a small model (Haiku) decide the
+messages the heuristics leave open, such as a plain question said to the room:
+
+```json
+"kitchen": { "id": "...", "default_agent": "amos",
+  "reply_gate": { "classifier": "haiku", "context_messages": 6,
+                  "min_confidence": 0.7, "timeout_s": 8,
+                  "max_per_minute": 4, "max_per_hour": 60 } }
+```
+
+An object without `classifier` is heuristic only. Out-of-range numbers warn
+once and use the defaults shown. Mentions, replies, name-openers, replies to
+other people, the fast-volley rule, bot authors and empty messages never reach
+the model. Any error, timeout, unparseable answer, low confidence, rate cap
+(per channel) or paused account keeps the silence. An engage routes exactly as
+a heuristic engage does, to the channel's agent.
+
+What is sent: the new message plus the last `context_messages` messages of that
+channel (each cut to 300 characters, kept in relay memory only, never written
+to disk or logged), to the same Claude account your agents already use, in a
+tool-less single-turn call with no MCP servers or settings. Each call is a
+fraction of a cent, recorded under the channel's agent in the cost table;
+counters are in `data/health/relay.json` under `reply_gate`. Set
+`KARAKOS_REPLY_CLASSIFIER=off` in `config/.env` to disable the tier install-wide
+without editing channels.
+
 **`guest_agents`** — lets bots from *outside* this install address your agents
 in that channel. Off by default, so a stranger's bot in a shared server is
 ignored.
