@@ -714,8 +714,13 @@ async def start_agent_subprocess(agent: str):
     # Same for the respawn watcher (#90) — a watcher still awaiting the old
     # process would fire a spurious "exited unexpectedly" the moment that
     # process is reaped, describing a restart we are performing right here.
+    # Except when the stale watcher IS this task: respawn_watcher calls us after
+    # its own process died, and cancelling the current task would abort the
+    # spawn at its first real await (found by the fake-claude harness; fakes
+    # that never suspend in create_subprocess_exec hid it).
     stale_watcher = respawn_watcher_tasks.pop(agent, None)
-    if stale_watcher and not stale_watcher.done():
+    if (stale_watcher and not stale_watcher.done()
+            and stale_watcher is not asyncio.current_task()):
         stale_watcher.cancel()
 
     try:
