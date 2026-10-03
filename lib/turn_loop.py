@@ -1303,11 +1303,10 @@ async def finish_turn(state: ServerState, shard: str, result: TurnResult):
     # with` exits. It cannot spin — every drain moves its batch out of
     # STATUS_QUEUED, so the count strictly decreases, and the `if not
     # batch: return` in drain_shard is the floor.
-    async with state.db.execute(
+    rows = await state.db.execute_fetchall(
         "SELECT COUNT(*) AS count FROM message_queue WHERE agent = ? AND processed = ?",
-        (shard, state.STATUS_QUEUED)
-    ) as cursor:
-        row = await cursor.fetchone()
+        (shard, state.STATUS_QUEUED))
+    row = rows[0] if rows else None
     if row and row["count"]:
         state.log.info(f"{agent} has {row['count']} messages still queued — draining again")
         spawn(state, drain_shard(state, shard))

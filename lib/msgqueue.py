@@ -118,10 +118,10 @@ async def claim_batch(db, shard, limit, now=None) -> list:
     batch with one.
     """
     await expire(db, shard, now)
-    async with db.execute(
+    heads = await db.execute_fetchall(
         f"SELECT id, call_id, channel FROM message_queue WHERE agent = ? AND processed = ?"
-        f" AND {_NOT_REPLY} ORDER BY {_ORDER} LIMIT 1", (shard, STATUS_QUEUED)) as cur:
-        head = await cur.fetchone()
+        f" AND {_NOT_REPLY} ORDER BY {_ORDER} LIMIT 1", (shard, STATUS_QUEUED))
+    head = heads[0] if heads else None
     if head is None:
         return []
     if head["call_id"] is not None or head["channel"] == INTERNAL_CHANNEL:
@@ -283,25 +283,32 @@ async def fail_calls(db, shard, code, detail="") -> int:
     """Answer every queued call row addressed to `shard` with an error reply
     row {"call_id", "error": code, "detail"} (same insert `expire` uses) and
     skip the call row (`response = code`). Returns the count."""
-    rows = await db.execute_fetchall(
-        "UPDATE message_queue SET processed = ?, response = ?,"
-        " processed_at = CURRENT_TIMESTAMP"
-        " WHERE agent = ? AND processed = ? AND call_id IS NOT NULL"
-        " AND reply_to_agent IS NOT NULL"
-        " RETURNING id, call_id, reply_to_agent",
-        (STATUS_SKIPPED, code, shard, STATUS_QUEUED))
-    for r in rows:
-        if r["reply_to_agent"]:
-            await db.execute(
-                "INSERT OR IGNORE INTO message_queue"
-                " (agent, channel, channel_id, server, author, author_id, is_bot,"
-                "  content, message_id, call_id, owner_agent)"
-                " VALUES (?, 'call', '0', 'local', ?, '0', 1, ?, ?, ?, ?)",
-                (r["reply_to_agent"], shard,
-                 json.dumps({"call_id": r["call_id"], "error": code, "detail": detail}),
-                 f"{code}-{r['call_id']}-{r['id']}", r["call_id"],
-                 r["reply_to_agent"]))
-    await db.commit()
+    def job(conn):
+        try:
+            rows = conn.execute(
+                "UPDATE message_queue SET processed = ?, response = ?,"
+                " processed_at = CURRENT_TIMESTAMP"
+                " WHERE agent = ? AND processed = ? AND call_id IS NOT NULL"
+                " AND reply_to_agent IS NOT NULL"
+                " RETURNING id, call_id, reply_to_agent",
+                (STATUS_SKIPPED, code, shard, STATUS_QUEUED)).fetchall()
+            for r in rows:
+                if r["reply_to_agent"]:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO message_queue"
+                        " (agent, channel, channel_id, server, author, author_id, is_bot,"
+                        "  content, message_id, call_id, owner_agent)"
+                        " VALUES (?, 'call', '0', 'local', ?, '0', 1, ?, ?, ?, ?)",
+                        (r["reply_to_agent"], shard,
+                         json.dumps({"call_id": r["call_id"], "error": code, "detail": detail}),
+                         f"{code}-{r['call_id']}-{r['id']}", r["call_id"],
+                         r["reply_to_agent"]))
+            conn.commit()
+            return rows
+        except BaseException:
+            conn.rollback()
+            raise
+    rows = await db._execute(job, db._conn)  # one hop: no write lock across an await
     for target in {r["reply_to_agent"] for r in rows if r["reply_to_agent"]}:
         notify(target)
     return len(rows)
@@ -314,11 +321,11 @@ async def peek_claimable(db, shard, limit=20, now=None) -> list:
     expire step would have skipped it first)."""
     live = " AND (expires_at IS NULL OR expires_at >= ?)"
     now = utc_iso(now)
-    async with db.execute(
+    heads = await db.execute_fetchall(
         f"SELECT id, call_id, channel FROM message_queue WHERE agent = ? AND processed = ?{live}"
         f" AND {_NOT_REPLY}"
-        f" ORDER BY {_ORDER} LIMIT 1", (shard, STATUS_QUEUED, now)) as cur:
-        head = await cur.fetchone()
+        f" ORDER BY {_ORDER} LIMIT 1", (shard, STATUS_QUEUED, now))
+    head = heads[0] if heads else None
     if head is None:
         return []
     if head["call_id"] is not None or head["channel"] == INTERNAL_CHANNEL:

@@ -290,3 +290,46 @@ def test_double_claim_partitions_200_iterations(ags):
             await db.execute("UPDATE message_queue SET processed = 2")
             await db.commit()
     with_db(ags, body)
+
+
+# -- no lock held across an await -----------------------------------------------
+
+def test_reads_leave_no_lock_between_hops(ags):
+    """A read that awaits between execute() and its cursor being closed keeps
+    SQLite's SHARED lock while the loop is free to run other code; a synchronous
+    writer on the same file (the harness tests) then waits out its busy timeout.
+    Probe the file from a second connection on every loop tick while the queue
+    helpers and agent_hold_until run."""
+    import sqlite3
+
+    async def body(db):
+        await add(db, "w1", age=60, agent=VICTIM)
+        await add(db, "w2", age=60, agent=VICTIM, not_before=int(time.time()) + 600)
+        await db.commit()
+        probe = sqlite3.connect(str(ags.DB_PATH), timeout=0, isolation_level=None)
+        locked = []
+        real_execute = db._execute
+
+        async def probed(fn, *a, **kw):
+            # Right after a hop returns, the caller is back on the loop and the
+            # connection thread is idle: nothing may still hold the file.
+            result = await real_execute(fn, *a, **kw)
+            try:
+                probe.execute("BEGIN EXCLUSIVE")
+                probe.execute("ROLLBACK")
+            except sqlite3.OperationalError as e:
+                locked.append(str(e))
+            return result
+        db._execute = probed
+
+        await msgqueue.peek_claimable(db, VICTIM)
+        await msgqueue.steal_wait_s(db, VICTIM, 0.3)
+        await msgqueue.queued_depths(db, [VICTIM, THIEF])
+        await ags.agent_hold_until(VICTIM)
+        await msgqueue.fail_calls(db, VICTIM, "x")
+        await msgqueue.claim_batch(db, VICTIM, 5)
+        db._execute = real_execute
+        probe.close()
+        assert not locked, f"lock held across an await {len(locked)}x"
+
+    with_db(ags, body)

@@ -2557,13 +2557,15 @@ def format_wall_notice(kind, until):
 async def agent_hold_until(agent: str, now=None):
     """Latest future `not_before` among the agent's queued rows, or None."""
     now = int(time.time() if now is None else now)
-    async with db.execute(
+    # execute_fetchall: one hop that also finalizes the statement. An open
+    # cursor (execute() then fetchone()) keeps SQLite's SHARED lock across the
+    # next await, which blocks any other writer on the file.
+    rows = await db.execute_fetchall(
         "SELECT MAX(not_before) AS nb FROM message_queue"
         " WHERE agent = ? AND processed = ? AND not_before > ?",
         (agent, STATUS_QUEUED, now),
-    ) as cursor:
-        row = await cursor.fetchone()
-    return row["nb"] if row and row["nb"] else None
+    )
+    return rows[0]["nb"] if rows and rows[0]["nb"] else None
 
 
 def schedule_hold_wake(agent: str, until: int) -> None:

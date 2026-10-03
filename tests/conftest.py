@@ -39,6 +39,22 @@ def import_script(name: str, file_path: Path = None):
     return module
 
 
+@pytest.fixture(autouse=True)
+def _release_server_log_handlers():
+    """agent-server.py adds a file handler and a console handler to the shared
+    "agent-server" logger at import. Tests re-import it constantly, so without
+    this the logger collects dozens of handlers (many on deleted tmp files),
+    and every log call becomes slow synchronous work on the event loop."""
+    import logging
+    logger = logging.getLogger("agent-server")
+    before = list(logger.handlers)
+    yield
+    for h in list(logger.handlers):
+        if h not in before:
+            logger.removeHandler(h)
+            h.close()
+
+
 @pytest.fixture
 def tmp_workspace(tmp_path):
     """Create a temporary workspace with expected directory structure."""

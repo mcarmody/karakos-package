@@ -130,6 +130,8 @@ class Harness:
         self.module.post_to_discord = self._record_discord
         self.client = TestClient(TestServer(self.module.create_app(), host="127.0.0.1"))
         await self.client.start_server()
+        if os.environ.get("KARAKOS_DB_TRACE"):
+            await self._trace_db()
         # The ephemeral port is only known now, after the shards have spawned, so
         # the fake's MCP tools server reads the base URL from this file (and a
         # respawned shard inherits it through AGENT_SERVER_URL). Step 2.3.
@@ -138,6 +140,30 @@ class Harness:
         self.log_dir.mkdir(parents=True, exist_ok=True)
         (self.log_dir / "server-url").write_text(url)
         return self
+
+    async def _trace_db(self):
+        """Debug aid (KARAKOS_DB_TRACE=1): record every statement the server's
+        connection runs, so a lock failure can show who held the lock."""
+        import collections
+        self.db_trace = collections.deque(maxlen=60)
+        trace = self.db_trace
+        conn = self.module.db._conn
+        await self.module.db._execute(
+            lambda: conn.set_trace_callback(
+                lambda sql: trace.append((time.monotonic(), sql[:160]))))
+
+    def dump_lock_state(self, label=""):
+        """Debug aid: server connection state + recent statements + task stacks."""
+        import io
+        out = io.StringIO()
+        db = self.module.db
+        print(f"=== DB LOCK DUMP {label} in_transaction={db._conn.in_transaction}", file=out)
+        for ts, sql in list(getattr(self, "db_trace", [])):
+            print(f"  {ts:.3f} {sql}", file=out)
+        for t in asyncio.all_tasks():
+            print(f"  task {t.get_name()}:", file=out)
+            t.print_stack(limit=4, file=out)
+        sys.stderr.write(out.getvalue())
 
     async def stop(self):
         if self.client is not None:

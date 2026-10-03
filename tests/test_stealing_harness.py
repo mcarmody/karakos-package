@@ -8,6 +8,7 @@ waiting row becomes stealable between ~0.3 s and ~1.3 s after it arrives.
 import asyncio
 import json
 import logging
+import os
 import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
@@ -46,11 +47,26 @@ def insert(h, agent, name, channel_id="9", age=60, **kw):
     cols = {"agent": agent, "channel": kw.pop("channel", "c"), "channel_id": channel_id,
             "server": "local", "author": "u", "author_id": "1", "is_bot": 0,
             "content": name, "message_id": name, "created_at": created, **kw}
+    if os.environ.get("KARAKOS_DB_TRACE"):
+        probe = sqlite3.connect(str(h.module.DB_PATH), timeout=0, isolation_level=None)
+        try:
+            probe.execute("BEGIN EXCLUSIVE")
+            probe.execute("ROLLBACK")
+        except sqlite3.OperationalError:
+            h.dump_lock_state(f"probe before {name}")
+        finally:
+            probe.close()
     conn = sqlite3.connect(str(h.module.DB_PATH))
-    conn.execute(f"INSERT INTO message_queue ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
-                 list(cols.values()))
-    conn.commit()
-    conn.close()
+    try:
+        conn.execute(f"INSERT INTO message_queue ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
+                     list(cols.values()))
+        conn.commit()
+    except sqlite3.OperationalError:
+        if os.environ.get("KARAKOS_DB_TRACE"):
+            h.dump_lock_state(name)
+        raise
+    finally:
+        conn.close()
 
 
 def wake(h, shard, channel_id="9"):
