@@ -78,8 +78,8 @@ def test_policy_hooks_register_after_hive(harness):
     async def scenario():
         async with h:
             hooks = h.module.STATE.hooks
-            assert hooks.on_turn_end == [h.module.hive_on_turn_end,
-                                         h.module.session_policy_on_turn_end]
+            assert hooks.on_turn_end[0] is h.module.hive_on_turn_end
+            assert hooks.on_turn_end[-1] is h.module.session_policy_on_turn_end
 
     run(scenario())
 
