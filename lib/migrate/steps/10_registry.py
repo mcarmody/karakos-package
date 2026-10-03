@@ -72,7 +72,7 @@ def _verify(ctx):
                         f"agent '{aid}': '{key}' changed ({val!r} -> {new[aid].get(key)!r})")
             elif key not in raw[aid]:      # unknown key must at least be carried over
                 raise RuntimeError(f"agent '{aid}': key '{key}' was dropped")
-        extra = set(new[aid]) - set(entry or {})
+        extra = set(new[aid]) - set(entry or {}) - {"prompt"}   # prompt flags added by migration
         if extra:
             raise RuntimeError(f"agent '{aid}': unexpected keys {sorted(extra)}")
     settings = cfg / "claude-settings.json"
