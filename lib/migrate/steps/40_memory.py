@@ -255,7 +255,7 @@ def _case(ctx):
     if lp.is_file():
         tables = _legacy_tables(lp)
         if mig is not None:
-            return "finish" if mig.get("source_sha256") == _sha256(lp) else None
+            return "finish"   # _finish refuses loudly when the hashes differ
         if tables is None or any(t in tables for t in TABLES):
             return "migrate"   # unreadable: fail loudly in apply, never skip silently
         return None if gp.is_file() else "empty"

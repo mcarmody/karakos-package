@@ -23,6 +23,9 @@ STEP = mem.STEP
 
 @pytest.fixture(autouse=True)
 def _env(monkeypatch):
+    # never load a real embedding model (network, HOME cache), even where CI has
+    # fastembed installed; tests wanting an embedder add the fake on top
+    monkeypatch.setitem(sys.modules, "fastembed", None)
     for k in ("KARAKOS_SKIP_STAMP_CHECK", "KARAKOS_ENV", "KARAKOS_SEMANTIC_RECALL",
               "KARAKOS_RECALL_WEIGHTS", "KARAKOS_RECALL_SCAN_LIMIT", "FASTEMBED_CACHE_PATH"):
         monkeypatch.delenv(k, raising=False)
