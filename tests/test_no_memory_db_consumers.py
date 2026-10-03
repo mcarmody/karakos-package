@@ -14,6 +14,9 @@ EXCLUDED_PREFIXES = ("tests/", "lib/migrate/", "docs/")
 # bin/memory-maintenance.py is the nightly 1.x writer; 4.3 retires it and this
 # entry with it. Nothing else may be listed here.
 ALLOWLIST = {"bin/memory-maintenance.py"}
+# Dev tooling that BUILDS 1.x installs as migrator test fixtures (step 7.1). It
+# writes a 1.x memory.db on purpose and never runs inside an install.
+FIXTURE_TOOLS = {"tools/seed_fixture.py"}
 MUST_BE_SCANNED = ("bin/relay.py", "bin/oneshot.py", "bin/purge-data.py")
 
 
@@ -31,13 +34,13 @@ def test_audited_files_are_scanned():
     files = set(scanned())
     for f in MUST_BE_SCANNED:
         assert f in files, f"{f} is not covered by the guard"
-        assert f not in ALLOWLIST
+        assert f not in ALLOWLIST and f not in FIXTURE_TOOLS
 
 
 def test_no_memory_db_consumers():
     hits = []
     for f in scanned():
-        if f in ALLOWLIST:
+        if f in ALLOWLIST or f in FIXTURE_TOOLS:
             continue
         text = (PACKAGE_ROOT / f).read_text(errors="replace")
         for n in NEEDLES:
