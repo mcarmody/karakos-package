@@ -193,3 +193,9 @@ class TestSetupPrimaryTemplate:
 
     def test_display_name_not_lowercased(self):
         assert "tr 'A-Z' 'a-z'" not in self.content
+
+
+def test_setup_checks_pyyaml_before_using_the_registry():
+    """setup.sh imports lib/registry.py on the host (step 3.1), which needs PyYAML."""
+    text = (Path(__file__).resolve().parents[1] / "setup.sh").read_text()
+    assert text.index("import yaml") < text.index("registry.slugify_id")

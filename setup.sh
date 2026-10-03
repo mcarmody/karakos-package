@@ -134,6 +134,32 @@ check_prerequisites() {
         log "jq installed"
     fi
 
+    # python3 + PyYAML: setup writes config/agents.yaml through lib/registry.py.
+    if ! command -v python3 &> /dev/null; then
+        error "python3 not found. Install Python 3.9 or newer and re-run setup."
+        exit 1
+    fi
+    if ! python3 -c 'import yaml' &> /dev/null; then
+        log "PyYAML not found — installing..."
+        if command -v apt-get &> /dev/null; then
+            sudo apt-get install -y python3-yaml
+        elif command -v brew &> /dev/null; then
+            python3 -m pip install --user pyyaml
+        elif command -v dnf &> /dev/null; then
+            sudo dnf install -y python3-pyyaml
+        elif command -v pacman &> /dev/null; then
+            sudo pacman -S --noconfirm python-yaml
+        else
+            python3 -m pip install --user pyyaml || true
+        fi
+
+        if ! python3 -c 'import yaml' &> /dev/null; then
+            error "PyYAML installation failed. Install it (python3 -m pip install pyyaml) and re-run setup."
+            exit 1
+        fi
+        log "PyYAML installed"
+    fi
+
     # Check ports
     if lsof -Pi :3000 -sTCP:LISTEN -t >/dev/null 2>&1; then
         warn "Port 3000 already in use. Dashboard won't start."
