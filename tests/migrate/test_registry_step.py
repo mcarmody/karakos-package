@@ -43,6 +43,11 @@ def make(tmp_path, legacy=LEGACY, channels=CHANNELS, settings=True):
     return ws
 
 
+def _no_prompt(agents):
+    """legacy_view minus the prompt flags the migration adds."""
+    return {a: {k: v for k, v in e.items() if k != "prompt"} for a, e in agents.items()}
+
+
 def migrate(ws):
     lines = []
     rc = runner.run(ws / "data", ws / "config", ws / "backups",
@@ -56,7 +61,7 @@ def test_migrates_conftest_fixture(legacy_workspace):
     assert rc == 0, lines
     reg = registry.load_registry(ws)
     assert reg.primary().id == "test-agent"
-    assert reg.legacy_view()["agents"]["test-agent"] == \
+    assert _no_prompt(reg.legacy_view()["agents"])["test-agent"] == \
         json.loads((ws / "config" / "agents.json").read_text())["agents"]["test-agent"]
     assert guard.read_stamp(ws / "data")
 
@@ -93,7 +98,8 @@ def test_role_mapping_and_channels(tmp_path):
     assert reg.shard_for_channel("ops").agent == "fifth"
     assert reg.shard_for_channel("signals") is None
     assert reg.agent("relay").get("model") == "haiku"
-    assert reg.legacy_view()["agents"] == LEGACY["agents"]
+    view = reg.legacy_view()["agents"]
+    assert _no_prompt({a: view[a] for a in LEGACY["agents"]}) == LEGACY["agents"]
 
 
 def test_no_relay_gets_default_monitor(tmp_path):
@@ -104,6 +110,47 @@ def test_no_relay_gets_default_monitor(tmp_path):
     mon = reg.monitor()
     assert mon.id == "relay" and mon.get("model") == "haiku"
     assert reg.primary().id == "solo"
+
+
+def test_migrated_agents_keep_prompt_verbatim(tmp_path):
+    from prompt_compose import compose_system_prompt
+    ws = make(tmp_path)
+    (ws / "agents" / "boss").mkdir(parents=True)
+    (ws / "agents" / "boss" / "SYSTEM_PROMPT.md").write_text("OLD BOSS PROMPT\n")
+    (ws / "agents" / "CORE.md").write_text("CORE TEXT")
+    (ws / "agents" / "HOUSE_STYLE.md").write_text("HOUSE TEXT")
+    assert migrate(ws)[0] == 0
+    reg = registry.load_registry(ws)
+    for aid in LEGACY["agents"]:
+        if aid == "relay":
+            continue
+        p = reg.agent(aid).get("prompt")
+        assert p["core"] is False and p["house_style"] is False, aid
+    assert reg.agent("boss").get("prompt")["section"] == "agents/boss/SYSTEM_PROMPT.md"
+    assert compose_system_prompt(ws, "boss") == "OLD BOSS PROMPT\n"
+
+
+def test_fresh_install_agent_has_flags_on(tmp_path):
+    from prompt_compose import compose_system_prompt
+    ws = tmp_path / "ws"
+    (ws / "config").mkdir(parents=True)
+    (ws / "agents" / "a").mkdir(parents=True)
+    (ws / "agents" / "CORE.md").write_text("CORE TEXT")
+    (ws / "agents" / "HOUSE_STYLE.md").write_text("HOUSE TEXT")
+    (ws / "agents" / "a" / "SYSTEM_PROMPT.md").write_text("A PROMPT")
+    (ws / "config" / "agents.yaml").write_text(yaml.safe_dump(
+        {"version": registry.REGISTRY_VERSION,
+         "agents": {"a": {"name": "a", "role": "primary"}}}))
+    out = compose_system_prompt(ws, "a")
+    assert "CORE TEXT" in out and "HOUSE TEXT" in out and "A PROMPT" in out
+
+
+def test_default_monitor_prompt_section_exists(tmp_path):
+    ws = make(tmp_path, legacy={"agents": {"solo": {"model": "opus"}}}, channels=None)
+    assert migrate(ws)[0] == 0
+    p = registry.load_registry(ws).monitor().get("prompt")
+    assert p["core"] is True and p["house_style"] is True
+    assert (ROOT / p["section"]).is_file()
 
 
 def test_verify_fails_when_a_field_is_dropped(tmp_path):

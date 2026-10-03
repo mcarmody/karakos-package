@@ -83,7 +83,10 @@ def test_cli_matches_old_lookup(migrated, name, args, old):
 
 
 def test_legacy_cli_matches_old_dict(migrated):
-    assert json.loads(cli(migrated, "legacy")) == LEGACY
+    got = json.loads(cli(migrated, "legacy"))
+    for entry in got["agents"].values():
+        entry.pop("prompt", None)       # flags added by the 1.3b migration
+    assert got == LEGACY
     view = json.loads(cli(migrated, "legacy"))["agents"]
     token = next((i["discord_bot_token_env"] for i in view.values()
                   if i.get("discord_bot_token_env")), None)

@@ -54,6 +54,10 @@ Call the owner by first name.
 Never discuss politics or religion. Redirect to practical topics.
 ```
 
+### Prompt composition and migrated agents
+
+Migrated agents keep their own prompt verbatim (`prompt: {core: false, house_style: false}`); turn `core`/`house_style` on after removing the duplicated sections from the prompt file by hand.
+
 ## Adding a Skill
 
 Skills add new tools to the MCP server. They're automatically discovered at startup.

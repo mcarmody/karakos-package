@@ -399,7 +399,9 @@ def write_agent(workspace, agent_id, body):
 
 LEGACY_BACKUP_SUFFIX = ".pre-2.0"
 _DEFAULT_MONITOR = {"name": "relay", "role": "monitor", "model": "haiku",
-                    "dashboard_chat": False}
+                    "dashboard_chat": False,
+                    "prompt": {"section": "agents/templates/relay.md",
+                               "core": True, "house_style": True}}
 
 
 def legacy_to_registry_dict(old, channels=None):
@@ -434,10 +436,18 @@ def legacy_to_registry_dict(old, channels=None):
                 entry.setdefault("discord", {})["bot_id_env"] = v
             else:
                 entry[k] = v
+        # 1.x prompts already carry their own core/house-style text: keep them
+        # verbatim (flags off) so nothing is injected twice after the upgrade.
+        if "prompt" not in entry:
+            entry["prompt"] = {"core": False, "house_style": False}
+            if entry.get("system_prompt"):
+                entry["prompt"] = {"section": entry["system_prompt"],
+                                   **entry["prompt"]}
         agents[aid] = entry
     if "monitor" not in roles.values():
         mid = "relay" if "relay" not in agents else "monitor"
-        agents[mid] = {**_DEFAULT_MONITOR, "name": mid}
+        agents[mid] = {**_DEFAULT_MONITOR, "name": mid,
+                       "prompt": dict(_DEFAULT_MONITOR["prompt"])}
     chans = (channels or {}).get("channels") if isinstance(channels, dict) else None
     if isinstance(chans, dict):
         owned = {}
