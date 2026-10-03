@@ -1877,13 +1877,13 @@ async def _writeback_discord_id(queue_message_id: str, discord_id: str) -> None:
     Rows of the same turn (same agent, channel, response, processed_at) share
     the reply, so they are marked together."""
     try:
-        await db.execute(
+        await msgqueue.write_commit(
+            db,
             "UPDATE message_queue SET discord_response_id = ? WHERE discord_response_id IS NULL "
             "AND (message_id = ? OR (processed_at IS NOT NULL AND (agent, channel_id, response, processed_at) = "
             "(SELECT agent, channel_id, response, processed_at FROM message_queue "
             "WHERE message_id = ? AND processed_at IS NOT NULL)))",
             (discord_id, queue_message_id, queue_message_id))
-        await db.commit()
     except Exception as e:
         log.warning(f"Discord outbox: could not write id back for {queue_message_id} "
                     f"({type(e).__name__}: {e})")
