@@ -115,6 +115,27 @@ previous run left root-owned volumes behind. That needs
 `docker compose -f config/docker-compose.yml --env-file config/.env down -v`,
 which destroys those volumes — restore from the step-1 backup afterwards.
 
+## Agent subprocess environment (2.0)
+
+Agent (`claude`) subprocesses no longer inherit the agent-server's whole
+environment. They get an allowlist (`PATH`, `HOME`, locale/proxy/CA settings,
+`ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CONFIG_DIR`, `XDG_*`)
+plus the agent's `env:` block in `config/agents.yaml`. Discord tokens and other
+secrets stay out unless named. If a hook or tool relied on an inherited
+variable such as `GITHUB_TOKEN`, grant it explicitly; `${NAME}` is resolved
+from the server environment at spawn, so the secret stays out of the file:
+
+```yaml
+agents:
+  amos:
+    env:
+      GITHUB_TOKEN: ${GITHUB_TOKEN}
+```
+
+`python3 -m lib.migrate --dry-run` lists variables in `config/.env` that no
+agent's `env:` references. For debugging only, `KARAKOS_ENV_PASSTHROUGH=1`
+restores the old behaviour (refused when `KARAKOS_ENV=production`).
+
 ## Database schema
 
 There is no migration command to run and no `bin/migrate.py`. The agent server

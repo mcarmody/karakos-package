@@ -321,3 +321,14 @@ def test_server_refuses_unstamped_fixture_no_spawn(tmp_path, monkeypatch):
     assert e.value.code == 78
     assert not log_dir.exists() or not list(log_dir.iterdir())  # no spawn
     assert not (ws / "data" / "memory").exists()  # no DB opened
+
+
+def test_dry_run_lists_env_vars_no_agent_references(tmp_path):
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / ".env").write_text("DISCORD_TOKEN_A=x\nGITHUB_TOKEN=y\nOTHER=z\n")
+    (cfg / "agents.json").write_text(json.dumps({"agents": {"a": {
+        "discord_bot_token_env": "DISCORD_TOKEN_A", "env": {"OTHER": "${OTHER}"}}}}))
+    lines = runner.unreferenced_env_report(cfg)
+    assert "  - GITHUB_TOKEN" in lines
+    assert "  - OTHER" not in lines and "  - DISCORD_TOKEN_A" not in lines
