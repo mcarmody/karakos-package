@@ -11,7 +11,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 git -C "$REPO" archive "$TAG" | tar -x -C "$TMP"
-python3 - "$TMP" "$TAG" "$FORMAT" <<'PY'
+python3 - "$TMP" "$TAG" "$FORMAT" "$REPO" <<'PY'
 import hashlib, json, re, sqlite3, sys
 from pathlib import Path
 root, tag, fmt = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
@@ -51,35 +51,9 @@ ep_facts = {"sha256": hashlib.sha256(ep.encode()).hexdigest()[:12],
             "mkdirs": sorted(set(re.findall(r'"\$WORKSPACE_ROOT/([\w/-]+)"', ep)))}
 
 # --- tables (execute the tag's own DDL; per source file => per database)
-def balanced(text, i):
-    d = 0
-    for j in range(i, len(text)):
-        d += (text[j] == "(") - (text[j] == ")")
-        if d == 0:
-            return text[i:j + 1]
-    return ""
-
-tables = {}
-for f in sorted(root.rglob("*.py")):
-    rel = f.relative_to(root).as_posix()
-    if rel.startswith(("tests/", "node_modules/")): continue
-    src = f.read_text(errors="replace")
-    ddl = [(m.group(1), balanced(src, m.end() - 1))
-           for m in re.finditer(r"CREATE TABLE IF NOT EXISTS\s+(\w+)\s*\(", src)]
-    ddl += [(m.group(1), balanced(src, m.end() - 1))
-            for m in re.finditer(r"CREATE TABLE\s+(?!IF)(\w+)\s*\(", src)]
-    if not ddl: continue
-    con = sqlite3.connect(":memory:")
-    for name, body in ddl:
-        try: con.execute(f"CREATE TABLE IF NOT EXISTS {name} {body}")
-        except sqlite3.Error: pass
-    for t, c, d in re.findall(r"ensure_column\(\s*[\"'](\w+)[\"']\s*,\s*[\"'](\w+)[\"']\s*,\s*[\"']([^\"']+)[\"']", src):
-        try: con.execute(f"ALTER TABLE {t} ADD COLUMN {c} {d}")
-        except sqlite3.Error: pass
-    for (t,) in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall():
-        cols = [r[1] for r in con.execute(f'PRAGMA table_info("{t}")')]
-        tables[f"{rel}:{t}"] = cols
-    con.close()
+sys.path.insert(0, sys.argv[4] + "/tools")
+import tagschema
+tables = tagschema.tables_of(root)
 
 # --- agents.json / channels.json shape as written by setup.sh
 setup = read("setup.sh")

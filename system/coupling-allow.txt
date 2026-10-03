@@ -5,3 +5,5 @@
 # ignored.
 Dockerfile	/home/karakos
 config/docker-compose*.yml	/home/karakos
+lib/migrate/templates/*.tmpl	/home/karakos
+docs/migration-inventory.md	/home/karakos
