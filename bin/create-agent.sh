@@ -132,28 +132,18 @@ PY
 )
 fi
 
-# Generate system prompt from template
-sed \
-    -e "s/{{AGENT_NAME}}/$AGENT_NAME/g" \
-    -e "s/{{SYSTEM_NAME}}/$SYSTEM_NAME/g" \
-    -e "s/{{OWNER_NAME}}/$OWNER_NAME/g" \
-    -e "s|{{CHANNELS}}|${CHANNELS//$'\n'/\\n}|g" \
-    -e "s|{{OTHER_AGENTS}}|${OTHER_AGENTS//$'\n'/\\n}|g" \
-    "$TEMPLATE_PATH" > "$AGENT_DIR/SYSTEM_PROMPT.md"
+# Copy the template unsubstituted: composition (lib/prompt_compose.py) resolves
+# {{AGENT_NAME}}, {{CHANNELS}} and the rest at every spawn.
+cp "$TEMPLATE_PATH" "$AGENT_DIR/SYSTEM_PROMPT.md"
 
 # Create empty voice.md for user customization
 touch "$AGENT_DIR/persona/voice.md"
 
-# Drop in a templated onboarding.md so the very first turn asks the user
-# for guidance instead of behaving as a fully-formed assistant. Removed
-# automatically (well — ignored) once the persona dir has any content.
+# First-boot onboarding is for the primary only; builders, reviewers, the
+# monitor and custom agents get none.
 ONBOARDING_TEMPLATE="$WORKSPACE_ROOT/agents/templates/onboarding.md"
-if [[ -f "$ONBOARDING_TEMPLATE" ]]; then
-    sed \
-        -e "s/{{AGENT_NAME}}/$AGENT_NAME/g" \
-        -e "s/{{SYSTEM_NAME}}/$SYSTEM_NAME/g" \
-        -e "s/{{OWNER_NAME}}/$OWNER_NAME/g" \
-        "$ONBOARDING_TEMPLATE" > "$AGENT_DIR/onboarding.md"
+if [[ "$TEMPLATE" == "primary" && -f "$ONBOARDING_TEMPLATE" ]]; then
+    cp "$ONBOARDING_TEMPLATE" "$AGENT_DIR/onboarding.md"
 fi
 
 # Create inbox directory for dispatch adapter

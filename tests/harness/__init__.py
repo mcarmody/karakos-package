@@ -80,7 +80,7 @@ def write_agents_config(workspace: Path, agents, shards=None) -> None:
 
 
 class Harness:
-    def __init__(self, tmp_workspace, agents=["a", "b"], shards=None):
+    def __init__(self, tmp_workspace, agents=["a", "b"], shards=None, write_config=True):
         from conftest import import_script  # tests/ is on sys.path under pytest
         self.workspace = Path(tmp_workspace)
         self.agents = list(agents)
@@ -92,7 +92,8 @@ class Harness:
         self.module = None
         self.client = None
         self.shards = dict(shards or {})
-        write_agents_config(self.workspace, agents, self.shards)
+        if write_config:
+            write_agents_config(self.workspace, agents, self.shards)
         # A 2.0 workspace is stamped; the server refuses to boot otherwise.
         from lib.migrate.guard import write_stamp
         write_stamp(self.workspace / "data")

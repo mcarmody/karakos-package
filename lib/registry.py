@@ -6,6 +6,7 @@
     reg.primary(); reg.monitor(); reg.shards(); reg.legacy_view()
 
 CLI:  python3 lib/registry.py [--workspace DIR] ids | field <id> <key> | role <role> | legacy | validate
+      python3 lib/registry.py init --workspace DIR --primary-id ID --primary-name NAME [...]
 
 Keying rule: a shard ``id`` is the runtime key everywhere (queue, sessions, cost
 rows, states, locks). The default shard of agent ``X`` has id ``X``. Account-level
@@ -518,6 +519,105 @@ def _fmt(val):
     return str(val)
 
 
+# --------------------------------------------------------------------------
+# init (called by setup.sh on a fresh install)
+# --------------------------------------------------------------------------
+
+NAME_MAX = 64
+
+
+def slugify_id(name):
+    """Registry id from a typed name: lowercase letters, digits, hyphens, starting
+    with a letter, at most 32 chars; ``karakos`` when nothing usable is left."""
+    slug = re.sub(r"[^a-z0-9-]", "-", str(name).lower())
+    slug = re.sub(r"^[^a-z]+", "", slug)[:32].strip("-")
+    return slug or "karakos"
+
+
+def clean_display_name(name):
+    """Trim; refuse control characters/newlines and names over NAME_MAX."""
+    name = str(name).strip()
+    if any(ord(c) < 32 or ord(c) == 127 for c in name):
+        raise RegistryError(["name must not contain control characters or newlines"])
+    if len(name) > NAME_MAX:
+        raise RegistryError([f"name must be at most {NAME_MAX} characters"])
+    return name
+
+
+def init_registry(workspace, primary_id, primary_name, monitor_id="relay", monitor_name=None,
+                  monitor_template="agents/templates/relay.md", channels=None,
+                  context_budget=150000):
+    """Write a fresh config/agents.yaml (primary + monitor). Refuses an existing
+    file. The document is built as a dict and dumped by yaml.safe_dump, so no name
+    can break the YAML."""
+    path = agents_yaml_path(workspace)
+    if path.exists():
+        raise RegistryError([f"{path} already exists; refusing to overwrite"])
+    primary_name = clean_display_name(primary_name) or primary_id
+    monitor_name = clean_display_name(monitor_name) if monitor_name else monitor_id
+    if primary_id == monitor_id:
+        raise RegistryError([f"primary id '{primary_id}' equals the monitor id; choose another name"])
+    doc = {
+        "version": REGISTRY_VERSION,
+        "agents": {
+            primary_id: {
+                "name": primary_name,
+                "role": "primary",
+                "model": "sonnet",
+                "max_turns": 200,
+                "timeout": 10800,
+                "prompt": {"section": f"agents/{primary_id}/SYSTEM_PROMPT.md",
+                           "core": True, "house_style": True},
+                "context_budget_tokens": int(context_budget),
+                "tool_streaming": True,
+                "stream_to_channel": True,
+                "discord": {"token_env": "DISCORD_BOT_TOKEN_PRIMARY",
+                            "bot_id_env": "DISCORD_BOT_ID_PRIMARY"},
+                "shards": [{"id": primary_id, "channels": list(channels or ["general"])}],
+            },
+            monitor_id: {
+                "name": monitor_name,
+                "role": "monitor",
+                "model": "haiku",
+                "max_turns": 10,
+                "timeout": 300,
+                "prompt": {"section": monitor_template, "core": True, "house_style": True},
+                "tool_streaming": False,
+                "stream_to_channel": False,
+                "dashboard_chat": False,
+            },
+        },
+    }
+    parse_registry(doc, None)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(yaml.safe_dump(doc, sort_keys=False, default_flow_style=False,
+                                  allow_unicode=True))
+    os.replace(tmp, path)
+
+
+def _init_main(ws, args):
+    import argparse
+    ap = argparse.ArgumentParser(prog="registry.py init")
+    ap.add_argument("--workspace", default=ws)
+    ap.add_argument("--primary-id", default=None)
+    ap.add_argument("--primary-name", required=True)
+    ap.add_argument("--monitor-id", default="relay")
+    ap.add_argument("--monitor-name", default=None)
+    ap.add_argument("--monitor-template", default="agents/templates/relay.md")
+    ap.add_argument("--channel", action="append", default=None)
+    ap.add_argument("--context-budget", type=int, default=150000)
+    a = ap.parse_args(args)
+    try:
+        pid = a.primary_id or slugify_id(a.primary_name)
+        init_registry(a.workspace, pid, a.primary_name, a.monitor_id, a.monitor_name,
+                      a.monitor_template, a.channel, a.context_budget)
+    except RegistryError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+    return 0
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     ws = os.environ.get("WORKSPACE_ROOT") or str(Path(__file__).resolve().parent.parent)
@@ -528,6 +628,8 @@ def main(argv=None):
         print(usage, file=sys.stderr)
         return 2
     cmd, args = argv[0], argv[1:]
+    if cmd == "init":
+        return _init_main(ws, args)
     try:
         reg = load_registry(ws)
     except RegistryError as exc:

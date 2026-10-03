@@ -168,3 +168,31 @@ def test_tool_events_usage_sidechain_and_duplicate_ids(harness):
     assert [e["message"]["id"] for e in tool_events] == ["m1", "m2", "m2"]
     assert [e["message"]["usage"]["input_tokens"] for e in tool_events[:2]] == [1, 2]
     assert [e["parent_tool_use_id"] for e in tool_events] == [None, None, "toolu_parent"]
+
+
+def test_real_template_primary_onboards_once(real_template_workspace):
+    ws = real_template_workspace
+    h = Harness(ws, agents=["jarvis"], write_config=False)
+
+    def argv_prompts():
+        a = h.argv("jarvis")
+        sysp = a[a.index("--system-prompt") + 1]
+        app = a[a.index("--append-system-prompt") + 1] if "--append-system-prompt" in a else ""
+        return sysp, app
+
+    async def scenario():
+        async with h:
+            await h.send("jarvis", "hi")
+            await h.wait_idle("jarvis")
+            first = argv_prompts()
+            (ws / "agents/jarvis/persona/identity.md").write_text("They are Sam.")
+            r = await h.client.post("/agents/jarvis/reset", headers=h._headers())
+            assert r.status == 200
+            await h.send("jarvis", "again")
+            await h.wait_idle("jarvis")
+            return first, argv_prompts()
+
+    (sysp, app), (_, app2) = run(scenario())
+    assert "## Shards and the hive" in sysp and "`jarvis`" in sysp and "Jarvis" in sysp
+    assert "First-Boot Onboarding" in app
+    assert "First-Boot Onboarding" not in app2
