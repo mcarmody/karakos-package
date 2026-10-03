@@ -18,6 +18,7 @@ class TestDockerBuild:
     """Verify Docker image builds successfully."""
 
     @pytest.mark.slow
+    @pytest.mark.docker
     def test_docker_build_succeeds(self):
         """The Docker image should build without errors."""
         result = subprocess.run(
@@ -32,6 +33,7 @@ class TestDockerBuild:
         )
 
     @pytest.mark.slow
+    @pytest.mark.docker
     def test_docker_build_has_dashboard(self):
         """Built image records the dashboard ref and loads its native modules."""
         result = subprocess.run(
@@ -57,6 +59,7 @@ class TestDockerBuild:
         assert "native ok" in result.stdout, f"native modules failed to load:\n{result.stderr}"
 
     @pytest.mark.slow
+    @pytest.mark.docker
     def test_docker_build_has_python_deps(self):
         """Built image should have Python dependencies installed."""
         result = subprocess.run(
@@ -73,6 +76,7 @@ class TestDockerBuild:
         )
 
     @pytest.mark.slow
+    @pytest.mark.docker
     def test_docker_build_has_node(self):
         """Built image should have Node.js installed."""
         result = subprocess.run(

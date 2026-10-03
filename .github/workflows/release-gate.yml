@@ -1,0 +1,222 @@
+name: Release gate
+
+# The artifacts-for-real half of the release tests (7.3a): a fresh install comes
+# up from the image and compose file a new user gets, a tagged 1.x install
+# upgrades on the real container path, and the real CLI still behaves as the
+# fake says. release.yml calls this before it publishes anything.
+#
+# Budget policy (see ci.yml's header): no push trigger, at most one scheduled
+# run a week, and pull_request only when a file that can break these changes.
+#
+# Secrets:
+#   DASHBOARD_FETCH_TOKEN    read access to the private karakos-dashboard repo (image build).
+#                            Missing: build-image and the two Docker smokes SKIP with a
+#                            warning on every event (as ci.yml's docker-smoke does).
+#   CLAUDE_CODE_OAUTH_TOKEN  a scratch Anthropic account's long-lived token (real-CLI smoke).
+#                            Missing: skips on a PR, FAILS on a tag, dispatch or schedule.
+# GITHUB_TOKEN (packages: read) pulls the ghcr.io/mcarmody/karakos tags the upgrade matrix uses.
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: "Commit or tag to test (defaults to the calling ref)"
+        type: string
+        required: false
+        default: ""
+    secrets:
+      DASHBOARD_FETCH_TOKEN:
+        required: false
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: false
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Commit or tag to test (defaults to the selected ref)"
+        required: false
+        default: ""
+      cli_version:
+        description: "claude CLI version for the real-CLI smoke (default: latest, as the image installs)"
+        required: false
+        default: "latest"
+  schedule:
+    - cron: "0 14 * * 1"
+  pull_request:
+    branches: [main, release/2.0]
+    paths:
+      - Dockerfile
+      - config/docker-compose*.yml
+      - bin/entrypoint.sh
+      - lib/migrate/**
+      - setup.sh
+      - requirements.txt
+      - dashboard.ref
+      - tests/smoke/**
+      - tests/realcli*
+      - .github/workflows/release-gate.yml
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  build-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      built: ${{ steps.flag.outputs.built }}
+    env:
+      HAS_DASHBOARD_TOKEN: ${{ secrets.DASHBOARD_FETCH_TOKEN != '' }}
+    steps:
+      - name: Secret present?
+        id: flag
+        run: |
+          if [ "$HAS_DASHBOARD_TOKEN" = true ]; then
+            echo "built=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "built=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::DASHBOARD_FETCH_TOKEN is not available (a forked PR, or the secret is not set): skipping the image build and the fresh-install and upgrade smokes. This is a skip, not a pass: release.yml's build-push also needs this secret, so nothing publishes without it."
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.flag.outputs.built == 'true'
+        with:
+          ref: ${{ inputs.ref || '' }}
+
+      - name: Fetch pinned dashboard source
+        if: steps.flag.outputs.built == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.DASHBOARD_FETCH_TOKEN }}
+        run: bin/fetch-dashboard.sh
+
+      - uses: docker/setup-buildx-action@v3
+        if: steps.flag.outputs.built == 'true'
+
+      - name: Build the image once and save it
+        if: steps.flag.outputs.built == 'true'
+        run: |
+          docker build --build-arg DASHBOARD_REF="$(cat dashboard.ref)" -t karakos-gate:ci .
+          docker save -o karakos-image.tar karakos-gate:ci
+
+      - uses: actions/upload-artifact@v4
+        if: steps.flag.outputs.built == 'true'
+        with:
+          name: karakos-image
+          path: karakos-image.tar
+          retention-days: 1
+          compression-level: 0
+
+  fresh-install-smoke:
+    needs: build-image
+    if: needs.build-image.outputs.built == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || '' }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install test dependencies
+        run: pip install pytest -r requirements.txt
+      - uses: actions/download-artifact@v4
+        with:
+          name: karakos-image
+      - name: Fresh-install smoke
+        env:
+          KARAKOS_REQUIRE_DOCKER: "1"
+          KARAKOS_SMOKE_IMAGE_TAR: ${{ github.workspace }}/karakos-image.tar
+          KARAKOS_SMOKE_ARTIFACTS: ${{ runner.temp }}/smoke-artifacts
+        run: python3 -m pytest tests/test_fresh_install_smoke.py -q -m "slow and docker"
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: fresh-install-logs
+          path: ${{ runner.temp }}/smoke-artifacts
+          if-no-files-found: ignore
+
+  upgrade-smoke:
+    needs: build-image
+    if: needs.build-image.outputs.built == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        tag: [v1.0.0, v1.1.1, v1.3, v1.5.0]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || '' }}
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install test dependencies
+        run: pip install pytest -r requirements.txt
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: karakos-image
+      - name: Upgrade smoke (${{ matrix.tag }})
+        env:
+          KARAKOS_REQUIRE_DOCKER: "1"
+          KARAKOS_SMOKE_IMAGE_TAR: ${{ github.workspace }}/karakos-image.tar
+          KARAKOS_SMOKE_ARTIFACTS: ${{ runner.temp }}/smoke-artifacts
+        run: python3 -m pytest tests/test_upgrade_smoke.py -q -m "slow and docker" -k "${{ matrix.tag }}"
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: upgrade-logs-${{ matrix.tag }}
+          path: ${{ runner.temp }}/smoke-artifacts
+          if-no-files-found: ignore
+
+  real-cli-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      HAS_CLAUDE_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+    steps:
+      - name: Secret present?
+        id: flag
+        run: |
+          if [ "$HAS_CLAUDE_TOKEN" = true ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = pull_request ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::CLAUDE_CODE_OAUTH_TOKEN unavailable (a forked PR, or the secret is not set): skipping the real-CLI smoke"
+          else
+            echo "::error::CLAUDE_CODE_OAUTH_TOKEN is required on a tag, dispatch or schedule; the gate cannot pass without it"
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+        if: steps.flag.outputs.run == 'true'
+        with:
+          ref: ${{ inputs.ref || '' }}
+      - uses: actions/setup-python@v5
+        if: steps.flag.outputs.run == 'true'
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v4
+        if: steps.flag.outputs.run == 'true'
+        with:
+          node-version: 22
+      - name: Install the CLI and test dependencies
+        if: steps.flag.outputs.run == 'true'
+        env:
+          CLI_VERSION: ${{ inputs.cli_version || 'latest' }}
+        run: |
+          npm install -g "@anthropic-ai/claude-code@${CLI_VERSION}"
+          claude --version
+          pip install pytest -r requirements.txt
+      - name: Real-CLI smoke
+        if: steps.flag.outputs.run == 'true'
+        env:
+          KARAKOS_REQUIRE_REAL_CLI: "1"
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: python3 -m pytest tests -q -m "slow and realcli"
