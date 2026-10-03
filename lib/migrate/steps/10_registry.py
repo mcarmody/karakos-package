@@ -42,6 +42,20 @@ def _hooks_sync(workspace):
         raise RuntimeError(str(e))
 
 
+def _plan(ctx):
+    ws = _workspace(ctx)
+    try:
+        old = json.loads((Path(ctx.config_dir) / "agents.json").read_text())
+        doc = _registry().legacy_to_registry_dict(old)
+    except Exception:
+        return []
+    adds = _registry().mcp_env_additions(ws, doc["agents"])
+    if not adds:
+        return ["10_registry: .mcp.json references no env vars; no `env:` entries added"]
+    return ["10_registry: add to env: (names only, as ${NAME} references) from .mcp.json: "
+            + "; ".join(f"{a}: {', '.join(n)}" for a, n in adds.items())]
+
+
 def _apply(ctx):
     ws = _workspace(ctx)
     _registry().migrate_legacy(ws)
@@ -66,7 +80,11 @@ def _verify(ctx):
         if aid not in new:
             raise RuntimeError(f"agent '{aid}' missing after migration")
         for key, val in (entry or {}).items():
-            if key in expressible:
+            if key == "env":       # migration may add .mcp.json references, never change a value
+                got = new[aid].get(key) or {}
+                if any(k not in got or got[k] != v for k, v in (val or {}).items()):
+                    raise RuntimeError(f"agent '{aid}': 'env' changed ({val!r} -> {got!r})")
+            elif key in expressible:
                 if new[aid].get(key) != val:
                     raise RuntimeError(
                         f"agent '{aid}': '{key}' changed ({val!r} -> {new[aid].get(key)!r})")
@@ -74,7 +92,7 @@ def _verify(ctx):
                 raise RuntimeError(f"agent '{aid}': key '{key}' was dropped")
         # prompt flags are added by migration; handoff_on_reset is always the
         # effective boolean (2.6), written whether or not the 1.x entry had it
-        extra = set(new[aid]) - set(entry or {}) - {"prompt", "handoff_on_reset"}
+        extra = set(new[aid]) - set(entry or {}) - {"prompt", "handoff_on_reset", "env"}
         if extra:
             raise RuntimeError(f"agent '{aid}': unexpected keys {sorted(extra)}")
     settings = cfg / "claude-settings.json"
@@ -82,4 +100,4 @@ def _verify(ctx):
         raise RuntimeError("hooks section missing after hooks-sync")
 
 
-STEP = Step("10_registry", 1, 2, detect=_detect, apply=_apply, verify=_verify)
+STEP = Step("10_registry", 1, 2, detect=_detect, apply=_apply, verify=_verify, plan=_plan)

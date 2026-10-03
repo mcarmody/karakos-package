@@ -207,3 +207,61 @@ def test_boot_leaves_unstamped_1x_settings_byte_identical(tmp_path):
     assert settings.read_bytes() == before
     assert not (ws / "config" / "hooks.json").exists()
     assert not (ws / "config" / "agents.yaml").exists()
+
+
+# -- .mcp.json env prefill (names only) ---------------------------------------
+
+MCP_1X = {"mcpServers": {
+    "tools": {"command": "python3", "args": ["mcp/tools-server.py"], "env": {}},
+    "github": {"command": "npx", "args": ["gh-mcp"],
+               "env": {"GITHUB_TOKEN": "${GITHUB_TOKEN}", "LITERAL": "s3cret-literal-value",
+                       "HOMEISH": "${HOME}", "DEF": "${REGION:-us-east-1}"}},
+    "web": {"url": "https://x.example/${SEARCH_HOST}/mcp",
+            "headers": {"Authorization": "Bearer ${SEARCH_KEY}"}},
+}}
+
+
+def test_mcp_json_refs_prefill_env_names_only(tmp_path):
+    ws = make(tmp_path)
+    (ws / ".mcp.json").write_text(json.dumps(MCP_1X))
+    assert migrate(ws)[0] == 0
+    text = (ws / "config" / "agents.yaml").read_text()
+    assert "s3cret-literal-value" not in text            # values are never copied
+    agents = yaml.safe_load(text)["agents"]
+    want = {"GITHUB_TOKEN": "${GITHUB_TOKEN}", "REGION": "${REGION}",
+            "SEARCH_HOST": "${SEARCH_HOST}", "SEARCH_KEY": "${SEARCH_KEY}"}
+    assert agents["boss"]["env"] == {"A": "1", **want}   # existing entry kept, refs added
+    assert agents["builder"]["env"] == want
+    assert "HOME" not in agents["builder"]["env"]        # already supplied by the spawner
+    mon = next(a for a in agents.values() if a["role"] == "monitor")
+    assert "env" not in mon                              # monitor keeps the narrow env
+
+
+def test_existing_env_values_are_never_overwritten(tmp_path):
+    legacy = {"agents": {"boss": {"env": {"GITHUB_TOKEN": "literal-kept"}}}}
+    ws = make(tmp_path, legacy=legacy, channels=None)
+    (ws / ".mcp.json").write_text(json.dumps(MCP_1X))
+    assert migrate(ws)[0] == 0
+    env = yaml.safe_load((ws / "config" / "agents.yaml").read_text())["agents"]["boss"]["env"]
+    assert env["GITHUB_TOKEN"] == "literal-kept" and env["SEARCH_KEY"] == "${SEARCH_KEY}"
+
+
+def test_dry_run_lists_env_additions_and_writes_nothing(tmp_path):
+    ws = make(tmp_path)
+    (ws / ".mcp.json").write_text(json.dumps(MCP_1X))
+    rc, lines = migrate(ws, dry_run=True)
+    assert rc == 0
+    line = next(l for l in lines if "10_registry: add to env" in l)
+    assert "builder: GITHUB_TOKEN, REGION, SEARCH_HOST, SEARCH_KEY" in line
+    assert "s3cret-literal-value" not in "\n".join(lines)
+    assert not (ws / "config" / "agents.yaml").exists()
+
+
+def test_no_mcp_json_or_no_refs_adds_nothing(tmp_path):
+    ws = make(tmp_path)
+    assert migrate(ws)[0] == 0
+    assert "env" not in yaml.safe_load((ws / "config" / "agents.yaml").read_text())["agents"]["builder"]
+    ws2 = make(tmp_path / "b")
+    (ws2 / ".mcp.json").write_text(json.dumps({"mcpServers": {"t": {"command": "x", "env": {}}}}))
+    assert migrate(ws2)[0] == 0
+    assert "env" not in yaml.safe_load((ws2 / "config" / "agents.yaml").read_text())["agents"]["builder"]
