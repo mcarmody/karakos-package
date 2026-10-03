@@ -86,6 +86,12 @@ if docker pull "$OLD_IMAGE" >/dev/null 2>&1; then
 else
   echo "no published image for $TAG: building it from that tag's own Dockerfile (slower)"
   git -C "$REPO" archive "$TAG" | tar -x -C "$OLD"
+  # v1.0.0 and v1.1.1 shipped no dashboard/package-lock.json, so their own `npm ci` cannot run.
+  # Build them with `npm install` instead (same package.json; dependency versions float).
+  if [ ! -f "$OLD/dashboard/package-lock.json" ]; then
+    echo "$TAG has no dashboard/package-lock.json: its Dockerfile's npm ci cannot build; using npm install"
+    sed -i 's/^RUN npm ci$/RUN npm install/' "$OLD/Dockerfile"
+  fi
   docker build -t "$OLD_IMAGE" "$OLD"
   OLD_BUILT=1
   rm -rf "${OLD:?}"/* "$OLD"/.[!.]* 2>/dev/null || true
@@ -192,7 +198,9 @@ smoke_wait "old stack answering /health" 180 api_healthy
 for i in 1 2 3; do post_message main "seed turn $i"; wait_done "$i"; done
 post_message helper "seed helper turn"; wait_done 4
 post_message main "HOLD this turn"          # the scripted hang
-smoke_wait "held row in progress" 60 bash -c "[ \"\$(curl -fsS -H '$AUTH' '$BASE/agents/main/queue' | grep -c processing)\" -ge 1 ]"
+# /agents/<name>/queue exists only from 1.5; the db is the same on every tag (processed=1: in progress).
+held_in_progress() { [ "$(dbq "select count(*) from message_queue where content like 'HOLD%' and processed=1")" -ge 1 ]; }
+smoke_wait "held row in progress" 60 held_in_progress
 post_message main "queued behind the hold"
 # Dashboard login on the old image: its session cookie must survive the upgrade.
 HDRS="$SMOKE_WORK/old-login.hdrs"
@@ -246,7 +254,7 @@ EXTRA_PROJECTS+=("$REFUSE_PROJECT")
 cp -a "$OLD" "$SMOKE_WORK/refuse"
 REFUSE_VOL="${REFUSE_PROJECT}_karakos-data"
 docker volume create --label "com.docker.compose.project=$REFUSE_PROJECT" --label com.docker.compose.volume=karakos-data "$REFUSE_VOL" >/dev/null
-docker run --rm -v "$DATA_VOL:/from:ro" -v "$REFUSE_VOL:/to" --entrypoint sh "$NEW_IMAGE" -c 'cp -a /from/. /to/'
+docker run --rm -v "$DATA_VOL:/from:ro" -v "$REFUSE_VOL:/to" --user 0 --entrypoint sh "$NEW_IMAGE" -c 'cp -a /from/. /to/'
 
 # ---- dry run -------------------------------------------------------------------
 step "dry run (documented command), writes a report, changes nothing"

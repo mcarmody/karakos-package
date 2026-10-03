@@ -102,9 +102,12 @@ ENV KARAKOS_REGISTRY_PATH=/workspace/config/agents.yaml \
     WORKSPACE_ROOT=/workspace
 
 # Create data directories owned by karakos so volume mounts get the right
-# ownership when first created.
+# ownership when first created. data/ gets NO subdirectories here: Docker copies
+# an image directory's contents into a new named volume, and a non-empty data/
+# looks like an unstamped 1.x install to the schema guard (exit 78 loop). The
+# entrypoint creates data/messages, memory and health after the stamp check.
 RUN install -d -o karakos -g karakos \
-        data data/messages data/memory data/health \
+        data \
         logs logs/agent-streams logs/session-summaries \
         inbox
 
