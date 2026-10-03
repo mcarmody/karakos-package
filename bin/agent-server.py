@@ -1955,8 +1955,15 @@ async def post_to_discord(agent: str, channel_id: str, content: str,
                 _outbox_notify()
                 if not claimed:
                     return None
-                row = outbox_lib.get(conn, rid)
-                return await outbox_send_row(row) if row else None
+                # No direct fallback from here: some chunks may already be out.
+                # A store error leaves the row `sending`; recover_sending
+                # re-sends it at boot with the same nonces.
+                try:
+                    row = outbox_lib.get(conn, rid)
+                    return await outbox_send_row(row) if row else None
+                except Exception as e:
+                    _outbox_broken("inline send", e)
+                    return None
 
     return await _post_direct(agent, token, channel_id, rendered, reply_to)
 
@@ -2515,8 +2522,9 @@ async def crash_recovery():
                     matched = outbox_lib.find_for_reply(
                         conn, poster, msg["channel_id"], sha, processed)
                     if matched is None:
-                        # A row this sweep enqueued on an earlier boot is
-                        # dated by that boot, not by the turn.
+                        # A row this sweep enqueued on an earlier boot is dated
+                        # by that boot, not by the turn. Only catches a restart
+                        # within the 120 s window (a crash loop).
                         matched = outbox_lib.find_for_reply(
                             conn, poster, msg["channel_id"], sha, _outbox_now())
                 except Exception as e:
@@ -2726,7 +2734,11 @@ async def handle_outbox_discard(request):
 
 
 async def handle_health(request):
-    """GET /health - Health check"""
+    """GET /health - Health check.
+
+    `dead_letters` is the number of `dead` outbox rows. `dead_letter_path` is
+    DEPRECATED: it now names the outbox file; read `outbox` instead.
+    """
     # Check bearer token
     auth_header = request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer ") or auth_header[7:] != AGENT_SERVER_TOKEN:

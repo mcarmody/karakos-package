@@ -360,6 +360,19 @@ def test_reply_reference_only_on_first_chunk_and_flags(ags):
 # Inline versus loop, ordering, restart
 # ---------------------------------------------------------------------------
 
+def test_a_store_error_during_the_inline_send_never_reaches_the_turn(ags, monkeypatch, skip_log):
+    def boom(*a, **k):
+        raise ob.sqlite3.OperationalError("database is locked")
+    monkeypatch.setattr(ob, "record_chunk", boom)
+    result, fake = post(ags, [200], content="reply")
+    assert result is None and fake.calls == 1                 # no exception into finish_turn
+    assert rows(ags)[0]["status"] == "sending"               # recovered at the next boot
+    assert any("outbox unavailable" in m for _, m in skip_log)
+    monkeypatch.undo()
+    ags._outbox_conn = None
+    assert asyncio.run(self_recover(ags)) == 1
+
+
 def test_loop_pass_during_an_inline_send_does_not_double_send(ags):
     async def go():
         fake = FakeDiscord()
