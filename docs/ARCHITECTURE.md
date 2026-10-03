@@ -791,12 +791,11 @@ Each is a real limit of the code, not a configuration mistake.
   A scoped credential is post-2.0.
 - **No host-side watchdog for a dead scheduler.** The container health check and
   supervisord's restart are what exist.
-- **The migrator does not fill `env:` from `.mcp.json`**, the 2.0 compose template
-  still mounts `.karakos`, and `logs/` and `inbox/` are not in the backup
-  ([UPGRADING.md](UPGRADING.md#the-real-run)).
-- **Remote build kill is guarded by pid file and exit file, not process start
-  time**, so a recycled process group could in theory be signalled after the
-  runner died without writing its exit file.
+- **The migrator fills `env:` only from `${NAME}` references in `.mcp.json`**
+  (not from skill or hook scripts), and `logs/` and `inbox/` are not in the
+  backup ([UPGRADING.md](UPGRADING.md#the-real-run)). The 2.0 compose template
+  keeps the `.karakos` mount because the owner and system name are still read
+  from `.karakos/config.json`.
 
 ## Where each 2.0 feature lives
 

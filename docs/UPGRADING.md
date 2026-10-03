@@ -180,8 +180,9 @@ before it changes anything, and that is the one to rely on (it writes to
 - It covers `data/`, `config/` (including `.env`) and `agents/`, with a hashed
   `MANIFEST.json`; SQLite files are copied with the online backup API, so they
   are consistent.
-- It does **not** cover the `logs/` and `inbox/` volumes. Copy those yourself
-  if you want them:
+- It does **not** cover the `logs/` and `inbox/` volumes, and the dry run and
+  the real run say so. No migration step changes them (the old copies stay where
+  they are), and `logs/` can be large. Copy them yourself if you want them:
 
 ```bash
 docker compose -f config/docker-compose.yml --env-file config/.env \
@@ -205,11 +206,10 @@ source:
 - `make pull` and `make up` read `config/.env`. **Set the pin there to the 2.0
   tag (or remove it) before `make pull`**, or you will start the old image on
   migrated data.
-- `bin/karakos` reads your **shell** environment, not `config/.env`. Export the
-  same value in the shell you run it from (`export KARAKOS_VERSION=v2.0`).
-  Unset, the wrapper falls back to a built-in default of `2.0.0`, which is not a
-  tag the release workflow publishes (see the PR's code follow-ups); do not rely
-  on it.
+- `bin/karakos` reads your **shell** environment first, then the
+  `KARAKOS_VERSION` line in `config/.env` (next to the compose file), then falls
+  back to `v2.0`, a tag the release workflow publishes. Export it
+  (`export KARAKOS_VERSION=v2.0`) to be explicit.
 
 ```bash
 git pull origin main
@@ -287,12 +287,16 @@ final integrity check (`90_stamp`).
 
 What the migrator does not do:
 
-- **It does not fill each agent's `env:` from its `.mcp.json`.** The dry run
-  lists the variables to consider; adding them is manual
+- **It only adds `.mcp.json` references to `env:`.** Variables the workspace's
+  `.mcp.json` names as `${NAME}` are added to each non-monitor agent's `env:` as
+  `NAME: ${NAME}` (names only, never values; existing entries are untouched; the
+  dry run lists them). Variables read by skill scripts or hooks are still manual
   ([procedure below](#the-env-allowlist-and-registry-env)).
-- **The new compose file still mounts `.karakos`.** The 2.0 compose template
-  bind-mounts `../.karakos` into the container, as 1.x did.
-- **`logs/` and `inbox/` are not in the backup** ([Back up](#back-up)).
+- **The new compose file still mounts `.karakos`**, on purpose: the owner and
+  system name in `.karakos/config.json` are still read (prompt composition and
+  the `workspace` MCP tool).
+- **`logs/` and `inbox/` are not in the backup** ([Back up](#back-up)); the dry
+  run says so.
 - **Fixtures cover no-Docker mode.** The wrapper was tested against a stand-in
   for `docker`; a run against a real daemon on real hosts is part of the
   release's host testing, so keep the backup and read the first run's output.
@@ -362,8 +366,9 @@ agents:
 
 **To find what an agent needs**, open the agent's `.mcp.json` (and the scripts
 of its skills and hooks) and note each variable they read; add one line per
-variable. This is manual: the migrator's registry step does not pre-populate
-`env:` from `.mcp.json`. Then reload the agent (`/reload`); a changed `env:`
+variable. The migrator's registry step already adds the `${NAME}` references it
+finds in `.mcp.json` (names only); you add what skill and hook scripts read.
+Then reload the agent (`/reload`); a changed `env:`
 applies at the next spawn.
 
 `KARAKOS_ENV_PASSTHROUGH=1` restores the old inherit-everything behaviour for

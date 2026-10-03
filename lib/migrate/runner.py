@@ -149,6 +149,17 @@ def _recover_interrupted(root: Path, data_dir: Path, config_dir: Path, out) -> b
     return True
 
 
+# logs/ and inbox/ are deliberately outside the backup. No step writes to them:
+# 05_layout only copies missing files from the old checkout into the new volumes
+# (the original stays put, read-only or bind-kept), and nothing rewrites or
+# deletes a log or an inbox file. The backup exists to undo what the migrator
+# changes. logs/ is unbounded (stream logs, archives) and a restore prunes
+# anything the manifest does not list, so adding them would cost size and make a
+# restore able to delete live files.
+NOT_BACKED_UP = ("logs/ and inbox/ are not in the backup: no migration step "
+                 "changes them (the old copies stay where they are)")
+
+
 def run(data_dir, config_dir, backup_root=None, steps=None, dry_run=False,
         force=False, parity_queries=50, out=print, import_from=None,
         keep_bind=None, report_to=None) -> int:
@@ -201,6 +212,7 @@ def run(data_dir, config_dir, backup_root=None, steps=None, dry_run=False,
                     out(line)
         for line in unreferenced_env_report(config_dir):
             out(line)
+        out(NOT_BACKED_UP)
         out("memory has no downgrade: the backup is the only way back "
             "(karakos migrate --restore <backup-dir>)")
         if left_behind and not force:
@@ -219,7 +231,7 @@ def run(data_dir, config_dir, backup_root=None, steps=None, dry_run=False,
     except backup_mod.BackupError as e:
         out(f"{e}; nothing was changed")
         return EXIT_STEP_FAILED
-    out(f"backup: {ctx.backup_dir}")
+    out(f"backup: {ctx.backup_dir} ({NOT_BACKED_UP})")
     # written right after the backup: a killed process runs no handler, so the
     # next start finds this and restores before doing anything else
     (root / MARKER).write_text(str(ctx.backup_dir))

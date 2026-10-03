@@ -446,8 +446,7 @@ def test_smoke_blocks_take_ports_and_tokens_from_env():
 
 def test_smoke_lines_are_in_the_smoke_script():
     script = ROOT / "tests/smoke/fresh_install.sh"
-    if not script.exists():
-        pytest.skip("tests/smoke/fresh_install.sh arrives with 7.3a, which removes this skip")
+    assert script.exists(), "tests/smoke/fresh_install.sh is the smoke script the docs name"
     body = script.read_text()
     missing = [l for l in _smoke_lines() if l not in body]
     assert not missing, missing

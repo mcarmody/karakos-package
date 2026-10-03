@@ -121,6 +121,13 @@ def kill_local_group(run_ref, signal_fn=os.killpg, snapshot_fn=procreap.snapshot
 # --- remote ------------------------------------------------------------------
 
 REMOTE_KILL = r'''
+pstart() {  # process start time: /proc starttime (ticks), else ps lstart; empty when gone
+    if [ -r "/proc/$1/stat" ]; then
+        sed 's/^.*) //' "/proc/$1/stat" 2>/dev/null | cut -d' ' -f20
+    else
+        ps -o lstart= -p "$1" 2>/dev/null | tr -s ' ' | sed 's/^ //'
+    fi
+}
 D="$1"; GRACE="$2"
 D="${D/#\~/$HOME}"
 [ -f "$D/exit" ] && { echo gone; exit 0; }
@@ -131,6 +138,15 @@ case "$PID" in ''|*[!0-9]*) echo failed; exit 0;; esac
 [ "$PG" -gt 1 ] && [ "$PG" = "$PID" ] || { echo failed; exit 0; }
 MYPG=$(ps -o pgid= -p $$ | tr -d ' ')
 [ "$PG" = "$MYPG" ] && { echo failed; exit 0; }
+# run.pid line 3 is the leader's start time. A leader that is alive with another
+# start time is a recycled pid: not ours, never signalled. A missing line (a run
+# from before this check) cannot be verified, so it is refused too. A dead leader
+# with a live group is still ours: the kernel does not reuse a pgid while the
+# group has members.
+START=$(sed -n 3p "$D/run.pid")
+[ -n "$START" ] || { echo failed; exit 0; }
+CUR=$(pstart "$PID")
+if [ -n "$CUR" ] && [ "$CUR" != "$START" ]; then echo gone; exit 0; fi
 kill -0 -- "-$PG" 2>/dev/null || { echo gone; exit 0; }
 kill -TERM -- "-$PG" 2>/dev/null || { echo failed; exit 0; }
 i=0; n=$(( GRACE * 10 ))

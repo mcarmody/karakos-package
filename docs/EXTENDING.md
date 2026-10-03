@@ -180,13 +180,34 @@ global. Tests must not read `HOME`, bind real ports or touch Discord;
 `tests/test_no_home_access.py` enforces this. The `Harness` signatures are
 frozen by `tests/test_harness_api.py`.
 
-**Known load flakes.** Under full-suite load a few harness tests have timed out
-and then passed alone or on rerun: `test_depth_cap_two_for_calls` and
-`test_two_shards_calling_each_other_is_refused_at_once` (hive timeouts, in
-`tests/test_hive_harness.py`) and `test_no_boundary_runs_as_next_turn` (a
-`wait_for` in `tests/test_steering_harness.py`). They are timing sensitivity, not
-logic failures: rerun the test alone before treating one as a regression, and
-give a new harness wait a generous timeout.
+**Load timeouts.** `test_depth_cap_two_for_calls` and
+`test_two_shards_calling_each_other_is_refused_at_once` timed out under
+full-suite load because a reply could land between the caller's long-poll checks and
+its wait and be missed (fixed: `msgqueue.work_version`, with a regression test in
+`tests/test_hive_harness.py` that holds the gap open). `test_no_boundary_runs_as_next_turn`
+raced two results 5 ms apart against a 20 ms poll (fixed with a step delay).
+If a harness test times out under load, look for a missed wake-up or a race
+before raising a wait; raise one only when the work is shown to be slow.
+
+**Markers and the release tests.** `slow` marks everything that needs more than
+the unit job has. Docker tests carry `slow` and `docker`; tests that call the
+real `claude` carry `slow` and `realcli`. The unit job runs `-m "not slow"`; the
+real-CLI gate is `-m "slow and realcli"` (plain `-m slow` would also pull in the
+Docker tests). Both groups skip locally with a stated reason when `docker`, the
+`claude` binary or a credential (`CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY`)
+is missing, and **fail** instead when `KARAKOS_REQUIRE_DOCKER=1` or
+`KARAKOS_REQUIRE_REAL_CLI=1` is set: that is how a gate job cannot pass by
+testing nothing. Real-CLI tests use haiku, pass `--max-budget-usd 0.25` per call
+and stop the session past `KARAKOS_REALCLI_BUDGET_USD` (default `0.50`); they run
+with a temporary `HOME` and `CLAUDE_CONFIG_DIR`. `Harness(..., claude="real")`
+runs the server against the real CLI on `PATH` and passes the credential through
+each agent's `env:`. The smoke scripts run on their own: `tests/smoke/fresh_install.sh`
+and `tests/smoke/upgrade.sh <tag>` (`v1.0.0`, `v1.1.1`, `v1.3`, `v1.5.0`) need a
+Docker daemon, work in a temp directory with a temp `HOME`, and refuse to run
+unless the compose project is named `karakos-smoke-*` or `karakos-up-*`. Set
+`KARAKOS_SMOKE_IMAGE_TAR` to a `docker save` file to skip the image build, and
+`KARAKOS_SMOKE_ARTIFACTS` to a directory to keep logs from a failed run. CI runs
+them from `.github/workflows/release-gate.yml`.
 
 ## Using the Builder Agent
 

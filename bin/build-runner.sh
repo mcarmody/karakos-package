@@ -7,7 +7,9 @@
 # Args: KIND ID REPO TARGET_BRANCH MODEL TIMEOUT_S COST_USD DIR BRANCH_PREFIX REPO_URL WORKDIR
 #   DIR holds brief.md and system.md (written by the dispatcher by content).
 # Contract:
-#   * DIR/run.pid (pid, then pgid, one per line) exists BEFORE claude starts.
+#   * DIR/run.pid (pid, pgid, then the process start time, one per line) exists
+#     BEFORE claude starts. The kill script compares the start time before it
+#     signals, so a recycled pid is never signalled.
 #   * claude runs in its own process group under `timeout <TIMEOUT_S - 60>`.
 #   * A pre-push hook refuses any ref but refs/heads/<prefix>*, the target
 #     branch itself, deletions and non-fast-forward pushes.
@@ -121,6 +123,13 @@ SYSTEM=$(cat "$DIR/system.md")
 T=$(( TIMEOUT_S - 60 )); (( T < 1 )) && T=1
 
 # --- signals ---------------------------------------------------------------
+pstart() {  # process start time: /proc starttime (ticks), else ps lstart; empty when gone
+    if [ -r "/proc/$1/stat" ]; then
+        sed 's/^.*) //' "/proc/$1/stat" 2>/dev/null | cut -d' ' -f20
+    else
+        ps -o lstart= -p "$1" 2>/dev/null | tr -s ' ' | sed 's/^ //'
+    fi
+}
 stop_group() {  # TERM the claude group, only when it is provably ours
     if [[ "$CPID" =~ ^[0-9]+$ ]] && (( CPID > 1 )) && kill -0 "$CPID" 2>/dev/null; then
         kill -TERM -- "-$CPID" 2>/dev/null || true
@@ -153,7 +162,12 @@ if [[ "$CPG" != "$CPID" || "$CPG" == "$MYPG" ]]; then
     kill -KILL "$CPID" 2>/dev/null
     fail 4 "claude did not get its own process group"
 fi
-printf '%s\n%s\n' "$CPID" "$CPG" > "$DIR/run.pid"
+CSTART=$(pstart "$CPID")
+if [[ -z "$CSTART" ]]; then
+    kill -KILL "$CPID" 2>/dev/null
+    fail 4 "could not read the start time of claude"
+fi
+printf '%s\n%s\n%s\n' "$CPID" "$CPG" "$CSTART" > "$DIR/run.pid"
 : > "$DIR/go"
 tail -n +1 -s 0.1 -f --pid="$CPID" "$DIR/stream.jsonl" 2>/dev/null &
 TPID=$!

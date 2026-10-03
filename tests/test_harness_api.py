@@ -34,6 +34,7 @@ def test_constructor():
     assert dict(params("__init__"))["shards"] is None
     assert dict(params("__init__"))["work_stealing"] is None  # 2.4
     assert dict(params("__init__"))["steering"] is None  # 2.5
+    assert dict(params("__init__"))["claude"] == "fake"  # 7.3a
 
 
 def test_send():

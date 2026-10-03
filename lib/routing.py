@@ -8,24 +8,11 @@ from dataclasses import dataclass
 from typing import Optional
 
 
-@dataclass(frozen=True, eq=False)
+@dataclass(frozen=True)
 class Route:
     shard: str
     agent: str
     reason: str  # "mention" | "channel" | "primary_fallback"
-
-    # A Route compares equal to its agent id string, so a caller that only
-    # cares about the agent (and the 1.x-era relay tests) keep working.
-    def __eq__(self, other):
-        if isinstance(other, Route):
-            return (self.shard, self.agent, self.reason) == (
-                other.shard, other.agent, other.reason)
-        if isinstance(other, str):
-            return self.agent == other
-        return NotImplemented
-
-    def __hash__(self):
-        return hash((self.shard, self.agent, self.reason))
 
 
 def route_message(registry, channel_name, mentioned_agent, is_bot,
