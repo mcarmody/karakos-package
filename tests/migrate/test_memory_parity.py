@@ -52,7 +52,10 @@ def test_corrupted_importance_fails_gate_a_and_cuts_nothing(tmp_path, fake_embed
     sp = mem.staging_file(ctx)
     # fidelity would catch this first, so run the parity gate on its own
     con = sqlite3.connect(sp)
-    con.execute("UPDATE observations SET importance = 10 - importance WHERE kind='episode'")
+    # one row: the highest-importance embedded episode, the one that tops rankings
+    top = con.execute("SELECT id FROM observations WHERE kind='episode' AND embedding "
+                      "IS NOT NULL ORDER BY importance DESC LIMIT 1").fetchone()[0]
+    con.execute("UPDATE observations SET importance = 0.0 WHERE id = ?", (top,))
     con.commit()
     con.close()
     with pytest.raises(mem.MemoryMigrationError, match="Gate A"):
@@ -61,6 +64,19 @@ def test_corrupted_importance_fails_gate_a_and_cuts_nothing(tmp_path, fake_embed
         STEP.verify(ctx)                 # the full verify refuses too
     assert not (tmp_path / "data/memory/graph.db").exists()
     assert mdb.read_bytes() == before and not sp.exists()
+
+
+def test_hash_mismatch_with_both_files_fails_loudly(tmp_path, fake_embedder):
+    install(tmp_path)
+    assert migrate(tmp_path)[0] == 0
+    # a different memory.db reappears next to the migrated graph
+    fx.make_memory_db(tmp_path / "data/memory/memory.db", seed=1)
+    ctx = make_ctx(tmp_path, with_backup=False)
+    assert STEP.detect(ctx) is True
+    STEP.apply(ctx)
+    with pytest.raises(mem.MemoryMigrationError, match="does not match"):
+        STEP.verify(ctx)
+    assert (tmp_path / "data/memory/memory.db").exists()
 
 
 def test_gate_b_differences_logged_not_failing(tmp_path, fake_embedder):
