@@ -735,6 +735,7 @@ data/                                  # named volume
 ├── taskboard.json
 ├── outbox/outbox.db                   # durable Discord replies: retry + audit (6.1)
 ├── build-queue.db                     # build queue (when enabled)
+├── discord-dead-letter.jsonl.migrated # 1.x dead letters, imported into the outbox and kept
 ├── operator-pause.json                # /pause holds, keyed by shard id
 ├── runtime-overrides.json             # /effort overrides, keyed by agent id
 ├── migration-reports/                 # migration-report.md from the migrator
@@ -744,6 +745,7 @@ data/                                  # named volume
 logs/                                  # named volume
 ├── agent-server.log  relay.log  scheduler.log  supervisord.log
 ├── health-alerts.log
+├── blocked-bash.jsonl                 # commands the bash safety hooks denied
 ├── summarizer-audit.jsonl  git-events.jsonl  hook-events.log
 ├── agent-streams/<agent>_<ts>.jsonl   # raw stream-json, fed to the summarizer
 └── session-summaries/<agent>-<ts>.md

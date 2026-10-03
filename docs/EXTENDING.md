@@ -788,7 +788,7 @@ These are the seams that stay yours across image upgrades:
 | `config/channels.json` | Keys you add (`route`, `ux`, `reply_gate`, ...) are read when present and ignored when not |
 | `config/monitor.yaml`, `config/governor.yaml`, `config/build-queue.yaml` | Optional files with built-in defaults when absent; the migrator creates `build-queue.yaml` only when it is missing and never overwrites it |
 
-The [stability contract](#releasev20-stability-contract) says what else is stable.
+The [stability contract](#release20-stability-contract) says what else is stable.
 
 **Queue database reads.** `data/memory/agent-server.db` is in rollback-journal
 mode, so a read cursor left open across an `await` blocks every writer. In code

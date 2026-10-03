@@ -32,6 +32,19 @@ changes there, then bump the pin here in a one-line PR (both files). The source
 is private and is never committed: see "Dashboard build" in `docs/EXTENDING.md`
 for how to get a build without access.
 
+**Repository secret `DASHBOARD_FETCH_TOKEN`** (maintainers): a read-only token on
+`karakos-dashboard` that CI uses to fetch the pinned source. The docker-smoke job
+and the release job need it; without it docker-smoke is **skipped**, not failed,
+so a green run without the secret has not built the image.
+`dashboard.bundle.sha256` is empty on purpose: the Next.js output is not
+byte-reproducible, so a bundle is verified against its own `.sha256`.
+
+**Tests.** `tests/test_docs.py` checks that the docs match the code: links and
+anchors, backticked paths, environment variables, registry keys, routes, MCP
+tools, the migrator's `--help` flags, shell blocks, and the coupling denylist.
+Change a flag or route and it tells you which doc to update. A few harness tests
+time out under full-suite load and pass alone ([EXTENDING.md](docs/EXTENDING.md#writing-a-harness-test)).
+
 ## Making a change
 
 1. Fork the repo and branch from `main`.

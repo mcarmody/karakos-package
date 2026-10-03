@@ -33,7 +33,7 @@ so a bare `docker compose` run from your checkout will not find it. Every
 command here uses the `make` targets, which pass the right flags for you. The
 long form, if you prefer typing it, is:
 
-```bash
+```text
 docker compose -f config/docker-compose.yml --env-file config/.env <command>
 ```
 
@@ -86,7 +86,7 @@ tables exist, not in what the migrator does to your data.
 |---|---|---|
 | Layout | Compose could bind-mount the whole checkout (1.0 to 1.2) | `config/`, `agents/` and `.karakos/` are bind-mounted; `data/`, `logs/` and `inbox/` are named volumes. The migrator rewrites `config/docker-compose.yml` and keeps the original as `docker-compose.yml.pre-2.0` |
 | Config | `config/agents.json` | `config/agents.yaml`, the registry: roles, shards, `prompt:`, `env:`, `effort`, budgets. `agents.json` is left in place |
-| Memory | `memory.db` (episodes and facts) | One knowledge graph, `data/memory/graph.db`. `memory.db` is renamed `memory.db.migrated` and kept |
+| Memory | `memory.db` (the 1.x SQLite store) | One knowledge graph, `data/memory/graph.db`. `memory.db` is renamed `memory.db.migrated` and kept |
 | Auth and env | The dashboard read the agent server's whole environment | Subprocesses get an allowlist plus the agent's `env:`; the dashboard cookie settings changed ([Auth and env changes](#auth-and-env-changes)) |
 | Outbox | A dead-letter file for failed Discord replies | `data/outbox/outbox.db`: retries with backoff, an audit trail, operator verbs |
 | Prompts | `system_prompt:` per agent | The same prompt keeps working; the 2.0 core, house style and templates are opt-in ([What else changed quietly](#what-else-changed-quietly)) |
@@ -413,10 +413,10 @@ Restore from the migrator's backup. Memory has no downgrade, so this is the only
 way back.
 
 ```bash
-bin/karakos migrate --restore backups/pre-2.0-<timestamp>
+bin/karakos migrate --restore backups/pre-2.0-20261003T120000000000Z
 ```
 
-The migrator prints this exact command (with the real path) after every run.
+The migrator prints this exact command (with the real path of your backup) after every run.
 The wrapper stops the stack, verifies the backup's manifest, and puts `data/`,
 `config/` and `agents/` back; inside the container the same step is
 `python3 -m lib.migrate --to-backup DIR`. Then roll the **image** back, which is
