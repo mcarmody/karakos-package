@@ -60,8 +60,9 @@ H = 3600
 BUILTIN = [
     Job("heartbeat-primary", "job", Every(1800, 0), "scheduler:heartbeat-primary", 5400),
     Job("heartbeat-monitor", "job", Every(1800, 900), "scheduler:heartbeat-monitor", 5400),
-    Job("memory-maintenance", "job", Daily("03:00"), "scheduler:run_memory_maintenance",
-        48 * H, health_file="memory-maintenance.json"),
+    Job("memory-consolidate", "job", Daily("03:00"),
+        "monitor_jobs.memory_consolidate:run_scheduled", 48 * H,
+        health_file="memory-consolidate.json"),
     Job("health-sweep", "job", Daily("04:00"), "scheduler:run_health_monitor", 48 * H),
     Job("wedge-check", "job", Every(60), "scheduler:run_wedge_check", 300),
     Job("cli-watchdog", "job", Every(3600), "scheduler:run_cli_upgrade_watchdog", 2 * H),

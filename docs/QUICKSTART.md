@@ -151,7 +151,7 @@ Four supervised processes in the one container:
 |---|---|
 | `bin/agent-server.py` | The core: Claude subprocesses, message queue, cost guard, HTTP API on :18791 |
 | `bin/relay.py` | The Discord gateway — carries messages in and replies out |
-| `bin/scheduler.py` | Heartbeats, health sweeps, memory maintenance, agent-scheduled one-offs |
+| `bin/scheduler.py` | Heartbeats, health sweeps, memory consolidation, agent-scheduled one-offs |
 | `dashboard` | The Next.js web interface on :3000 |
 
 Plus the MCP tool server, which the Claude CLI starts as its own child.

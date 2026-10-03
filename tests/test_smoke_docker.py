@@ -92,7 +92,6 @@ class TestFileStructure:
         "bin/entrypoint.sh",
         "bin/capture.py",
         "bin/health-monitor.py",
-        "bin/memory-maintenance.py",
         "bin/purge-data.py",
         "bin/summarize-session.py",
         "bin/poke.sh",
