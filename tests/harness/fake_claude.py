@@ -27,6 +27,13 @@ until the tool answers. Results are available to `text` as {{mcp:0}} (the raw
 tool result text) and {{mcp:0.answer}} (a field of its JSON). Rules may match
 on `agent` and/or `shard` (regexes on KARAKOS_SHARD, else KARAKOS_AGENT).
 
+Step 2.6 keys (default, non-queued mode): `write_file_from_prompt: "<text>"`
+emits a `Write` tool_use for the path found in the user text (the handoff
+prompt carries it alone on a line) and writes that file itself, creating its
+directory; `compact: true` emits a `system` `compact_boundary` event
+(`pre_tokens`/`post_tokens` from the step's `pre_tokens`/`post_tokens`) before
+the closing result, as `/compact` would.
+
 Queued-stdin mode (step 0.3b) -- on only with `--replay-user-messages` or
 FAKE_CLAUDE_QUEUED=1; otherwise the fake behaves exactly as above. It replays
 the behaviour recorded from the real CLI (tests/harness/fixtures/real-cli):
@@ -601,6 +608,23 @@ def main():
 
         usage = step.get("usage") or DEFAULT_USAGE
         mcp_out = run_mcp(step.get("mcp") or [], sid, n_msg, emit)
+        if step.get("write_file_from_prompt") is not None:
+            m = re.search(r"^(/\S+\.md)$", text, re.M)
+            if m:
+                emit({"type": "assistant", "session_id": sid, "parent_tool_use_id": None,
+                      "message": {"id": f"msg_{sid[:8]}_{n_msg}_w", "role": "assistant",
+                                  "content": [{"type": "tool_use", "id": f"toolu_w_{n_msg}",
+                                               "name": "Write",
+                                               "input": {"file_path": m.group(1),
+                                                         "content": step["write_file_from_prompt"]}}],
+                                  "usage": usage}})
+                os.makedirs(os.path.dirname(m.group(1)), exist_ok=True)
+                with open(m.group(1), "w") as fh:
+                    fh.write(step["write_file_from_prompt"])
+        if step.get("compact"):
+            emit({"type": "system", "subtype": "compact_boundary", "session_id": sid,
+                  "pre_tokens": step.get("pre_tokens", 60000),
+                  "post_tokens": step.get("post_tokens", 5000)})
         reply = render(step.get("text", "ok"), text, {"mcp": mcp_out})
         ptu = step.get("parent_tool_use_id")
         emit({"type": "assistant", "session_id": sid, "parent_tool_use_id": ptu,

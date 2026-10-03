@@ -407,8 +407,9 @@ crash recovery, then spawns one subprocess per agent. Each gets:
 `agents/<agent>/SYSTEM_PROMPT.md`, every file in `agents/<agent>/persona/`
 concatenated, and — if the persona directory is empty —
 `agents/<agent>/onboarding.md`, so a brand-new agent interviews you instead of
-starting blank. If `data/last-session-summary-<agent>.md` exists and is under
-24 hours old, it is prepended as `[SESSION RESET]`.
+starting blank. A fresh session also gets the shard's handoff note
+(`data/handoff/<shard>.md`) if one was written for it, once, at the top of the
+appended prompt.
 
 **Stopping a turn, and starting over.** These four are different and are
 routinely confused:
@@ -424,24 +425,34 @@ routinely confused:
 end an in-flight turn is to kill the process to force EOF. The agent is
 flagged so the partial text is thrown away rather than posted.
 
-**Shutdown, and the summary that carries context forward.** As it reads each
-agent's stream, `read_agent_response` tees every raw stream-json line to
+**Context budget, handoff note, and shutdown.** As it reads each agent's
+stream, `read_agent_response` tees every raw stream-json line to
 `logs/agent-streams/{agent}_<timestamp>.jsonl` — unbuffered, so a separate
 process can tail it while the agent still holds the handle, and fail-safe, so
 a write error can never break a turn. The file rolls per boot, per day, and at
 16 MB; `bin/purge-data.py` drops them after `STREAM_LOG_RETENTION_DAYS`
 (default 7).
 
-`SIGTERM` triggers `graceful_shutdown()`, which runs `bin/summarize-session.py`
-per agent with a 25-second budget — which is why `stop_grace_period` is 45
-seconds. The summarizer reads back the last of those stream files (walking up
-to three, so a mid-session roll does not leave it summarizing the final thirty
-seconds), asks Claude for a summary under three required headings, and writes
-`data/last-session-summary-<agent>.md`. That file is what gets re-injected as
-`[SESSION RESET]` on the next start, if it is under 24 hours old.
+A long-lived shard re-reads its whole context on every turn, so each agent can
+set `context_budget_tokens` (at least 20000) in `agents.yaml`. When a shard's
+`sessions.context_tokens` reaches it, the shard is reset at the end of that
+turn: the server inserts one internal turn (channel `handoff`, priority 90,
+never posted) asking the session that holds the context to write
+`data/handoff/<shard>.md`, then restarts the shard on a fresh session and puts
+the note, once, at the top of its `--append-system-prompt`. A failed or slow
+handoff (`HANDOFF_TURN_TIMEOUT_S`) never blocks the reset; a held shard, an
+open account breaker, or a context-overflow error reset without one. Rotated
+notes stay in `data/handoff/` (five kept). `handoff_on_reset` defaults to true
+for `primary` and `custom` agents and false for the rest; set it false to start
+every reset cold. A reload keeps the session, so it leaves the note on disk.
+The MCP `session` tool's `finalize` action asks for the same reset at the end
+of the current turn. `POST /agents/{name}/reset` stays a cold start;
+`?handoff=1` runs the handoff first.
 
-The MCP `session` tool's `finalize` action runs the same summarizer on demand,
-resolving which agent it is speaking for from `KARAKOS_AGENT`.
+`SIGTERM` triggers `graceful_shutdown()`, which waits for in-flight turns and
+stops the subprocesses. It starts no summarizer and no handoff turn; sessions
+persist and the next boot resumes them. `bin/summarize-session.py` remains as a
+manual tool for one release.
 
 ## Memory
 
@@ -542,7 +553,7 @@ data/                                  # named volume
 │   └── wedge-check-state.json
 ├── taskboard.json
 ├── discord-dead-letter.jsonl          # replies Discord refused
-├── last-session-summary-<agent>.md
+├── handoff/<shard>.md                 # note for the next fresh session (rotated)
 └── stop-hook-extensions.json
 
 logs/                                  # named volume
@@ -563,10 +574,6 @@ Note `data/memory/agent-server.db` — the queue database lives under
 Documented so you don't spend an evening deciding whether it's your install.
 Each is a real defect in the code, not a configuration mistake.
 
-- **The `session` tool's `load_last` can return another agent's summary.** It
-  globs `data/last-session-summary-*.md` across every agent and returns the
-  alphabetically last one, rather than the calling agent's own.
-  ([#160](https://github.com/mcarmody/karakos-package/issues/160))
 - **Session-summary retention mis-buckets hyphenated agent names.**
   `bin/purge-data.py` splits the agent out of the filename at the first
   hyphen, so `test-agent` and `test-bot` share one 30-file budget and evict

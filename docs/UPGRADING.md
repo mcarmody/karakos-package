@@ -70,7 +70,7 @@ those are backed up by copying the directories or committing them.
 make down
 ```
 
-Shutdown is graceful: agents finalize their sessions first, up to 45 seconds.
+Shutdown is graceful: in-flight turns finish first, up to 45 seconds.
 
 ### 3. Pull the new code
 

@@ -22,6 +22,11 @@ STATUS_COMPLETE = 2
 STATUS_CRASHED = 3
 STATUS_SKIPPED = 4
 
+# Rows the server itself inserts for a shard (2.6's handoff and compact turns).
+# Claimed alone, like a call row: a human line merged into one would have its
+# answer suppressed. Same string as session_policy.HANDOFF_CHANNEL.
+INTERNAL_CHANNEL = "handoff"
+
 _ORDER = "priority DESC, created_at ASC, id ASC"
 # A reply row (call_id set, reply_to_agent NULL) is read by the waiting caller's
 # tool call, never run as a turn (step 2.3).
@@ -80,21 +85,23 @@ async def claim_batch(db, shard, limit, now=None) -> list:
     this caller now owns, ordered priority DESC, created_at, id.
 
     One UPDATE ... RETURNING whose candidates come from a subquery, so a row is
-    never in two callers' results. A call row (call_id set) is claimed alone;
-    ordinary rows never share a batch with one.
+    never in two callers' results. A call row (call_id set) or an internal row
+    (channel INTERNAL_CHANNEL) is claimed alone; ordinary rows never share a
+    batch with one.
     """
     await expire(db, shard, now)
     async with db.execute(
-        f"SELECT id, call_id FROM message_queue WHERE agent = ? AND processed = ?"
+        f"SELECT id, call_id, channel FROM message_queue WHERE agent = ? AND processed = ?"
         f" AND {_NOT_REPLY} ORDER BY {_ORDER} LIMIT 1", (shard, STATUS_QUEUED)) as cur:
         head = await cur.fetchone()
     if head is None:
         return []
-    if head["call_id"] is not None:
+    if head["call_id"] is not None or head["channel"] == INTERNAL_CHANNEL:
         where, args = "id = ?", (head["id"],)
     else:
         where = (f"id IN (SELECT id FROM message_queue WHERE agent = ?"
-                 f" AND processed = ? AND call_id IS NULL ORDER BY {_ORDER} LIMIT ?)")
+                 f" AND processed = ? AND call_id IS NULL"
+                 f" AND channel != '{INTERNAL_CHANNEL}' ORDER BY {_ORDER} LIMIT ?)")
         args = (shard, STATUS_QUEUED, limit)
     rows = await db.execute_fetchall(
         "UPDATE message_queue SET processed = ?, claimed_by = ?,"
@@ -259,18 +266,19 @@ async def peek_claimable(db, shard, limit=20, now=None) -> list:
     live = " AND (expires_at IS NULL OR expires_at >= ?)"
     now = utc_iso(now)
     async with db.execute(
-        f"SELECT id, call_id FROM message_queue WHERE agent = ? AND processed = ?{live}"
+        f"SELECT id, call_id, channel FROM message_queue WHERE agent = ? AND processed = ?{live}"
         f" AND {_NOT_REPLY}"
         f" ORDER BY {_ORDER} LIMIT 1", (shard, STATUS_QUEUED, now)) as cur:
         head = await cur.fetchone()
     if head is None:
         return []
-    if head["call_id"] is not None:
+    if head["call_id"] is not None or head["channel"] == INTERNAL_CHANNEL:
         return list(await db.execute_fetchall(
             "SELECT * FROM message_queue WHERE id = ?", (head["id"],)))
     rows = await db.execute_fetchall(
         f"SELECT * FROM message_queue WHERE agent = ? AND processed = ?"
-        f" AND call_id IS NULL{live} AND {_NOT_REPLY} ORDER BY {_ORDER} LIMIT ?",
+        f" AND call_id IS NULL AND channel != '{INTERNAL_CHANNEL}'{live}"
+        f" AND {_NOT_REPLY} ORDER BY {_ORDER} LIMIT ?",
         (shard, STATUS_QUEUED, now, limit))
     return sorted(rows, key=lambda r: (-(r["priority"] or 0), r["created_at"], r["id"]))
 

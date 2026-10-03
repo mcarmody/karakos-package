@@ -25,6 +25,7 @@ that was broken.
 import asyncio
 import json
 import os
+import re
 import time
 
 import pytest
@@ -223,6 +224,17 @@ class TestStreamLogIsWritten:
             drive(ags, [assistant_event(text_block(f"turn {i} " + "x" * 100)),
                         result_event()])
 
+        # Files written within one timestamp tick tie on mtime; give them the
+        # strictly increasing mtimes real time would have (creation order: the
+        # base name, then -1, -2, ...).
+        files = list(ags.STREAM_LOG_DIR.glob("amos_*.jsonl"))
+        def order(p):
+            m = re.match(r"amos_(\d+-\d+)(?:-(\d+))?$", p.stem)
+            return (m.group(1), int(m.group(2) or 0))
+        files.sort(key=order)
+        base = time.time() - 100
+        for n, f in enumerate(files):
+            os.utime(f, (base + n, base + n))
         summarizer.STREAM_LOG_DIR = ags.STREAM_LOG_DIR
         assert "turn 5" in summarizer.read_recent_stream("amos")
 
@@ -495,70 +507,147 @@ def tools_server(tmp_path, monkeypatch):
 
 
 class TestMcpFinalize:
+    """Step 2.6: `finalize` means "I want a fresh session" and goes to the
+    agent server; it no longer shells out to the summarizer."""
 
-    def _capture(self, tools_server, monkeypatch, returncode=0, stderr=""):
-        seen = {}
+    def _capture(self, tools_server, monkeypatch, status=200, body=None):
+        seen = {"calls": []}
 
-        def fake_run(cmd, **kwargs):
-            seen["cmd"] = cmd
+        def fake_request(method, path, payload=None, timeout=15.0):
+            seen["calls"].append((method, path))
+            return status, body if body is not None else {"status": "scheduled"}
 
-            class R:
-                pass
-            R.returncode = returncode
-            R.stdout = "Summary generated and saved for amos"
-            R.stderr = stderr
-            return R
+        def no_run(*a, **k):
+            raise AssertionError("summarize-session.py must not be run")
 
-        monkeypatch.setattr(tools_server.subprocess, "run", fake_run)
+        monkeypatch.setattr(tools_server, "agent_server_request", fake_request)
+        monkeypatch.setattr(tools_server.subprocess, "run", no_run)
         return seen
 
-    def test_finalize_passes_the_agent_positional(self, tools_server, monkeypatch):
-        """summarize-session.py declares `agent` as a required positional.
-        The bare call exited 2 on argparse every time — the tool has never
-        once produced a summary."""
+    def test_finalize_posts_the_callers_shard(self, tools_server, monkeypatch):
         seen = self._capture(tools_server, monkeypatch)
-
         out = tools_server.handle_core_tool("session", {"action": "finalize"})
+        assert out["status"] == "scheduled"
+        assert seen["calls"] == [("POST", "/agents/amos/session/finalize")]
 
-        assert out["status"] == "ok"
-        assert seen["cmd"][-1] == "amos"
-        assert seen["cmd"][-2].endswith("summarize-session.py")
-
-    def test_the_agent_comes_from_karakos_agent(self, tools_server):
-        """Identity is the env var bin/agent-server.py sets on the agent
-        subprocess this server is a child of — the same source ask_user uses."""
-        assert tools_server.KARAKOS_AGENT == "amos"
+    def test_the_shard_wins_over_the_agent_id(self, tools_server, monkeypatch):
+        seen = self._capture(tools_server, monkeypatch)
+        monkeypatch.setattr(tools_server, "KARAKOS_SHARD", "amos-2")
+        tools_server.handle_core_tool("session", {"action": "finalize"})
+        assert seen["calls"] == [("POST", "/agents/amos-2/session/finalize")]
 
     def test_an_explicit_agent_argument_wins(self, tools_server, monkeypatch):
         seen = self._capture(tools_server, monkeypatch)
-
         tools_server.handle_core_tool("session", {"action": "finalize", "agent": "kara"})
-        assert seen["cmd"][-1] == "kara"
+        assert seen["calls"] == [("POST", "/agents/kara/session/finalize")]
 
-    def test_no_identity_is_an_explicit_error_not_a_bare_call(self, tools_server, monkeypatch):
+    def test_no_identity_is_an_explicit_error(self, tools_server, monkeypatch):
         monkeypatch.setattr(tools_server, "KARAKOS_AGENT", "")
-        called = self._capture(tools_server, monkeypatch)
-
+        seen = self._capture(tools_server, monkeypatch)
         out = tools_server.handle_core_tool("session", {"action": "finalize"})
-
         assert "error" in out and "KARAKOS_AGENT" in out["error"]
-        assert "cmd" not in called, "must not invoke the script with no agent"
+        assert seen["calls"] == []
 
-    def test_a_failing_run_surfaces_stderr(self, tools_server, monkeypatch):
-        """The original swallowed stderr, so an argparse exit 2 arrived as
-        {"status": "error", "output": ""} — which is why this went unnoticed
-        for as long as it did."""
-        self._capture(tools_server, monkeypatch, returncode=2,
-                      stderr="error: the following arguments are required: agent")
-
+    def test_a_server_error_is_surfaced(self, tools_server, monkeypatch):
+        self._capture(tools_server, monkeypatch, status=404, body={"error": "Unknown agent"})
         out = tools_server.handle_core_tool("session", {"action": "finalize"})
+        assert out["status"] == "error" and "Unknown agent" in out["error"]
 
-        assert out["status"] == "error"
-        assert "required" in out["error"]
+    def test_load_last_returns_this_shards_pending_note(self, tools_server, tmp_path):
+        d = tmp_path / "data" / "handoff"
+        d.mkdir(parents=True)
+        (d / "amos.md").write_text("note for amos")
+        (d / "zed.md").write_text("note for zed")
+        out = tools_server.handle_core_tool("session", {"action": "load_last"})
+        assert out["status"] == "success" and out["summary"] == "note for amos"
+
+    def test_load_last_without_a_note_is_not_found(self, tools_server):
+        out = tools_server.handle_core_tool("session", {"action": "load_last"})
+        assert out == {"status": "not_found"}
 
     def test_the_tool_schema_accepts_an_agent(self, tools_server):
         session_tool = next(t for t in tools_server.CORE_TOOLS if t["name"] == "session")
         assert "agent" in session_tool["inputSchema"]["properties"]
+
+
+# ---------------------------------------------------------------------------
+# Step 2.6: the handoff note replaces the 24 h [SESSION RESET] summary
+# ---------------------------------------------------------------------------
+
+class TestHandoffInjection:
+
+    def _spawn(self, ags, monkeypatch, tmp_path, cleared_at):
+        import asyncio as aio
+
+        class Proc:
+            pid = 1
+            stdin = stdout = None
+
+            class stderr:
+                @staticmethod
+                async def readline():
+                    await aio.sleep(3600)
+
+            async def wait(self):
+                await aio.sleep(3600)
+
+        seen = {}
+
+        async def fake_exec(*args, **kw):
+            seen["cmd"] = list(args)
+            return Proc()
+
+        async def fake_session(shard):
+            return "sess-1"
+
+        async def fake_cleared(shard):
+            return cleared_at
+
+        monkeypatch.setattr(ags.asyncio, "create_subprocess_exec", fake_exec)
+        monkeypatch.setattr(ags, "get_or_create_session", fake_session)
+        monkeypatch.setattr(ags, "session_cleared_at", fake_cleared)
+        (tmp_path / "agents" / "amos").mkdir(parents=True, exist_ok=True)
+
+        async def go():
+            try:
+                await ags.start_agent_subprocess("amos")
+            finally:
+                for reg in (ags.stderr_reader_tasks, ags.respawn_watcher_tasks):
+                    for t in reg.values():
+                        t.cancel()
+                    reg.clear()
+        aio.run(go())
+        return seen["cmd"]
+
+    def test_a_note_older_than_the_clear_is_injected_once(self, ags, tmp_path, monkeypatch):
+        d = tmp_path / "data" / "handoff"
+        d.mkdir(parents=True)
+        (d / "amos.md").write_text("carry this over")
+        old = time.time() - 600
+        os.utime(d / "amos.md", (old, old))
+        cmd = self._spawn(ags, monkeypatch, tmp_path, "2999-01-01 00:00:00")
+        appended = cmd[cmd.index("--append-system-prompt") + 1]
+        assert "handoff note from your previous session" in appended
+        assert "carry this over" in appended
+        assert "[SESSION RESET]" not in appended
+        assert not (d / "amos.md").exists()           # rotated, never injected twice
+        cmd = self._spawn(ags, monkeypatch, tmp_path, "2999-01-01 00:00:00")
+        assert "--append-system-prompt" not in cmd or \
+            "carry this over" not in cmd[cmd.index("--append-system-prompt") + 1]
+
+    def test_the_old_summary_file_is_not_injected(self, ags, tmp_path, monkeypatch):
+        (tmp_path / "data").mkdir(exist_ok=True)
+        (tmp_path / "data" / "last-session-summary-amos.md").write_text("old summary")
+        cmd = self._spawn(ags, monkeypatch, tmp_path, "2999-01-01 00:00:00")
+        assert "old summary" not in " ".join(cmd)
+
+    def test_no_clear_time_means_no_note_applies(self, ags, tmp_path, monkeypatch):
+        d = tmp_path / "data" / "handoff"
+        d.mkdir(parents=True)
+        (d / "amos.md").write_text("not for this session")
+        cmd = self._spawn(ags, monkeypatch, tmp_path, None)
+        assert "not for this session" not in " ".join(cmd)
+        assert (d / "amos.md").exists()
 
 
 # ---------------------------------------------------------------------------

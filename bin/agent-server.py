@@ -43,6 +43,7 @@ import registry as agent_registry  # noqa: E402
 import procreap  # noqa: E402
 import prompt_compose  # noqa: E402
 import rate_limits  # noqa: E402
+import session_policy as sp_lib  # noqa: E402
 import shards as shards_lib  # noqa: E402
 import spawn_env as spawn_env_lib  # noqa: E402
 import tengwar  # noqa: E402
@@ -64,9 +65,8 @@ STREAM_LOG_DIR = WORKSPACE_ROOT / "logs" / "agent-streams"
 DEAD_LETTER_PATH = WORKSPACE_ROOT / "data" / "discord-dead-letter.jsonl"
 
 # Raw stream-json events are teed to logs/agent-streams/{agent}_*.jsonl as
-# they are read (#148). bin/summarize-session.py reads the tail of the newest
-# matching file to build the [SESSION RESET] summary; nothing wrote these
-# files before, so that whole path was dead. A new file is opened per boot,
+# they are read (#148). The manual summarizer reads the tail of the newest
+# matching file; nothing wrote these files before, so that whole path was dead. A new file is opened per boot,
 # per day, and whenever the current one passes the size cap — which keeps
 # each file small enough to tail cheaply and gives bin/purge-data.py whole
 # files to expire rather than lines to rewrite.
@@ -148,7 +148,6 @@ SERVER_START_TS = time.time()
 
 # Session persistence
 SUMMARY_DIR = WORKSPACE_ROOT / "logs" / "session-summaries"
-LAST_SUMMARY_TEMPLATE = WORKSPACE_ROOT / "data" / "last-session-summary-{agent}.md"
 
 # Logging
 STREAM_LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -246,6 +245,8 @@ class _ServerView:
 # access time, so rebinding a global here (a test patching db or
 # post_to_discord) is seen by the loop on its next call.
 STATE = turn_loop.make_state(_ServerView())
+# Context budget / handoff / reset policy (step 2.6); in memory, keyed by shard.
+STATE.session_policy = sp_lib.SessionPolicyState()
 
 # Who and where the agent's current turn came from. `/ask` has no channel of
 # its own — the question belongs in the conversation that prompted it — and
@@ -261,9 +262,6 @@ agent_roles: Dict[str, str] = {}
 
 # Graceful shutdown flag
 shutting_down = False
-
-# The per-shard session summarizer; a module constant so tests can substitute it.
-SUMMARIZE_CMD = ["python3", str(Path(__file__).parent / "summarize-session.py")]
 
 # =============================================================================
 # Database Schema
@@ -605,28 +603,15 @@ async def get_context_tokens() -> Dict[str, int]:
     ) as cursor:
         return {r["agent"]: r["context_tokens"] or 0 for r in await cursor.fetchall()}
 
-# =============================================================================
-# Session Persistence (Summary and Restore)
-# =============================================================================
-
-async def load_last_session(agent: str) -> Dict[str, Any]:
-    """Load last session summary if available and recent"""
-    summary_path = Path(str(LAST_SUMMARY_TEMPLATE).format(agent=agent))
-
-    if not summary_path.exists():
-        return {"status": "not_found"}
-
-    # Check age
-    mtime = summary_path.stat().st_mtime
-    age_hours = (time.time() - mtime) / 3600
-
-    if age_hours > 24:
-        return {"status": "stale", "age_hours": age_hours}
-
-    with open(summary_path) as f:
-        summary = f.read()
-
-    return {"status": "success", "summary": summary, "age_hours": age_hours}
+async def session_cleared_at(shard: str):
+    """sessions.last_compacted for the shard (naive UTC 'YYYY-MM-DD HH:MM:SS'),
+    or None: a session created by get_or_create_session has never been cleared,
+    so no handoff note can apply to it."""
+    async with db.execute(
+        "SELECT last_compacted FROM sessions WHERE agent = ?", (shard,)
+    ) as cursor:
+        row = await cursor.fetchone()
+    return row["last_compacted"] if row else None
 
 # =============================================================================
 # Agent Subprocess Management
@@ -807,11 +792,16 @@ async def start_agent_subprocess(shard: str):
         log.info(f"Injecting onboarding prompt for {label} (persona is empty)")
         persona_content = onboarding + ("\n\n" + persona_content if persona_content else "")
 
-    # Load last session summary if available
-    last_session = await load_last_session(shard)
-    if last_session["status"] == "success":
-        log.info(f"Injecting session summary for {label} (age: {last_session['age_hours']:.1f}h)")
-        persona_content = f"[SESSION RESET]\n\n{last_session['summary']}\n\n{persona_content}"
+    # Handoff note from the previous session (step 2.6). It rides in
+    # --append-system-prompt, which a fresh session honours and a resumed one
+    # ignores, so it is consumed only when the session was cleared after the
+    # note was written; a reload simply leaves it on disk.
+    note = sp_lib.consume_handoff(WORKSPACE_ROOT, shard,
+                                  await session_cleared_at(shard), time.time())
+    if note:
+        log.info(f"Injecting handoff note for {label} ({len(note)} chars)")
+        persona_content = (sp_lib.format_handoff_block(note)
+                           + ("\n\n" + persona_content if persona_content else ""))
 
     # Build command
     cmd = [
@@ -2015,8 +2005,8 @@ _stream_log_files: Dict[str, Dict] = {}
 def _open_stream_log(agent: str):
     """Open a fresh stream log for `agent` and return (handle, day, path).
 
-    The name must match the `{agent}_*.jsonl` glob bin/summarize-session.py
-    globs for. Unbuffered binary append: the summarizer is a *separate*
+    The name must match the `{agent}_*.jsonl` glob the manual summarizer
+    uses. Unbuffered binary append: the summarizer is a *separate*
     process reading this file, so a buffered write would leave it reading
     a stale tail.
     """
@@ -2629,9 +2619,36 @@ async def handle_agent_reset(request):
     if not targets:
         return web.json_response({"error": "Unknown agent"}, status=404)
 
+    # Operator resets are cold (no handoff) unless ?handoff=1 asks for the
+    # handoff turn first and the shard's effective handoff_on_reset allows it.
+    # The handoff turn can take minutes, so that path is scheduled, not awaited.
+    want_handoff = request.rel_url.query.get("handoff") in ("1", "true")
+    scheduled = []
     for t in targets:
-        await restart_agent(t)
+        if want_handoff and STATE.cfg(t).get("handoff_on_reset"):
+            scheduled.append(t)
+            asyncio.create_task(begin_reset(t, "operator"))
+        else:
+            await restart_agent(t)
+    if scheduled:
+        body = {"status": "scheduled", "handoff": scheduled}
+        return web.json_response(_with_shards(body, targets))
     return web.json_response(_with_shards({"status": "reset"}, targets))
+
+
+async def handle_session_finalize(request):
+    """POST /agents/{name}/session/finalize - the agent wants a fresh session.
+
+    Schedules a reset (with a handoff note) for the end of the shard's current
+    turn; the `session` MCP tool calls it with the caller's shard id."""
+    if not _bearer_ok(request):
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    shard = shards_lib.first_shard(effective_specs(), request.match_info.get("name") or "")
+    if not shard:
+        return web.json_response({"error": "Unknown agent"}, status=404)
+    STATE.session_policy.reset_requested[shard] = sp_lib.REASON_AGENT
+    log.info(f"{shard} requested a fresh session; reset at the end of this turn")
+    return web.json_response({"status": "scheduled", "shard": shard})
 
 
 async def handle_agent_reload(request):
@@ -3590,6 +3607,245 @@ def register_hive_hooks():
 
 
 # =============================================================================
+# Session policy: context budget, handoff note, reset (step 2.6)
+# =============================================================================
+# The logic is in lib/session_policy.py; this is the wiring. Hook order:
+# hive's on_turn_end runs first (a reply row is written before any reset), this
+# one runs last and only schedules work (followups run after the shard lock is
+# released).
+
+def register_session_policy(state=None):
+    """Register the policy hooks once, after the hive's. Idempotent."""
+    state = state or STATE
+    for name, fn in (("on_turn_end", session_policy_on_turn_end),
+                     ("on_event", session_policy_on_event),
+                     ("before_claim", session_policy_before_claim)):
+        if fn not in getattr(state.hooks, name):
+            state.hooks.register(name, fn)
+
+
+def session_policy_before_claim(shard):
+    """Truthy while a reset is restarting this shard: no turn may start on the
+    old session. begin_reset kicks the drain once the new one is up."""
+    return bool(STATE.session_policy.resetting.get(shard))
+
+
+def session_policy_on_event(shard, event):
+    if event.get("type") == "system" and event.get("subtype") == "compact_boundary":
+        meta = event.get("compact_metadata") or {}
+        STATE.session_policy.compact_event[shard] = {
+            "pre": event.get("pre_tokens", meta.get("pre_tokens")),
+            "post": event.get("post_tokens", meta.get("post_tokens"))}
+
+
+def session_policy_on_turn_end(shard, result):
+    sp = STATE.session_policy
+    rows = result.batch.rows
+    if sp_lib.is_internal_batch(rows):
+        # A handoff or compact reply is never posted, whatever channel_id says.
+        result.suppress_post = True
+        if sp.compacting.get(shard):
+            return          # begin_reset is awaiting this row itself
+        if shard in sp.inflight:
+            # Stop new turns starting on this session before the lock is
+            # released; finish_reset restarts the shard.
+            sp.resetting[shard] = True
+            result.followups.append(lambda: finish_reset(shard))
+        return
+
+    cfg = STATE.cfg(shard)
+    budget = cfg.get("context_budget_tokens")
+    requested = sp.reset_requested.get(shard)
+    md = result.metadata or {}
+    # No budget and no request: only an errored turn can still mean overflow
+    # (a regex on text already in hand, no database access).
+    if not budget and not requested and not md.get("is_error"):
+        return
+    overflow = bool(md.get("is_error")) and bool(
+        CONTEXT_OVERFLOW_RE.search(result.raw_response_text or ""))
+    reason = sp_lib.should_reset(md.get("context_tokens", 0) or 0, budget, overflow)
+    if reason is None and requested:
+        reason = requested
+    if reason is None:
+        return
+    if any(r["call_id"] for r in rows):
+        # The caller is waiting inside this turn; the reset is taken at the
+        # next ordinary turn end (a pending agent request stays pending).
+        log.warning(f"{shard}: reset ({reason}) deferred past a hive call turn")
+        return
+    sp.reset_requested.pop(shard, None)
+    since = time.time() - sp.last_reset_at.get(shard, 0)
+    if since < sp_lib.RESET_MIN_INTERVAL_S or shard in sp.inflight:
+        log.warning(f"{shard}: reset ({reason}) skipped: "
+                    + ("one is already running" if shard in sp.inflight
+                       else f"last reset {int(since)}s ago"))
+        return
+    result.followups.append(lambda: begin_reset(shard, reason))
+
+
+async def _insert_internal_row(shard, prefix, content, timeout_s):
+    """One server-inserted row (handoff or compact turn): an ordinary queue row
+    in channel `handoff`, claimed alone, priority HANDOFF_PRIORITY."""
+    message_id = f"{prefix}-{shard}-{uuid.uuid4().hex[:12]}"
+    expires = msgqueue.utc_iso(time.time() + timeout_s)
+    await db.execute(
+        "INSERT INTO message_queue (agent, channel, channel_id, server, author,"
+        " is_bot, content, message_id, priority, owner_agent, expires_at)"
+        " VALUES (?, ?, '0', 'local', 'session-handoff', 1, ?, ?, ?, ?, ?)",
+        (shard, sp_lib.HANDOFF_CHANNEL, content, message_id,
+         sp_lib.HANDOFF_PRIORITY, STATE.agent_of(shard), expires))
+    await db.commit()
+    msgqueue.notify(shard)
+    turn_loop.notify_enqueued(STATE, shard, "0")
+    return message_id
+
+
+async def _wait_internal_row(shard, message_id, timeout_s) -> bool:
+    """Wait for the row to leave QUEUED/IN_PROGRESS. True when it did. On
+    timeout the row is skipped (still queued) or its turn interrupted."""
+    sp = STATE.session_policy
+    deadline = time.monotonic() + timeout_s
+    while True:
+        async with db.execute("SELECT processed FROM message_queue"
+                              " WHERE message_id = ?", (message_id,)) as cur:
+            row = await cur.fetchone()
+        status = row["processed"] if row else STATUS_SKIPPED
+        if status not in (STATUS_QUEUED, STATUS_IN_PROGRESS):
+            return True
+        if time.monotonic() >= deadline:
+            break
+        await asyncio.sleep(0.05)
+    log.warning(f"{shard}: internal turn {message_id} not done after {timeout_s}s")
+    if status == STATUS_QUEUED:
+        await db.execute("UPDATE message_queue SET processed = ?, response = 'timeout',"
+                         " processed_at = CURRENT_TIMESTAMP"
+                         " WHERE message_id = ? AND processed = ?",
+                         (STATUS_SKIPPED, message_id, STATUS_QUEUED))
+        await db.commit()
+    else:
+        if shard in sp.inflight:        # a do_reset is still to come and clears this
+            sp.resetting[shard] = True  # nothing may claim on the old session
+        await interrupt_agent(shard)
+    return False
+
+
+async def _settle(shard):
+    """Wait (bounded) for 2.5's steered lines to drain; settled at once when
+    steering is absent. On timeout carry on: release_pending returns queued
+    steered lines to the queue when the process is killed."""
+    steer = getattr(STATE, "steer", None)
+    if steer is None:
+        return
+    deadline = time.monotonic() + sp_lib.SETTLE_WAIT_S
+    while time.monotonic() < deadline:
+        try:
+            if not steer[shard].pending():
+                return
+        except Exception:
+            return
+        await asyncio.sleep(0.1)
+
+
+async def begin_reset(shard, reason):
+    """Reset one shard: settle, (optionally) compact or take a handoff note,
+    then restart it. Best effort throughout: a failed handoff never blocks the
+    reset."""
+    sp = STATE.session_policy
+    if shard in sp.inflight:
+        return
+    sp.inflight[shard] = reason
+    try:
+        await _settle(shard)
+        cfg = STATE.cfg(shard)
+        if (reason == sp_lib.REASON_BUDGET and cfg.get("reset_mode") == "compact"):
+            if not sp_lib.COMPACT_VERIFIED:
+                if not sp.compact_warned:
+                    sp.compact_warned = True
+                    log.warning("reset_mode: compact is unverified against the real "
+                                "CLI (COMPACT_VERIFIED is False); behaving as reset")
+            elif await _run_compact(shard):
+                sp.inflight.pop(shard, None)
+                sp.last_reset_at[shard] = time.time()
+                asyncio.create_task(turn_loop.drain_shard(STATE, shard))
+                return
+        with_handoff = (
+            reason != sp_lib.REASON_OVERFLOW
+            and bool(cfg.get("handoff_on_reset"))
+            and not await agent_hold_until(shard)
+            and not usage_gate.account_paused()
+            and not shutting_down)
+        if with_handoff:
+            await _run_handoff(shard)
+    except Exception as e:
+        log.error(f"{shard}: handoff before reset failed: {type(e).__name__}: {e}")
+    await do_reset(shard)
+
+
+async def _run_handoff(shard):
+    path = sp_lib.handoff_path(WORKSPACE_ROOT, shard)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    timeout_s = sp_lib.HANDOFF_TURN_TIMEOUT_S
+    mid = await _insert_internal_row(
+        shard, "handoff", sp_lib.build_handoff_prompt(path), timeout_s)
+    await _wait_internal_row(shard, mid, timeout_s)
+
+
+async def _run_compact(shard) -> bool:
+    """Compact mode (unverified, off). True when the CLI reported a
+    compact_boundary and the turn completed; any failure means reset."""
+    sp = STATE.session_policy
+    timeout_s = sp_lib.COMPACT_TURN_TIMEOUT_S
+    before = (await get_context_tokens()).get(shard, 0)
+    sp.compact_event.pop(shard, None)
+    sp.compacting[shard] = True
+    try:
+        mid = await _insert_internal_row(shard, "compact", sp_lib.COMPACT_PROMPT, timeout_s)
+        done = await _wait_internal_row(shard, mid, timeout_s)
+    finally:
+        sp.compacting.pop(shard, None)
+    event = sp.compact_event.pop(shard, None)
+    async with db.execute("SELECT processed FROM message_queue WHERE message_id = ?",
+                          (mid,)) as cur:
+        row = await cur.fetchone()
+    if not (done and event and row and row["processed"] == STATUS_COMPLETE):
+        log.warning(f"{shard}: compact failed (done={done}, boundary={bool(event)}); resetting")
+        sp.resetting.pop(shard, None)
+        return False
+    after = (await get_context_tokens()).get(shard, 0)
+    log.info(f"{shard}: compacted tokens_before={event.get('pre') or before} "
+             f"tokens_after={event.get('post') or after}")
+    return True
+
+
+async def finish_reset(shard):
+    """Scheduled when the handoff turn ends: reset now, not at the timeout."""
+    await do_reset(shard)
+
+
+async def do_reset(shard):
+    """Restart the shard on a fresh session (kill, clear, spawn). Claimed once:
+    whichever of finish_reset and begin_reset gets here first does it."""
+    sp = STATE.session_policy
+    if sp.inflight.pop(shard, None) is None:
+        return
+    sp.last_reset_at[shard] = time.time()
+    sp.resetting[shard] = True
+    try:
+        lock = agent_locks.get(shard)
+        if lock is not None:
+            async with lock:
+                await restart_agent(shard)
+        else:
+            await restart_agent(shard)
+    except Exception as e:
+        log.error(f"{shard}: reset failed: {type(e).__name__}: {e}")
+    finally:
+        sp.resetting.pop(shard, None)
+    # Queued human rows run on the fresh session.
+    asyncio.create_task(turn_loop.drain_shard(STATE, shard))
+
+
+# =============================================================================
 # Graceful Shutdown
 # =============================================================================
 
@@ -3739,32 +3995,8 @@ async def graceful_shutdown(sig):
             break
         await asyncio.sleep(1)
 
-    # Generate summaries, one per shard, at most four at a time. Each writes
-    # data/last-session-summary-<shard>.md from that shard's stream logs.
-    log.info("Finalizing sessions...")
-    gate = asyncio.Semaphore(4)
-
-    async def _summarize(sid: str):
-        async with gate:
-            label = label_of(sid)
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    *SUMMARIZE_CMD, sid,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=25)
-                if proc.returncode == 0:
-                    log.info(f"Session summary generated for {label}")
-                else:
-                    log.warning(f"Session summary failed for {label}: {stderr.decode()[:200]}")
-            except asyncio.TimeoutError:
-                log.warning(f"Session summary timed out for {label}")
-            except Exception as e:
-                log.warning(f"Session summary error for {label}: {e}")
-
-    await asyncio.gather(*(_summarize(sid) for sid in STATE.shard_ids()))
-
+    # No summarizer and no handoff turn here: the stop timeout cannot hold a
+    # model turn. Sessions persist and the next boot resumes them.
     # Kill subprocesses
     log.info("Terminating agent subprocesses...")
     for agent in list(agent_processes.keys()):
@@ -3810,6 +4042,9 @@ async def startup(app):
 
     # Account breaker, token budget and weekly governor (spec 2.7).
     usage_gate.install(STATE)
+
+    # Session policy last: it only schedules work, after hive and the gate.
+    register_session_policy(STATE)
 
     # Initialize locks and state for every shard before any spawn.
     for sid in STATE.shard_ids():
@@ -3892,6 +4127,7 @@ def create_app(with_lifecycle: bool = True) -> web.Application:
     app.router.add_get("/agents", handle_agents)
     app.router.add_post("/agents/{name}/reset", handle_agent_reset)
     app.router.add_post("/agents/{name}/reload", handle_agent_reload)
+    app.router.add_post("/agents/{name}/session/finalize", handle_session_finalize)
     app.router.add_post("/agents/{name}/register", handle_agent_register)
     app.router.add_post("/agents/{name}/interrupt", handle_agent_interrupt)
     app.router.add_post("/agents/{name}/kill", handle_agent_kill)

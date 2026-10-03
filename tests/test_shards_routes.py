@@ -250,34 +250,33 @@ def test_tools_server_sends_the_shard(monkeypatch, tmp_path):
 
 # -- shutdown -----------------------------------------------------------------------
 
-def test_graceful_shutdown_summarizes_once_per_shard(harness):
+def test_graceful_shutdown_starts_no_summarizer(harness):
+    """Step 2.6: shutdown only stops the subprocesses; no summarizer runs."""
     h = fixture(harness)
-    log = h.workspace / "summ.log"
-    code = ("import sys,time,json;"
-            f"f=open({str(log)!r},'a');"
-            "f.write(json.dumps(['s',sys.argv[1],time.time()])+'\\n');f.flush();"
-            "time.sleep(0.3);"
-            "f.write(json.dumps(['e',sys.argv[1],time.time()])+'\\n');f.close()")
+    marker = h.workspace / "summarizer-ran"
 
     async def scenario():
         async with h:
-            h.module.SUMMARIZE_CMD = [sys.executable, "-c", code]
+            assert not hasattr(h.module, "SUMMARIZE_CMD")
+            real = h.module.asyncio.create_subprocess_exec
+            spawned = []
+
+            async def spy(*args, **kw):
+                spawned.append(args)
+                return await real(*args, **kw)
+
+            h.module.asyncio.create_subprocess_exec = spy
             try:
                 await h.module.graceful_shutdown("TEST")
             except SystemExit:
                 pass
+            finally:
+                h.module.asyncio.create_subprocess_exec = real
             assert not h.module.agent_processes
+            assert spawned == []
 
     run(scenario())
-    events = [json.loads(l) for l in log.read_text().splitlines()]
-    starts = sorted(e[1] for e in events if e[0] == "s")
-    assert starts.count("a") == starts.count("a-2") == starts.count("b") == 1
-    assert len(starts) == len(set(starts))
-    live = peak = 0
-    for kind, _, _ in sorted(events, key=lambda e: e[2]):
-        live += 1 if kind == "s" else -1
-        peak = max(peak, live)
-    assert 1 < peak <= 4
+    assert not marker.exists()
 
 
 # -- schema -------------------------------------------------------------------------
