@@ -204,15 +204,16 @@ bin/create-agent.sh --template builder --model sonnet builder
 On first boot a fresh agent runs an onboarding conversation to learn who you
 are, rather than starting from a blank persona.
 
-**Memory.** Conversations become episodes; episodes are scored, decayed and
-consolidated; facts are extracted and re-injected at session start.
-Semantic search runs on local embeddings, so recall costs no API calls.
+**Memory.** Durable memory is a knowledge graph (entities, links and
+observations) in `data/memory/graph.db`. Each human prompt gets a short recall
+block from it, and top facts load at session start; semantic search runs on
+local embeddings, so recall costs no API calls.
 
 **Cost control.** Every turn's spend is recorded per agent. Daily and monthly
 caps are enforced at the point a message is queued, and warnings post to your
 signals channel before the cap bites.
 
-**Scheduled work.** Heartbeats, health sweeps, memory maintenance and data
+**Scheduled work.** Heartbeats, health sweeps, memory consolidation and data
 purges run on a built-in scheduler. Agents can also schedule arbitrary
 one-off work at runtime — "check back in ten minutes" is a real mechanism,
 and it survives a container restart.

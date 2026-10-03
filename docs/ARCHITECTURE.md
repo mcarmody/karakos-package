@@ -265,7 +265,7 @@ Replaces cron, with the container's full environment. The loop ticks every
 | Wedge check | every 1 min | `bin/wedge-check.py` |
 | Flush deferred messages | every 5 min | `bin/flush-deferred-messages.py` |
 | Claude CLI rollback guard | at startup, then hourly | `bin/cli-upgrade-watchdog.sh` |
-| Memory maintenance | daily 03:00 | `bin/memory-maintenance.py` |
+| Memory consolidation | daily 03:00 | `lib/monitor_jobs/memory_consolidate.py` (also `bin/graph-consolidate.py [--dry-run]`) |
 | Health monitor | daily 04:00 | `bin/health-monitor.py` |
 | Data purge | daily 04:30 | `bin/purge-data.py` |
 | Update check | Mondays 05:00 | `bin/check-updates.sh` — pokes signals on a new release |
@@ -477,57 +477,56 @@ manual tool for one release.
 
 ## Memory
 
-`data/memory/memory.db`, maintained daily at 03:00 by
-`bin/memory-maintenance.py`.
+Durable memory is one knowledge graph: `data/memory/graph.db` (SQLite, FTS5,
+float32 embeddings), shared by every agent and shard (it is not partitioned).
+Code lives in `lib/graph`; the `memory` and `graph` MCP tools read and write it.
+Only the migrator (`lib/migrate`) ever opens a 1.x `memory.db`, and it renames
+that file `memory.db.migrated` after importing it.
 
-| Table | Columns of note |
+| Table | Holds |
 |---|---|
-| `episodes` | `summary`, `importance` (default 5.0), `base_importance`, `channel`, `tags`, `agents`, `created_at`, `inserted_at`, `embedding` |
-| `facts` | `subject`, `content`, `confidence` (0.8), `domain` |
-| `patterns` | `agent`, `pattern_type`, `content`, `confidence`, `reinforcement_count` |
+| `entities` | `name`, `kind`, `summary`, `importance`, `embedding`; `entity_aliases` for alternate names |
+| `edges` | typed, weighted links between entities (`relation`, `weight`) |
+| `observations` | the memories: `kind` (`fact`, `episode`, `pattern`), `content`, `entity_id`, `importance`, `agent`, `domain`, `embedding`, `source` |
+| `observation_mentions` | which entities an observation mentions |
+| `observations_fts`, `entities_fts` | FTS5 indexes for keyword matching |
 
-The daily pass reads yesterday's message JSONL, scores importance with a
-(retried) Haiku call, writes episodes, decays importance from
-`base_importance` idempotently by `MEMORY_DECAY_RATE` (0.25), and drops
-anything below `MEMORY_CUTOFF` (6.0) that is also older than
-`MEMORY_PRUNE_GRACE_DAYS` (default 7, from `inserted_at` — the DB-write
-time, not the `created_at` message timestamp recall ranking still uses).
-Maintenance also keeps at most `MEMORY_MAX_EPISODES` (15) per day.
+**Recall signals.** `recall` scores each candidate on four signals and blends
+them: `vec` (embedding cosine, `BAAI/bge-small-en-v1.5` via `fastembed`), `kw`
+(FTS5 BM25, with a substring floor), `name` (the query names an entity or
+alias) and `imp` (importance ÷ 10). Default weights are `vec 0.50, kw 0.15,
+name 0.15, imp 0.20` (`KARAKOS_RECALL_WEIGHTS` overrides). When a signal is
+unavailable its weight is dropped and the rest are renormalised.
 
-Embeddings are generated with **`BAAI/bge-small-en-v1.5` via `fastembed`**, 50
-episodes a batch, stored as float32 blobs. The model is hardcoded, not
-configurable. If `fastembed` is missing the step is skipped rather than
-failing the run.
+**Fallback.** Recall degrades rather than failing. If `fastembed` is absent,
+the model will not load, or nothing is embedded yet, it runs on `kw`, `name`
+and `imp` and says so (`mode: "keyword"` plus a reason).
+`KARAKOS_SEMANTIC_RECALL=0` forces that path. The database is queried before
+the model, so an install with nothing embedded never loads it.
 
-**Recall is semantic.** `memory.recall` embeds the query with the same model
-and ranks episodes by `0.75 × cosine similarity + 0.25 × (importance ÷ 10)`,
-so a close match on a trivial episode does not outrank a decent match on an
-important one. Importance already carries age, because the nightly pass decays
-it.
+**Two read paths, one per-prompt injection.**
 
-It degrades rather than failing. If `fastembed` is absent, the model will not
-load, the query cannot be embedded, or no episode has an embedding yet, recall
-falls back to the old `LIKE` scan and says so in its response (`mode:
-"keyword"`, plus a reason). A mixed database is handled rather than fallen
-back on: embedded rows are scored, and literal matches on un-embedded rows are
-folded into the same ranking, tagged `match: "keyword"`. Set
-`KARAKOS_SEMANTIC_RECALL=0` to force the keyword path.
+- The `memory` tool runs in the long-lived tool-server process, so the model
+  (about 6 s and 230 MB to load) is paid once and recall is hybrid.
+- `system/hooks/inject-recall.py` is the only place a recall block enters a
+  prompt. It is a fresh process per prompt, so it runs recall in **fast
+  mode**: no model load, signals `kw`, `name`, `imp` only.
+  `KARAKOS_RECALL_HOOK_MODE=full` tries the model within a 6 s budget and falls
+  back to fast. Source order: an operator override
+  (`KARAKOS_RECALL_SOURCE` or `config/recall-source`) **replaces** the graph;
+  otherwise the graph. A missing, broken or slow graph yields no block, never
+  an error. Automated prompts (the `[KARAKOS_AUTOMATED]` sentinel) are skipped.
+- Because automated turns (heartbeats, pokes, scheduled jobs) skip that hook,
+  `bin/agent-server.py` also loads the top 50 `fact` observations by
+  importance, read through `lib/graph`, into `--append-system-prompt` at spawn
+  and resume under its own header (`# Stored Facts (knowledge graph)`). An
+  empty or missing graph spawns with no block.
 
-The model is loaded lazily and cached for the life of the tool-server process:
-roughly 6 seconds and 230 MB on a Pi 4, paid once per session. The database is
-queried before the model, so an install with nothing embedded never loads it
-at all.
-
-**Writing memory:** `memory.remember` is the only live write path into
-`facts` (episodes are written solely by the nightly pass above). It inserts
-one row — `{subject, content, confidence?, domain?}` — and rejects empty
-`subject`/`content`.
-
-Separately, `system/hooks/inject-recall.py` runs on `UserPromptSubmit` and
-injects a block from `KARAKOS_RECALL_SOURCE` (default `config/recall-source`,
-absent unless you create it; a plain file is read verbatim, an executable one
-is run with the prompt on stdin). It skips any prompt carrying the
-`[KARAKOS_AUTOMATED]` sentinel, and it does not read `memory.db`.
+**Writing memory:** `memory.remember` and the `graph` tool write observations,
+entities and edges through `GraphStore`. The nightly `memory-consolidate`
+job (`lib/graph/consolidate.py`) builds episodes from the previous day's
+messages, decays and archives them, merges duplicates, tidies entities and
+backfills embeddings.
 
 ## Protected paths
 
@@ -557,7 +556,8 @@ data/                                  # named volume
 ├── memory/
 │   ├── agent-server.db                # message_queue, sessions, cost_events,
 │   │                                  #   rate_limit_state
-│   └── memory.db                      # episodes, facts, patterns, embeddings
+│   └── graph.db                       # knowledge graph: entities, edges,
+│                                      #   observations, embeddings
 ├── mcp-tools-audit.db                 # tool_calls
 ├── messages/
 │   └── messages-YYYY-MM-DD.jsonl      # daily capture
@@ -569,7 +569,7 @@ data/                                  # named volume
 ├── health/
 │   ├── agents/<agent>.json            # liveness beacons
 │   ├── relay.json  scheduler.json
-│   ├── mcp-tools.json  memory-maintenance.json
+│   ├── mcp-tools.json  memory-consolidate.json
 │   ├── claude-cli.json                # known-good CLI version
 │   └── wedge-check-state.json
 ├── taskboard.json

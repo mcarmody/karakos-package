@@ -119,7 +119,9 @@ def test_server_refuses_before_step_and_boots_after(tmp_path, monkeypatch):
     spec.loader.exec_module(ags)
     with pytest.raises(SystemExit):
         asyncio.run(ags.init_db())
-    runner.run(data, config, backup_root=tmp_path / "bk", out=lambda *_: None)
+    # the refused boot above already created 2.0-shaped sibling tables: force past
+    # the fork policy, which is not what this test is about
+    runner.run(data, config, backup_root=tmp_path / "bk", out=lambda *_: None, force=True)
 
     async def boot():
         # the other 1.x tables are absent in this fixture, so init_db creates them

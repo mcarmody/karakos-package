@@ -684,63 +684,40 @@ def load_memory_index(agent: str) -> str:
         return ""
 
 
+STORED_FACTS_HEADER = "# Stored Facts (knowledge graph)"
+
+
 def load_stored_facts(agent: str = "", limit: int = 50) -> str:
-    """Load stored facts from memory.db into the agent prompt context.
+    """Top-N `fact` observations from the knowledge graph for the spawn prompt.
 
-    Provides the missing retrieval loop for durable memory: facts recorded live
-    via `memory.remember` (or extracted by nightly maintenance) are injected
-    into the agent's --append-system-prompt at startup/resume so learned
-    knowledge persists across session resets without requiring manual edits to
-    static files. Also checks data/memory-candidates/ if available.
+    Automated turns (heartbeats, pokes, scheduled jobs) skip the per-prompt
+    recall hook, so durable facts also load once per spawn/resume. Read through
+    lib/graph only; an uninitialised or unreadable graph yields "" (a fresh
+    install spawns with no block). Distinct header: never confused with the
+    hook's [ACTIVE RECALL] block.
     """
-    facts_lines = []
-
-    # 1. Query SQLite memory.db if available
-    db_path = WORKSPACE_ROOT / "data" / "memory" / "memory.db"
-    if db_path.exists():
-        try:
-            import sqlite3
-            conn = sqlite3.connect(db_path, timeout=5.0)
-            conn.row_factory = sqlite3.Row
-            table_check = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='facts'"
-            ).fetchone()
-            if table_check:
-                rows = conn.execute(
-                    "SELECT subject, content, domain FROM facts ORDER BY id DESC LIMIT ?",
-                    (limit,)
-                ).fetchall()
-                for r in rows:
-                    domain_tag = f" [{r['domain']}]" if r["domain"] and r["domain"] != "general" else ""
-                    facts_lines.append(f"- **{r['subject']}{domain_tag}:** {r['content']}")
-            conn.close()
-        except Exception as e:
-            log.warning(f"Failed to load facts from {db_path}: {e}")
-
-    # 2. Check recent candidates if DB had few or no facts
-    if len(facts_lines) < 10:
-        candidates_dir = WORKSPACE_ROOT / "data" / "memory-candidates"
-        if candidates_dir.exists():
-            try:
-                candidate_files = sorted(candidates_dir.glob("*.md"), reverse=True)[:3]
-                for cf in candidate_files:
-                    try:
-                        content = cf.read_text().strip()
-                        for line in content.splitlines():
-                            if line.startswith("- **") and line not in facts_lines:
-                                facts_lines.append(line)
-                                if len(facts_lines) >= limit:
-                                    break
-                    except Exception:
-                        pass
-            except Exception as e:
-                log.warning(f"Failed to load memory candidates: {e}")
-
-    if not facts_lines:
+    try:
+        from lib.graph.recall import top_facts
+        from lib.graph.schema import GraphNotInitialised
+        from lib.graph.store import open_graph
+        store = open_graph(WORKSPACE_ROOT / "data", create=False)
+        facts = top_facts(store, agent, limit)
+    except GraphNotInitialised:
+        return ""  # fresh install: no block, no log line
+    except Exception as e:
+        log.debug(f"No stored facts for {agent}: {e}")
         return ""
-
-    header = "# Learned Facts & Persistent Memory\n\nDurable knowledge recorded from previous interactions:"
-    return header + "\n\n" + "\n".join(facts_lines[:limit])
+    lines = []
+    for f in facts:
+        text = " ".join(str(f["content"] or "").split())
+        subject = f.get("subject")
+        domain = f.get("domain")
+        tag = f" [{domain}]" if domain and domain != "general" else ""
+        lines.append(f"- **{subject}{tag}:** {text}" if subject else f"- {text}{tag}")
+    if not lines:
+        return ""
+    return (STORED_FACTS_HEADER + "\n\nDurable knowledge recorded from previous interactions:\n\n"
+            + "\n".join(lines))
 
 
 async def start_agent_subprocess(shard: str):
@@ -3533,6 +3510,36 @@ async def handle_hive_call_cancel(request):
     return web.json_response({"status": "cancelled"})
 
 
+async def _graph_browse(request, route, entity_id=None):
+    if not _bearer_ok(request):
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    from lib.graph import browse
+    loop = asyncio.get_running_loop()
+    status, body = await loop.run_in_executor(
+        None, browse.handle, route, dict(request.query), WORKSPACE_ROOT / "data", entity_id)
+    return web.json_response(body, status=status)
+
+
+async def handle_graph_status(request):
+    """GET /graph/status (docs/graph-browse-api.md)."""
+    return await _graph_browse(request, "status")
+
+
+async def handle_graph_observations(request):
+    """GET /graph/observations."""
+    return await _graph_browse(request, "observations")
+
+
+async def handle_graph_entities(request):
+    """GET /graph/entities."""
+    return await _graph_browse(request, "entities")
+
+
+async def handle_graph_entity(request):
+    """GET /graph/entities/{id}."""
+    return await _graph_browse(request, "entity", request.match_info["id"])
+
+
 async def handle_hive_calls(request):
     """GET /hive/calls: the call log (docs/hive-call-log.md)."""
     if not _bearer_ok(request):
@@ -4196,6 +4203,10 @@ def create_app(with_lifecycle: bool = True) -> web.Application:
     app.router.add_get("/hive/call/{call_id}", handle_hive_call_get)
     app.router.add_post("/hive/call/{call_id}/cancel", handle_hive_call_cancel)
     app.router.add_get("/hive/calls", handle_hive_calls)
+    app.router.add_get("/graph/status", handle_graph_status)
+    app.router.add_get("/graph/observations", handle_graph_observations)
+    app.router.add_get("/graph/entities", handle_graph_entities)
+    app.router.add_get("/graph/entities/{id}", handle_graph_entity)
 
     # Register startup/shutdown handlers
     if with_lifecycle:

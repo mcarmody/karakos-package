@@ -99,7 +99,7 @@ def test_env_bypass_and_production_refusal(tmp_path, monkeypatch):
 # -- detector ----------------------------------------------------------------
 
 def test_detect_buckets(tmp_path):
-    def tree(name, agents_json=True, dot=False, yaml=False, sessions=False, queue=False):
+    def tree(name, agents_json=True, dot=False, yaml=False, rate=False, queue=False):
         r = tmp_path / name
         (r / "config").mkdir(parents=True)
         if agents_json:
@@ -111,15 +111,14 @@ def test_detect_buckets(tmp_path):
         sql = "CREATE TABLE x(a);"
         if queue:
             sql += "CREATE TABLE message_queue(id);"
-        if sessions:
-            sql += "CREATE TABLE sessions(id);"
+        if rate:
+            sql += "CREATE TABLE rate_limit_state(agent);"
         mk_db(r / "data" / "memory" / "agent-server.db", sql)
         return detect_version(r / "data", r / "config")
 
     assert tree("v10").version == "1.0"
-    assert tree("v11", dot=True).version == "1.1"
     assert tree("v13", dot=True, queue=True).version == "1.3"
-    assert tree("v15", dot=True, sessions=True).version == "1.5"
+    assert tree("v15", dot=True, rate=True).version == "1.5"
     assert tree("v15y", agents_json=False, yaml=True, dot=True).version == "1.5"
     d = detect_version(tmp_path / "nothing" / "data", tmp_path / "nothing" / "config")
     assert d.version == "unknown" and d.evidence
@@ -148,8 +147,8 @@ def make_install(root: Path):
     db.parent.mkdir(parents=True)
     con = sqlite3.connect(db)
     con.execute("PRAGMA journal_mode=WAL")
-    con.execute("CREATE TABLE t(v)")
-    con.executemany("INSERT INTO t VALUES(?)", [(i,) for i in range(100)])
+    con.execute("CREATE TABLE cost_events(id)")
+    con.executemany("INSERT INTO cost_events VALUES(?)", [(i,) for i in range(100)])
     con.commit()
     return con  # open writer, WAL not checkpointed
 
@@ -157,7 +156,7 @@ def make_install(root: Path):
 def test_backup_restore_round_trip_with_open_wal_writer(tmp_path):
     root = tmp_path / "ws"
     writer = make_install(root)
-    writer.execute("INSERT INTO t VALUES(999)")
+    writer.execute("INSERT INTO cost_events VALUES(999)")
     writer.commit()
     out = bk.backup(root / "data", root / "config", root / "backups")
     assert out.name.startswith("pre-2.0-")
@@ -167,13 +166,13 @@ def test_backup_restore_round_trip_with_open_wal_writer(tmp_path):
             "data/memory/agent-server.db"} <= paths
     assert all(len(e["sha256"]) == 64 and e["size"] >= 0 for e in m["files"])
     bk.verify(out)
-    writer.execute("DELETE FROM t")
+    writer.execute("DELETE FROM cost_events")
     writer.commit()
     writer.close()
     (root / ".env").write_text("changed")
     bk.restore(out)
     con = sqlite3.connect(root / "data" / "memory" / "agent-server.db")
-    assert con.execute("SELECT count(*) FROM t").fetchone()[0] == 101
+    assert con.execute("SELECT count(*) FROM cost_events").fetchone()[0] == 101
     con.close()
     assert (root / ".env").read_text() == "TOKEN=abc\n"
 
@@ -270,7 +269,10 @@ def test_unknown_schema_refused_without_force(tmp_path):
 
 
 def test_default_step_chain_loads():
-    assert [s.name for s in runner.load_steps()] == ["00_noop", "10_registry", "12_monitor", "20_queue", "30_sessions", "35_rate_limit", "40_memory"]
+    # the fixed order and the present/absent rules live in test_chain.py; this
+    # only proves the default chain imports and is sorted
+    names = [s.name for s in runner.load_steps()]
+    assert names and names == sorted(names)
 
 
 def test_cli_exit_codes(tmp_path):

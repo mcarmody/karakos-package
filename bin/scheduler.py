@@ -72,19 +72,6 @@ def run_heartbeat(agent: str):
     except subprocess.CalledProcessError as e:
         log.error(f"Heartbeat failed for {agent}: {e.stderr}")
 
-def run_memory_maintenance():
-    """Run memory consolidation"""
-    log.info("Running memory maintenance")
-    try:
-        subprocess.run(
-            ["python3", f"{WORKSPACE_ROOT}/bin/memory-maintenance.py"],
-            check=True,
-            capture_output=True,
-            text=True
-        )
-    except subprocess.CalledProcessError as e:
-        log.error(f"Memory maintenance failed: {e.stderr}")
-
 def run_health_monitor():
     """Run health monitor"""
     log.info("Running health monitor")

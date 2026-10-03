@@ -179,6 +179,11 @@ except:
 " 2>/dev/null || true
 fi
 
+# Queue-owned run (spec 3.3): the dispatcher notifies the requester and owns the row.
+if [[ -n "${KARAKOS_QUEUE_RUN:-}" ]]; then
+    exit $EXIT_CODE
+fi
+
 # Poke back requester
 if [[ -n "${REQUESTER:-}" ]]; then
     "$WORKSPACE_ROOT/bin/poke.sh" --agent "$REQUESTER" --source "$REVIEWER_AGENT" \

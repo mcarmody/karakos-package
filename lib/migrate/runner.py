@@ -1,6 +1,7 @@
 """Migrator core: detect, backup, run applicable steps, verify, stamp last."""
 import importlib
 import logging
+import time
 import pkgutil
 import re
 from dataclasses import dataclass, field
@@ -9,7 +10,7 @@ from typing import Callable, List, Optional
 
 from lib.migrate import (EXIT_OK, EXIT_REFUSED, EXIT_STEP_FAILED, SCHEMA_VERSION)
 from lib.migrate import backup as backup_mod
-from lib.migrate import guard
+from lib.migrate import fork, guard
 from lib.migrate.detect import Detected, detect_version
 
 
@@ -24,6 +25,10 @@ class Context:
     parity_queries: int = 50
     # report section -> lines; written to migration-reports/migration-report.md
     report: dict = field(default_factory=dict)
+    # 05_layout inputs: copy logs/inbox/data from an old checkout mounted here, or
+    # keep the old host path bind-mounted (HOST_DIR as the host sees it)
+    import_from: Optional[Path] = None
+    keep_bind: Optional[str] = None
 
 
 @dataclass
@@ -108,20 +113,61 @@ def unreferenced_env_report(config_dir) -> List[str]:
             + [f"  - {n}" for n in missing])
 
 
+MARKER = ".migration-in-progress"
+# An interrupted run is resumed by restoring its backup only while the marker is
+# fresh. Older than this, the install may have been run (restored by hand, or a
+# 1.x image started on it) and an automatic restore would discard that work.
+MARKER_MAX_AGE_S = 86400
+
+
+def clear_marker(root) -> None:
+    (Path(root) / MARKER).unlink(missing_ok=True)
+
+
+def _recover_interrupted(root: Path, data_dir: Path, config_dir: Path, out) -> bool:
+    """A run that was killed (or failed) after its backup left a marker and no
+    stamp: put the backup back so this run starts from the original, never from
+    half-state. False when the restore itself fails."""
+    marker = root / MARKER
+    if not marker.is_file():
+        return True
+    prev = Path(marker.read_text().strip())
+    age = time.time() - marker.stat().st_mtime
+    if age > MARKER_MAX_AGE_S:
+        out(f"a previous run did not finish {age / 3600:.0f} h ago (backup {prev}).")
+        out("not restoring it automatically: the install may have changed since.")
+        out(f"to start from that backup: karakos migrate --restore {prev}")
+        out(f"to keep the current files instead: delete {marker} and run again")
+        return False
+    out(f"previous run did not finish; restoring {prev} first")
+    try:
+        backup_mod.restore(prev, data_dir=data_dir, config_dir=config_dir)
+    except backup_mod.BackupError as e:
+        out(f"cannot restore {prev}: {e}")
+        return False
+    marker.unlink(missing_ok=True)
+    return True
+
+
 def run(data_dir, config_dir, backup_root=None, steps=None, dry_run=False,
-        force=False, parity_queries=50, out=print) -> int:
+        force=False, parity_queries=50, out=print, import_from=None,
+        keep_bind=None, report_to=None) -> int:
     data_dir, config_dir = Path(data_dir), Path(config_dir)
     steps = load_steps() if steps is None else steps
     log = logging.getLogger("karakos.migrate")
-    detected = detect_version(data_dir, config_dir)
-    out(f"detected: {detected.version} ({detected.layout})")
-    for e in detected.evidence:
-        out(f"  - {e}")
+    root = Path(backup_root) if backup_root else data_dir.parent / "backups"
 
     stamp = guard.read_stamp(data_dir)
     if stamp and stamp["schema"] >= SCHEMA_VERSION:
         out(f"already at schema {stamp['schema']}; nothing to do")
         return EXIT_OK
+    if not dry_run and not _recover_interrupted(root, data_dir, config_dir, out):
+        return EXIT_STEP_FAILED
+
+    detected = detect_version(data_dir, config_dir)
+    out(f"detected: {detected.version} ({detected.layout})")
+    for e in detected.evidence:
+        out(f"  - {e}")
 
     if detected.version == "unknown" and any(data_dir.glob("*")):
         for line in unknown_report(detected):
@@ -134,10 +180,12 @@ def run(data_dir, config_dir, backup_root=None, steps=None, dry_run=False,
             return EXIT_OK
 
     ctx = Context(data_dir, config_dir, None, detected, log, force=force,
-                  parity_queries=parity_queries)
+                  parity_queries=parity_queries,
+                  import_from=Path(import_from) if import_from else None,
+                  keep_bind=keep_bind)
     plan = [s for s in steps if s.detect(ctx)]
     out("plan: " + (", ".join(s.name for s in plan) or "no data steps") + ", stamp")
-    left_behind = []
+    left_behind = fork.check(data_dir, config_dir)
     for s in plan:
         if s.preflight:
             left_behind += s.preflight(ctx)
@@ -145,13 +193,6 @@ def run(data_dir, config_dir, backup_root=None, steps=None, dry_run=False,
         out("data this migration does not recognise:")
         for line in left_behind:
             out(f"  - {line}")
-        if not force:
-            if dry_run:
-                out("dry-run: would refuse without --force")
-                return EXIT_OK
-            out("refusing: unrecognised data (use --force to proceed; it stays only "
-                "in the retained original files)")
-            return EXIT_REFUSED
         ctx.report["Left behind"] = list(left_behind)
     if dry_run:
         for s in plan:
@@ -160,16 +201,28 @@ def run(data_dir, config_dir, backup_root=None, steps=None, dry_run=False,
                     out(line)
         for line in unreferenced_env_report(config_dir):
             out(line)
+        out("memory has no downgrade: the backup is the only way back "
+            "(karakos migrate --restore <backup-dir>)")
+        if left_behind and not force:
+            out("dry-run: would refuse without --force (exit 3)")
+        if report_to:
+            _write_report(ctx, Path(report_to))
         out("dry-run: nothing written")
         return EXIT_OK
+    if left_behind and not force:
+        out("refusing: unrecognised data (use --force to proceed; it stays only "
+            "in the retained original files, and migration-report.md lists it)")
+        return EXIT_REFUSED
 
-    root = Path(backup_root) if backup_root else data_dir.parent / "backups"
     try:
         ctx.backup_dir = backup_mod.backup(data_dir, config_dir, root)
     except backup_mod.BackupError as e:
         out(f"{e}; nothing was changed")
         return EXIT_STEP_FAILED
     out(f"backup: {ctx.backup_dir}")
+    # written right after the backup: a killed process runs no handler, so the
+    # next start finds this and restores before doing anything else
+    (root / MARKER).write_text(str(ctx.backup_dir))
 
     for s in plan:
         try:
@@ -180,23 +233,26 @@ def run(data_dir, config_dir, backup_root=None, steps=None, dry_run=False,
             out(f"step {s.name} FAILED: {e}")
             out(f"data is NOT stamped. backup: {ctx.backup_dir}")
             out(f"restore with: python3 -m lib.migrate --to-backup {ctx.backup_dir}")
+            out("the next run restores this backup first, then starts again")
             return EXIT_STEP_FAILED
 
     _write_report(ctx)
     guard.write_stamp(data_dir, migrated_from=_from_version(detected))
+    (root / MARKER).unlink(missing_ok=True)
     out(f"migrated to schema {SCHEMA_VERSION}")
     return EXIT_OK
 
 
-def _write_report(ctx: Context) -> None:
+def _write_report(ctx: Context, path: Optional[Path] = None) -> None:
     if not ctx.report:
         return
     out = ["# Migration report", ""]
     for section, lines in ctx.report.items():
         out += [f"## {section}", ""] + list(lines) + [""]
-    d = Path(ctx.data_dir) / "migration-reports"
-    d.mkdir(parents=True, exist_ok=True)
-    (d / "migration-report.md").write_text("\n".join(out))
+    if path is None:
+        path = Path(ctx.data_dir) / "migration-reports" / "migration-report.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(out))
 
 
 def _from_version(d: Detected):

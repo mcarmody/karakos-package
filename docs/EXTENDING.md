@@ -397,7 +397,8 @@ want to edit:
 | `MEMORY_SCORE_TIMEOUT` / `MEMORY_SCORE_RETRY_TIMEOUT` | Haiku scoring call timeout, first attempt and retry; default 20s / 60s |
 | `MESSAGE_RETENTION_DAYS` | JSONL log retention |
 | `TOOL_AUDIT_RETENTION_DAYS` | Tool-call audit retention |
-| `KARAKOS_RECALL_SOURCE` / `KARAKOS_RECALL_TIMEOUT_S` | Recall injection, below |
+| `KARAKOS_RECALL_SOURCE` / `KARAKOS_RECALL_TIMEOUT_S` | Recall injection override and time bound, below |
+| `KARAKOS_RECALL_LIMIT` / `KARAKOS_RECALL_MAX_CHARS` / `KARAKOS_RECALL_HOOK_MODE` | Graph recall block size (default 6 results / 2400 chars) and hook mode (`fast`, or `full` to try the model) |
 | `SCHEDULER_TICK_SECONDS` | Scheduler loop period, default 15 |
 | `ONESHOT_STALE_AFTER_SECONDS` | How late a missed one-off may fire, default 24h |
 
@@ -437,24 +438,35 @@ CLI.
 
 ### Recall re-injection (`inject-recall.py`)
 
-Without this hook, everything an agent knows enters once, at spawn, via
-`--append-system-prompt`, and a long-running session answers every question
-from whatever was true when it started. `inject-recall.py` re-reads a
-recall source on every `UserPromptSubmit` and folds it into the turn via
-Claude Code's `hookSpecificOutput.additionalContext`.
+Without this hook, a long-running session answers every question from
+whatever was true when it started. `inject-recall.py` runs on every
+`UserPromptSubmit` and folds a recall block into the turn via Claude Code's
+`hookSpecificOutput.additionalContext`. It is the only per-prompt recall path.
 
-The package ships no memory store of its own — the recall source is a
-documented, swappable interface, resolved from `KARAKOS_RECALL_SOURCE`
-(default `$WORKSPACE_ROOT/config/recall-source`):
+**Default source: the knowledge graph.** With no override, the hook queries
+`data/memory/graph.db` with the prompt text and renders up to
+`KARAKOS_RECALL_LIMIT` (default 6) `- [kind] subject: text` lines under
+`[ACTIVE RECALL]`, capped at `KARAKOS_RECALL_MAX_CHARS` (default 2400). An
+uninitialised or unreadable graph, any error, or a timeout
+(`KARAKOS_RECALL_TIMEOUT_S`, default 10s) yields no block and never blocks the
+turn. The hook is a fresh process per prompt, so it runs in **fast mode** (no
+embedding model; keyword, name and importance signals). Set
+`KARAKOS_RECALL_HOOK_MODE=full` to try the model within a 6 s budget, falling
+back to fast.
 
-- **Path does not exist** — no-op. Not an error; a fresh install with no
-  recall source configured behaves exactly as before this hook existed.
+**Operator override.** If `KARAKOS_RECALL_SOURCE` is set, or
+`$WORKSPACE_ROOT/config/recall-source` exists, that source is used *instead of*
+the graph, never alongside it:
+
+- **Path does not exist** — no-op, not an error.
 - **Path is executable** — run with the pending user prompt text on stdin;
   its stdout becomes the recall block. A non-zero exit, a crash, or a
-  timeout (`KARAKOS_RECALL_TIMEOUT_S`, default 10s) are all treated as "no
-  recall available," never as an error that blocks the turn.
+  timeout are all treated as "no recall available."
 - **Path is a plain file** — read verbatim, every turn, as a static recall
   block (e.g. a hand-maintained facts file).
+
+Facts also load once per spawn (top graph facts by importance, own header),
+because automated turns skip this hook; see ARCHITECTURE.md, "Memory".
 
 Automated traffic — system pokes, heartbeats, and task-complete
 notifications sent through `bin/poke.sh` (always `is_bot=1`) — skips

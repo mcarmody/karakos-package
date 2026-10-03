@@ -74,6 +74,12 @@ def backup(data_dir, config_dir, dest) -> Path:
                     files.append((f"{label}/{p.relative_to(root).as_posix()}", p))
         if env:
             files.append((".env", env))
+        dirs = []
+        for label, root in roots:
+            for p in sorted(root.rglob("*")):
+                if p.is_dir() and dest not in p.parents and p != dest \
+                        and out not in p.parents and p != out:
+                    dirs.append(f"{label}/{p.relative_to(root).as_posix()}")
         entries = []
         for rel, src in files:
             target = out / "files" / rel
@@ -84,7 +90,7 @@ def backup(data_dir, config_dir, dest) -> Path:
         if env:
             roots_map[".env"] = str(env)
         (out / MANIFEST).write_text(json.dumps(
-            {"created": ts, "roots": roots_map, "files": entries}, indent=1))
+            {"created": ts, "roots": roots_map, "files": entries, "dirs": dirs}, indent=1))
     except Exception as e:
         shutil.rmtree(out, ignore_errors=True)
         raise BackupError(f"backup failed: {e}") from e
@@ -107,7 +113,8 @@ def verify(backup_dir) -> dict:
 def restore(backup_dir, data_dir=None, config_dir=None) -> None:
     """Verify the manifest, then put every file back. Roots default to where
     they came from. Files are overwritten; stale -wal/-shm are removed so the
-    restored DB is not replayed against old journal state."""
+    restored DB is not replayed against old journal state; files under the
+    restored roots that the manifest does not list are removed."""
     backup_dir = Path(backup_dir)
     m = verify(backup_dir)
     roots = {k: Path(v) for k, v in m["roots"].items()}
@@ -115,13 +122,41 @@ def restore(backup_dir, data_dir=None, config_dir=None) -> None:
         roots["data"] = Path(data_dir)
     if config_dir:
         roots["config"] = Path(config_dir)
+    kept = set()
+    for d in m.get("dirs", []):
+        label, _, rest = d.partition("/")
+        if label in roots:
+            (roots[label] / rest).mkdir(parents=True, exist_ok=True)
+            kept.add(roots[label] / rest)
     for e in m["files"]:
         label, _, rest = e["path"].partition("/")
         dst = roots[".env"] if e["path"] == ".env" else roots[label] / rest
+        kept.add(dst)
         if dst.suffix in _DB_SUFFIXES:
             for sfx in _SKIP_SUFFIXES:
                 Path(str(dst) + sfx).unlink(missing_ok=True)
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(backup_dir / "files" / e["path"], dst)
+    _prune(m, roots, kept, backup_dir)
     # a restore returns the data dir to its pre-migration state: no stamp
     (roots["data"] / ".schema-version").unlink(missing_ok=True)
+
+
+def _prune(manifest, roots, kept, backup_dir: Path) -> None:
+    """Remove files a failed or partial run created under the restored roots
+    (agents.yaml, graph.db, *.pre-2.0 ...), so the tree equals the manifest.
+    The backup directory and its parent (the backups root) are never touched."""
+    protect = {backup_dir.resolve(), backup_dir.resolve().parent}
+    for label in ("data", "config", "agents"):
+        root = roots.get(label)
+        if root is None or not root.is_dir():
+            continue
+        for p in sorted(root.rglob("*"), reverse=True):
+            rp = p.resolve()
+            if any(rp == q or q in rp.parents for q in protect):
+                continue
+            if p.is_file() or p.is_symlink():
+                if p not in kept:
+                    p.unlink()
+            elif p.is_dir() and p not in kept and not any(p.iterdir()):
+                p.rmdir()
