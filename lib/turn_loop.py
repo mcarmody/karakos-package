@@ -986,19 +986,23 @@ async def _settle_next(state: ServerState, shard: str, last: Optional[TurnBatch]
 
 
 async def _settle_loop(state: ServerState, shard: str, last: Optional[TurnBatch],
-                       ready: bool = False) -> None:
-    """Read follow-on and self-started turns until nothing more is pending."""
+                       ready: bool = False) -> list:
+    """Read follow-on and self-started turns until nothing more is pending.
+    Returns the hook followups those turns produced (run after the lock is
+    released, like the first turn's)."""
+    followups: list = []
     while True:
         nxt = await settle(state, shard, last, ready=ready)
         ready = False
         if nxt is None:
-            return
+            return followups
         await state.hooks.fire("on_turn_start", shard, nxt)
         result = await run_turn(state, shard, nxt, write=False)
         if nxt.timed_out:
             await _bounce(state, shard)
-            return
+            return followups
         await finish_turn(state, shard, result)
+        followups.extend(result.followups)
         last = nxt
 
 
@@ -1013,23 +1017,22 @@ async def _bounce(state: ServerState, shard: str) -> None:
     asyncio.create_task(drain_shard(state, shard))
 
 
-async def _drain_stale_self_turn(state: ServerState, shard: str) -> None:
+async def _drain_stale_self_turn(state: ServerState, shard: str) -> list:
     """A self-started turn that began after the shard went IDLE is read before
     anything is written, so its events cannot leak into the next reply."""
     if not state.bg_seen.pop(shard, False) or not steering_on(state, shard):
-        return
+        return []
     proc = state.agent_processes.get(shard)
     if not proc or not proc.stdout or getattr(proc, "returncode", None) is not None:
-        return
+        return []
     while True:
         line = await _next_line(state, shard, proc, 0.01)
         if not line:
-            return
+            return []
         state.write_stream_log(shard, line)
         if _is_init(line):
             _unread(state, shard, line)
-            await _settle_loop(state, shard, None, ready=True)
-            return
+            return await _settle_loop(state, shard, None, ready=True)
 
 
 # =============================================================================
@@ -1276,6 +1279,7 @@ async def drain_shard(state: ServerState, shard: str):
         return
 
     result = None
+    extra_followups: list = []
     async with lock:
         if state.agent_states.get(shard) != "IDLE":
             return
@@ -1299,29 +1303,28 @@ async def drain_shard(state: ServerState, shard: str):
                 # The process is gone: the respawn watcher brings it back and
                 # redrains. Claiming now would write into a dead pipe.
                 return
-            await _drain_stale_self_turn(state, shard)
+            extra_followups.extend(await _drain_stale_self_turn(state, shard))
             await _coalesce(state, shard)
 
         batch = await claim_next(state, shard)
         if batch is None:
             batch = await steal_next(state, shard)
-        if batch is None:
-            return
-        state.enqueued_at.pop(shard, None)
-        if batch.origin == "queue" and _stealing_on(state, shard):
-            # Backlog behind this (possibly long) turn: an idle sibling may take it.
-            asyncio.create_task(maybe_steal_wake(state, shard, busy=shard))
+        if batch is not None:
+            state.enqueued_at.pop(shard, None)
+            if batch.origin == "queue" and _stealing_on(state, shard):
+                # Backlog behind this (possibly long) turn: an idle sibling may take it.
+                asyncio.create_task(maybe_steal_wake(state, shard, busy=shard))
 
-        await state.hooks.fire("on_turn_start", shard, batch)
-        result = await run_turn(state, shard, batch)
-        await finish_turn(state, shard, result)
-        # The CLI may have more of this process's work to report (lines it
-        # queued after the last tool boundary, a self-started turn).
-        await _settle_loop(state, shard, batch)
+            await state.hooks.fire("on_turn_start", shard, batch)
+            result = await run_turn(state, shard, batch)
+            await finish_turn(state, shard, result)
+            # The CLI may have more of this process's work to report (lines it
+            # queued after the last tool boundary, a self-started turn).
+            extra_followups.extend(await _settle_loop(state, shard, batch))
 
     # Lock released: hook followups (e.g. 2.6's reset) may take it themselves.
-    if result is not None:
-        for fn in list(result.followups):
+    if result is not None or extra_followups:
+        for fn in (list(result.followups) if result is not None else []) + extra_followups:
             try:
                 value = fn()
                 if inspect.isawaitable(value):

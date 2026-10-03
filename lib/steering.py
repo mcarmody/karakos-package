@@ -23,8 +23,8 @@ KEYS = tuple(DEFAULTS)
 # claimed first by claim_batch.
 INTERRUPT_PRIORITY = 100
 
-# The channel an internal context-handoff batch runs in (step 2.6): never
-# steered into.
+# The `channel` of the server's own handoff and compact rows (step 2.6): such a
+# turn is never steered into, and such a row is never steered.
 HANDOFF_CHANNEL = "handoff"
 
 PRIMARY = "primary"   # the line that opens a turn
@@ -150,9 +150,11 @@ def steerable(state, shard, row) -> bool:
     # into a reply addressed to another shard); nor an internal handoff turn.
     if getattr(batch, "call_id", None) or any(_get(r, "call_id") for r in batch.rows):
         return False
-    if batch.channel_id == HANDOFF_CHANNEL:
+    if batch.channel_id == HANDOFF_CHANNEL or any(
+            _get(r, "channel") == HANDOFF_CHANNEL for r in batch.rows):
         return False
-    if _get(row, "call_id") or _get(row, "reply_to_agent"):
+    if _get(row, "call_id") or _get(row, "reply_to_agent") \
+            or _get(row, "channel") == HANDOFF_CHANNEL:
         return False
     if (_get(row, "priority", 0) or 0) != 0:
         return False

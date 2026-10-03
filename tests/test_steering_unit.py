@@ -160,6 +160,15 @@ def test_steerable_refuses_call_batch_by_row_and_handoff():
     assert not steering.steerable(st, "a", row(channel_id="handoff"))
 
 
+def test_steerable_refuses_handoff_batch_and_row():
+    # 2.6's internal rows have channel "handoff" (their channel_id is "0").
+    st = mkstate(batch=turn_loop.TurnBatch(
+        shard="a", rows=[{"channel": "handoff", "channel_id": "0", "call_id": None}],
+        message_ids=["m"], channel_id="0", content="x", phase="streaming"))
+    assert not steering.steerable(st, "a", row(channel_id="0"))
+    assert not steering.steerable(mkstate(), "a", row(channel="handoff"))
+
+
 def test_steerable_allowance():
     st = mkstate({"max_lines_per_turn": 2})
     st.active_turns["a"].steered_count = 1
@@ -265,12 +274,12 @@ def ags(tmp_path):
 
 
 async def add(db, name, agent="a", channel_id="1", call_id=None, reply_to=None,
-              priority=0, expires=None):
+              priority=0, expires=None, channel="c"):
     await db.execute(
         "INSERT INTO message_queue (agent, channel, channel_id, author, content, message_id,"
         " priority, call_id, reply_to_agent, expires_at)"
-        " VALUES (?, 'c', ?, 'u', 'x', ?, ?, ?, ?, ?)",
-        (agent, channel_id, name, priority, call_id, reply_to, expires))
+        " VALUES (?, ?, ?, 'u', 'x', ?, ?, ?, ?, ?)",
+        (agent, channel, channel_id, name, priority, call_id, reply_to, expires))
     await db.commit()
 
 
@@ -293,6 +302,7 @@ def test_claim_steerable_predicates(ags):
         await add(db, "prio", priority=100)
         await add(db, "other-chan", channel_id="2")
         await add(db, "other-shard", agent="a-2")
+        await add(db, "internal", channel="handoff")
         await add(db, "expired", expires="2000-01-01T00:00:00Z")
         rows = await msgqueue.claim_steerable(db, "a", "1", 10)
         assert [r["message_id"] for r in rows] == ["ok1", "ok2"]
@@ -300,7 +310,7 @@ def test_claim_steerable_predicates(ags):
         left = {r["message_id"]: r["processed"] for r in
                 await db.execute_fetchall("SELECT message_id, processed FROM message_queue")}
         assert left["call"] == left["reply"] == left["prio"] == left["other-chan"] == 0
-        assert left["other-shard"] == 0
+        assert left["other-shard"] == left["internal"] == 0
         assert left["expired"] == 4   # skipped by expire, never claimed
     with_db(ags, body)
 

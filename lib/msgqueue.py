@@ -124,6 +124,7 @@ async def claim_steerable(db, shard, channel_id, limit, now=None) -> list:
         " processing_started_at = CURRENT_TIMESTAMP"
         " WHERE id IN (SELECT id FROM message_queue WHERE agent = ? AND processed = ?"
         "  AND call_id IS NULL AND reply_to_agent IS NULL AND priority = 0"
+        f" AND channel != '{INTERNAL_CHANNEL}'"
         f" AND channel_id = ? ORDER BY {_ORDER} LIMIT ?)"
         " AND processed = ? RETURNING *",
         (STATUS_IN_PROGRESS, shard, shard, STATUS_QUEUED, str(channel_id),
