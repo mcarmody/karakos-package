@@ -128,3 +128,27 @@ def test_no_single_quote_interpolation_in_python_blocks():
     assert "python3 -c \"" not in content, (
         "Found `python3 -c \"...\"` — switch to `python3 - <<'PY'` with env-passed values."
     )
+
+
+def _with_templates(workspace):
+    t = workspace / "agents" / "templates"
+    t.joinpath("onboarding.md").write_text("ONBOARD {{AGENT_NAME}}\n")
+    for name in ("builder", "reviewer", "relay", "monitor"):
+        t.joinpath(f"{name}.md").write_text("# {{AGENT_NAME}} " + name + "\n")
+
+
+def test_primary_gets_onboarding_and_raw_prompt(workspace):
+    _with_templates(workspace)
+    result = _run(workspace, "oracle", "--template", "primary")
+    assert result.returncode == 0, result.stderr
+    assert (workspace / "agents" / "oracle" / "onboarding.md").is_file()
+    assert "{{AGENT_NAME}}" in (workspace / "agents" / "oracle" / "SYSTEM_PROMPT.md").read_text()
+
+
+@pytest.mark.parametrize("template", ["builder", "reviewer", "relay", "monitor"])
+def test_other_templates_get_no_onboarding(workspace, template):
+    _with_templates(workspace)
+    result = _run(workspace, "other", "--template", template)
+    assert result.returncode == 0, result.stderr
+    assert not (workspace / "agents" / "other" / "onboarding.md").exists()
+    assert "{{AGENT_NAME}}" in (workspace / "agents" / "other" / "SYSTEM_PROMPT.md").read_text()

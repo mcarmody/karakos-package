@@ -187,3 +187,46 @@ def harness(tmp_workspace):
                        shards=shards)
 
     return make
+
+
+@pytest.fixture
+def real_template_workspace(tmp_workspace):
+    """tmp_workspace with the shipped templates and a registry written by
+    `registry.py init` (primary "Jarvis", id jarvis; monitor relay), so tests
+    exercise the real prompt. The registry also carries model/env overrides so
+    the harness's fake `claude` works; use `Harness(ws, agents=["jarvis"],
+    write_config=False)`."""
+    import shutil
+    import yaml
+
+    (tmp_workspace / "config" / "agents.yaml").unlink()
+    shutil.rmtree(tmp_workspace / "agents")
+    shutil.copytree(PACKAGE_ROOT / "agents", tmp_workspace / "agents",
+                    ignore=shutil.ignore_patterns("mnemosyne", "*.generated.md"))
+    sys.path.insert(0, str(PACKAGE_ROOT / "lib"))
+    try:
+        import registry
+    finally:
+        sys.path.pop(0)
+    registry.init_registry(tmp_workspace, "jarvis", "Jarvis", channels=["general"])
+    for sub in ("persona", "journal", "inbox"):
+        (tmp_workspace / "agents" / "jarvis" / sub).mkdir(parents=True, exist_ok=True)
+    shutil.copy(PACKAGE_ROOT / "agents" / "templates" / "primary.md",
+                tmp_workspace / "agents" / "jarvis" / "SYSTEM_PROMPT.md")
+    shutil.copy(PACKAGE_ROOT / "agents" / "templates" / "onboarding.md",
+                tmp_workspace / "agents" / "jarvis" / "onboarding.md")
+    (tmp_workspace / "agents" / "relay").mkdir(exist_ok=True)
+    shutil.copy(PACKAGE_ROOT / "agents" / "templates" / "relay.md",
+                tmp_workspace / "agents" / "relay" / "SYSTEM_PROMPT.md")
+
+    # Harness knobs: fake model and the fake-claude env passthrough.
+    from harness import FAKE_ENV_KEYS
+    path = tmp_workspace / "config" / "agents.yaml"
+    doc = yaml.safe_load(path.read_text())
+    for body in doc["agents"].values():
+        body["model"] = "fake-model"
+        body["env"] = {k: "${%s}" % k for k in FAKE_ENV_KEYS}
+    path.write_text(yaml.safe_dump(doc, sort_keys=False))
+    (tmp_workspace / "config" / "claude-settings.json").write_text(
+        json.dumps({"permissions": {"allow": [], "deny": []}}))
+    return tmp_workspace

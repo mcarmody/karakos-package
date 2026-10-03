@@ -262,9 +262,10 @@ main() {
         PRIMARY_AGENT_NAME=$(get_state primary_agent_name)
         log "Primary agent: $PRIMARY_AGENT_NAME"
     fi
-    # The registry keys everything by id: lowercase letters, digits, hyphens.
-    PRIMARY_AGENT_NAME=$(printf '%s' "$PRIMARY_AGENT_NAME" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9\n-' '-' | sed 's/^[^a-z]*//' | cut -c1-32)
-    PRIMARY_AGENT_NAME="${PRIMARY_AGENT_NAME:-karakos}"
+    # Display name stays as typed (trimmed); the registry id is a slug of it
+    # (lowercase letters, digits, hyphens). lib/registry.py owns both rules.
+    PRIMARY_AGENT_NAME=$(printf '%s' "$PRIMARY_AGENT_NAME" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+    PRIMARY_AGENT_ID=$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import registry; print(registry.slugify_id(sys.argv[2]))' "${SCRIPT_DIR}/lib" "$PRIMARY_AGENT_NAME")
 
     # Step 4: Anthropic authentication
     echo
@@ -409,36 +410,15 @@ EOF
 
     chmod 600 "$ENV_FILE"
 
-    # Create agents.yaml (schema 2; see lib/registry.py)
-    cat > "$AGENTS_CONFIG" <<EOF
-version: 2
-agents:
-  ${PRIMARY_AGENT_NAME}:
-    name: ${PRIMARY_AGENT_NAME}
-    role: primary
-    model: sonnet
-    max_turns: 200
-    timeout: 10800
-    system_prompt: agents/${PRIMARY_AGENT_NAME}/SYSTEM_PROMPT.md
-    tool_streaming: true
-    stream_to_channel: true
-    discord:
-      token_env: DISCORD_BOT_TOKEN_PRIMARY
-      bot_id_env: DISCORD_BOT_ID_PRIMARY
-    shards:
-      - id: ${PRIMARY_AGENT_NAME}
-        channels: [general]
-  relay:
-    name: relay
-    role: monitor
-    model: haiku
-    max_turns: 10
-    timeout: 300
-    system_prompt: agents/relay/SYSTEM_PROMPT.md
-    tool_streaming: false
-    stream_to_channel: false
-    dashboard_chat: false
-EOF
+    # Create agents.yaml (schema 2) through the registry, so quoting is the YAML
+    # library's problem, not the shell's. Refuses an existing file.
+    if [ -f "$AGENTS_CONFIG" ]; then
+        warn "config/agents.yaml already exists; leaving it untouched"
+    else
+        python3 "${SCRIPT_DIR}/lib/registry.py" init --workspace "${SCRIPT_DIR}" \
+            --primary-id "${PRIMARY_AGENT_ID}" --primary-name "${PRIMARY_AGENT_NAME}" \
+            --channel general
+    fi
 
     # Create channels.json
     CHANNELS_JSON="{\"server_id\": \"$DISCORD_SERVER_ID\", \"channels\": {\"general\": {\"id\": \"$CHANNEL_GENERAL\"}, \"signals\": {\"id\": \"$CHANNEL_SIGNALS\"}"
@@ -453,33 +433,29 @@ EOF
 
     # Create .karakos/config.json
     mkdir -p .karakos
-    cat > "$KARAKOS_CONFIG" <<EOF
-{
-  "version": "1.0.0",
-  "system_name": "$SYSTEM_NAME",
-  "owner_name": "$OWNER_NAME",
-  "installed_at": "$(date -Iseconds)"
-}
-EOF
+    jq -n --arg system_name "$SYSTEM_NAME" --arg owner_name "$OWNER_NAME" \
+        --arg installed_at "$(date -Iseconds)" \
+        '{version: "1.0.0", system_name: $system_name, owner_name: $owner_name, installed_at: $installed_at}' \
+        > "$KARAKOS_CONFIG"
 
     # Generate agent directories and system prompts
     log "Creating agent directories..."
 
-    for agent in "${PRIMARY_AGENT_NAME}" "relay"; do
+    for agent in "${PRIMARY_AGENT_ID}" "relay"; do
         mkdir -p "agents/${agent}/persona"
         mkdir -p "agents/${agent}/inbox"
         mkdir -p "agents/${agent}/journal"
 
-        # Generate system prompt from template
-        if [ "$agent" = "${PRIMARY_AGENT_NAME}" ]; then
+        # Copy the template unsubstituted: placeholders are resolved at every
+        # spawn from the registry and channels.json (lib/prompt_compose.py).
+        if [ "$agent" = "${PRIMARY_AGENT_ID}" ]; then
             template="agents/templates/primary.md"
+            # First-boot onboarding: the primary only.
+            cp "agents/templates/onboarding.md" "agents/${agent}/onboarding.md"
         else
             template="agents/templates/${agent}.md"
         fi
-
-        # Simple variable substitution
-        sed "s/{{AGENT_NAME}}/${agent}/g; s/{{SYSTEM_NAME}}/${SYSTEM_NAME}/g; s/{{OWNER_NAME}}/${OWNER_NAME}/g" \
-            "$template" > "agents/${agent}/SYSTEM_PROMPT.md"
+        cp "$template" "agents/${agent}/SYSTEM_PROMPT.md"
     done
 
     # docker-compose.yml lives in config/ (shipped with the repo).

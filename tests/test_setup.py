@@ -165,3 +165,31 @@ class TestPythonSyntax:
         assert result.returncode == 0, (
             f"{script} has syntax errors:\n{result.stderr}"
         )
+
+
+class TestSetupPrimaryTemplate:
+    """Step 3.1: registry written by `registry.py init`, raw template copy, onboarding."""
+
+    @pytest.fixture(autouse=True)
+    def load_script(self):
+        self.content = SETUP_SCRIPT.read_text()
+
+    def test_no_agents_yaml_heredoc(self):
+        assert not re.search(r"cat\s*>\s*\"?\$AGENTS_CONFIG", self.content)
+        assert "system_prompt:" not in self.content
+
+    def test_calls_registry_init(self):
+        assert "registry.py" in self.content and " init " in self.content
+
+    def test_no_sed_over_templates(self):
+        assert not re.search(r"sed .*agents/templates", self.content)
+        assert not re.search(r"sed [^\n]*\{\{AGENT_NAME\}\}", self.content)
+
+    def test_onboarding_for_primary_only(self):
+        lines = [l for l in self.content.splitlines() if "onboarding.md" in l and not l.strip().startswith("#")]
+        assert len(lines) == 1 and "agents/${agent}/onboarding.md" in lines[0]
+        block = self.content[self.content.index('if [ "$agent" = "${PRIMARY_AGENT_ID}" ]'):]
+        assert block.index("onboarding.md") < block.index("else")
+
+    def test_display_name_not_lowercased(self):
+        assert "tr 'A-Z' 'a-z'" not in self.content

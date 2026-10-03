@@ -655,6 +655,15 @@ def load_onboarding_prompt(agent: str) -> str:
     identity. Substitutes a small set of placeholders so the file can be
     shared across agent renames.
     """
+    display_name = agent
+    try:
+        a = agent_registry.load_registry(WORKSPACE_ROOT).agent(agent)
+        display_name = a.name or agent
+        if a.role != "primary":
+            return ""
+    except Exception:
+        pass  # registry unavailable: gate on persona content only
+
     persona_dir = WORKSPACE_ROOT / "agents" / agent / "persona"
     if persona_dir.exists() and any(
         f.read_text().strip() for f in persona_dir.glob("*.md") if f.is_file()
@@ -665,9 +674,10 @@ def load_onboarding_prompt(agent: str) -> str:
     if not onboarding_path.exists():
         return ""
 
-    text = onboarding_path.read_text()
+    # Paths need the id; prose gets the display name.
+    text = onboarding_path.read_text().replace("agents/{{AGENT_NAME}}/", f"agents/{agent}/")
     substitutions = {
-        "{{AGENT_NAME}}": agent,
+        "{{AGENT_NAME}}": display_name,
         "{{OWNER_NAME}}": os.environ.get("OWNER_NAME", "User"),
         "{{SYSTEM_NAME}}": os.environ.get("SYSTEM_NAME", "karakos"),
     }
