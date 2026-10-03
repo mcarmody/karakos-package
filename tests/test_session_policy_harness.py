@@ -218,7 +218,8 @@ def test_an_ordinary_error_without_overflow_text_does_not_reset(harness):
             await h.wait_idle("a")
             return old
 
-    assert h.session_id("a") == run(scenario())
+    old = run(scenario())
+    assert h.session_id("a") == old
 
 
 def test_a_held_shard_resets_without_a_handoff(harness):
