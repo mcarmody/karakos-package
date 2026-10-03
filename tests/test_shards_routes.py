@@ -290,10 +290,10 @@ def test_no_schema_change_and_no_new_migrator_step(harness):
             pass
 
     run(scenario())
-    steps = sorted(p.name for p in (PACKAGE_ROOT / "lib" / "migrate" / "steps").glob("*.py"))
-    # 3.2b adds 12; 2.7 adds 35; 4.4 adds 40_memory and its helper. 2.1 itself adds no step
-    assert steps == ["00_noop.py", "10_registry.py", "12_monitor.py", "20_queue.py", "30_sessions.py",
-                     "35_rate_limit.py", "40_memory.py", "__init__.py", "_legacy_memory.py"]
+    # which step files exist moves with every migrator step; the fixed order and
+    # the "no unlisted step" rule are asserted in tests/migrate/test_chain.py
+    steps = sorted(p.name for p in (PACKAGE_ROOT / "lib" / "migrate" / "steps").glob("[0-9][0-9]_*.py"))
+    assert "35_rate_limit.py" in steps and "40_memory.py" in steps
     cols = {t: [r["name"] for r in h._query(f"PRAGMA table_info({t})")]
             for t in ("sessions", "message_queue", "cost_events")}
     assert "owner_agent" in cols["message_queue"]  # 1.2's column, not 2.1's
