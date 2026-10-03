@@ -490,3 +490,25 @@ def test_wrapper_restore_maps_to_to_backup(tmp_path):
     run = next(c for c in calls if " run " in c)
     assert "--to-backup /restore" in run
     assert "--backup-to /backups" in run      # so the restore clears the marker there
+
+
+def test_dry_run_says_logs_and_inbox_are_not_backed_up(tmp_path, fake_embedder):
+    root = extract("v1.3", tmp_path)
+    rc, lines = go(root, tmp_path / "backups", dry_run=True)
+    assert rc == 0, lines
+    assert any("logs/ and inbox/ are not in the backup" in l for l in lines)
+
+
+def test_no_step_writes_logs_or_inbox_and_backup_matches_the_claim(tmp_path, fake_embedder):
+    """The dry-run note is only true while a migration leaves logs/ and inbox/ alone."""
+    root = extract("v1.3", tmp_path)
+    (root / "logs").mkdir(exist_ok=True)
+    (root / "inbox").mkdir(exist_ok=True)
+    (root / "logs" / "a.log").write_text("keep")
+    (root / "inbox" / "b.md").write_text("keep")
+    before = {p: (root / p).read_bytes() for p in ("logs/a.log", "inbox/b.md")}
+    rc, lines = go(root, tmp_path / "backups")
+    assert rc == 0, lines
+    assert {p: (root / p).read_bytes() for p in before} == before
+    bk = next((tmp_path / "backups").glob("pre-2.0-*"))
+    assert not (bk / "files" / "logs").exists() and not (bk / "files" / "inbox").exists()
