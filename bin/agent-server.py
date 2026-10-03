@@ -36,6 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 # lib/ is a package root for lib.migrate (the schema-stamp guard).
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import ask_handler  # noqa: E402
+import msgqueue  # noqa: E402
 import registry as agent_registry  # noqa: E402
 import prompt_compose  # noqa: E402
 import tengwar  # noqa: E402
@@ -125,6 +126,12 @@ STATUS_IN_PROGRESS = 1
 STATUS_COMPLETE = 2
 STATUS_CRASHED = 3
 STATUS_SKIPPED = 4
+
+# Columns the 20_queue migrator step adds (lib/migrate/steps/20_queue.py).
+QUEUE_V2_COLUMNS = (
+    "call_id", "reply_to_agent", "priority", "expires_at", "depth",
+    "partial_response", "restart_count", "claimed_by", "owner_agent",
+)
 
 # Wall-clock start of this process, for /health's uptime_seconds. The
 # dashboard's "Uptime" card read that field before anything served it and
@@ -253,7 +260,16 @@ async def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             processing_started_at TIMESTAMP,
             processed_at TIMESTAMP,
-            not_before INTEGER
+            not_before INTEGER,
+            call_id TEXT,
+            reply_to_agent TEXT,
+            priority INTEGER DEFAULT 0,
+            expires_at TEXT,
+            depth INTEGER DEFAULT 0,
+            partial_response TEXT,
+            restart_count INTEGER DEFAULT 0,
+            claimed_by TEXT,
+            owner_agent TEXT
         )
     """)
 
@@ -266,6 +282,23 @@ async def init_db():
         CREATE INDEX IF NOT EXISTS idx_queue_pending
         ON message_queue(processed) WHERE processed = 0
     """)
+
+    # Created after the columns they name. On an upgraded install the
+    # columns come from the 20_queue migrator step, never from boot.
+    async with db.execute("PRAGMA table_info(message_queue)") as cursor:
+        queue_cols = {row[1] for row in await cursor.fetchall()}
+    missing = [c for c in QUEUE_V2_COLUMNS if c not in queue_cols]
+    if missing:
+        await db.close()
+        raise SystemExit(
+            f"message_queue lacks schema-2.0 columns {missing}; run: karakos migrate")
+    await db.execute("""
+        CREATE INDEX IF NOT EXISTS idx_queue_claim
+        ON message_queue(agent, processed, priority DESC, created_at)
+    """)
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_queue_call ON message_queue(call_id)"
+    )
 
     # Sessions table
     await db.execute("""
@@ -1807,6 +1840,23 @@ async def write_streaming_response(message_ids: List[str], text: str) -> None:
         log.warning(f"streaming response write failed: {e}")
 
 
+async def write_partial_response(message_ids: List[str], text: str) -> None:
+    """Mirror streamed text into message_queue.partial_response (msgqueue.set_partial)."""
+    if not message_ids or db is None:
+        return
+    try:
+        placeholders = ",".join("?" * len(message_ids))
+        async with db.execute(
+            f"SELECT id FROM message_queue WHERE message_id IN ({placeholders})",
+            tuple(message_ids),
+        ) as cursor:
+            ids = [r["id"] for r in await cursor.fetchall()]
+        for row_id in ids:
+            await msgqueue.set_partial(db, row_id, text)
+    except Exception as e:
+        log.warning(f"partial response write failed: {e}")
+
+
 # agent -> {"fh": file object, "day": "YYYY-MM-DD", "bytes": int}. The handle
 # is kept open across turns: this runs once per stream event, and reopening
 # per line would put three syscalls on the hot path instead of one.
@@ -2045,6 +2095,8 @@ async def read_agent_response(
                 if got_text:
                     cleaned = THINKING_BLOCK_RE.sub("", final_text)
                     await write_streaming_response(msg_ids, cleaned)
+                    if config.get("partial_response"):   # off by default; 2.3 turns it on
+                        await write_partial_response(msg_ids, cleaned)
 
             elif event_type == "result":
                 # Extract metadata. Token counts live under `usage`,
@@ -2228,7 +2280,8 @@ async def hold_batch(agent, channel_id, message_ids, kind, until):
     await db.execute(
         f"""
         UPDATE message_queue
-        SET processed = ?, not_before = ?, processing_started_at = NULL
+        SET processed = ?, not_before = ?, processing_started_at = NULL,
+            claimed_by = NULL
         WHERE message_id IN ({','.join('?' * len(message_ids))})
         """,
         (STATUS_QUEUED, until, *message_ids),
@@ -2258,32 +2311,14 @@ async def process_agent_queue(agent: str):
             schedule_hold_wake(agent, held_until)
             return
 
-        # Get pending messages
-        async with db.execute(
-            """
-            SELECT * FROM message_queue
-            WHERE agent = ? AND processed = ?
-            ORDER BY created_at ASC
-            LIMIT 20
-            """,
-            (agent, STATUS_QUEUED)
-        ) as cursor:
-            messages = await cursor.fetchall()
+        # Claim the next batch: priority DESC, created_at, id; expired rows
+        # are skipped (and their callers told) inside claim_batch.
+        messages = await msgqueue.claim_batch(db, agent, 20)
 
         if not messages:
             return
 
-        # Mark as in progress
         message_ids = [msg["message_id"] for msg in messages]
-        await db.execute(
-            f"""
-            UPDATE message_queue
-            SET processed = ?, processing_started_at = CURRENT_TIMESTAMP
-            WHERE message_id IN ({','.join('?' * len(message_ids))})
-            """,
-            (STATUS_IN_PROGRESS, *message_ids)
-        )
-        await db.commit()
 
         # Format batch
         channel_id = messages[0]["channel_id"]
@@ -2554,6 +2589,7 @@ async def handle_message(request):
              int(mentions_agent), json.dumps(attachments) if attachments else None)
         )
         await db.commit()
+        msgqueue.notify(agent)
     except aiosqlite.IntegrityError:
         # A message_id we already queued: the deferred-message flusher (#88)
         # re-firing a payload whose first POST landed but whose response was
@@ -2787,9 +2823,11 @@ async def handle_agent_queue(request):
         return web.json_response({"error": "Unknown agent"}, status=404)
 
     async with db.execute(
-        "SELECT id, channel, author, content, created_at, processed"
+        "SELECT id, channel, author, content, created_at, processed,"
+        " call_id, reply_to_agent, priority, expires_at, depth,"
+        " partial_response, restart_count, claimed_by, owner_agent"
         " FROM message_queue WHERE agent = ? AND processed IN (?, ?)"
-        " ORDER BY created_at ASC, id ASC",
+        " ORDER BY priority DESC, created_at ASC, id ASC",
         (agent, STATUS_QUEUED, STATUS_IN_PROGRESS),
     ) as cursor:
         rows = await cursor.fetchall()
@@ -2809,6 +2847,9 @@ async def handle_agent_queue(request):
             "state": (
                 "processing" if row["processed"] == STATUS_IN_PROGRESS else "pending"
             ),
+            **{k: row[k] for k in (
+                "call_id", "reply_to_agent", "priority", "expires_at", "depth",
+                "partial_response", "restart_count", "claimed_by", "owner_agent")},
         })
 
     return web.json_response({"agent": agent, "messages": messages})
