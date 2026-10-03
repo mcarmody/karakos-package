@@ -2402,6 +2402,7 @@ async def handle_health(request):
             "session_id": agent_sessions.get(sp.id, "")[:8],
             # 0 = unknown.
             "context_tokens": ctx_by_shard.get(sp.id, 0),
+            "stolen_total": STATE.stolen_total.get(sp.id, 0),
         }
 
     for agent in dict.fromkeys(sp.agent for sp in specs):
@@ -2474,6 +2475,7 @@ async def handle_agents(request):
                 "channels": list(sp.channels),
                 "last_channel": agent_last_channel.get(sp.id),
                 "paused": _paused_entry(sp.id),
+                "stolen_total": STATE.stolen_total.get(sp.id, 0),
             })
         agents_list.append({
             "name": agent,

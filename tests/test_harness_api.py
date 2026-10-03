@@ -32,6 +32,7 @@ EMPTY = inspect.Parameter.empty
 def test_constructor():
     prefix("__init__", [("tmp_workspace", EMPTY), ("agents", ["a", "b"])])
     assert dict(params("__init__"))["shards"] is None
+    assert dict(params("__init__"))["work_stealing"] is None  # 2.4
 
 
 def test_send():
