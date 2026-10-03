@@ -269,13 +269,13 @@ async def reap_hive_rows(db, now=None, ttl=600) -> int:
     elif isinstance(now, (int, float)):
         now = datetime.fromtimestamp(now, tz=timezone.utc)
     cutoff = datetime.fromtimestamp(now.timestamp() - ttl, tz=timezone.utc)
-    rows = await db.execute_fetchall(
+    rows, _ = await write_commit(
+        db,
         "UPDATE message_queue SET processed = ?, response = 'stale',"
         " processed_at = CURRENT_TIMESTAMP"
         " WHERE processed = ? AND call_id IS NOT NULL AND reply_to_agent IS NULL"
         " AND created_at <= ? RETURNING id",
-        (STATUS_SKIPPED, STATUS_QUEUED, cutoff.strftime("%Y-%m-%d %H:%M:%S")))
-    await db.commit()
+        (STATUS_SKIPPED, STATUS_QUEUED, cutoff.strftime("%Y-%m-%d %H:%M:%S")), fetch=True)
     return len(rows)
 
 

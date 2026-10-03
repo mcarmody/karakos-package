@@ -1068,11 +1068,11 @@ async def respawn_watcher(shard: str, proc: asyncio.subprocess.Process):
         await hive_cancel_caller(shard)
         await turn_loop.release_pending(STATE, shard, "exit")
         try:
-            await db.execute(
+            await msgqueue.write_commit(
+                db,
                 "UPDATE message_queue SET processed = ? WHERE agent = ? AND processed = ?"
                 " AND call_id IS NOT NULL AND reply_to_agent IS NOT NULL",
                 (STATUS_CRASHED, shard, STATUS_IN_PROGRESS))
-            await db.commit()
         except Exception as e:
             log.warning(f"hive crash mark for {shard} failed: {e}")
 
@@ -1171,11 +1171,11 @@ async def flush_agent_queue(shard: str) -> int:
         pending = row["count"]
 
     if pending:
-        await db.execute(
+        await msgqueue.write_commit(
+            db,
             "UPDATE message_queue SET processed = ? WHERE agent = ? AND processed = ?",
             (STATUS_SKIPPED, shard, STATUS_QUEUED),
         )
-        await db.commit()
 
     log.info(f"Flushed {pending} queued message(s) for {label_of(shard)}")
     return pending
@@ -1202,14 +1202,14 @@ async def post_cost_update(agent: str, metadata: Dict):
     agent_last_cost[agent] = session_total
 
     # Store in database
-    await db.execute(
+    await msgqueue.write_commit(
+        db,
         """
         INSERT INTO cost_events (agent, cost_delta, session_total, input_tokens, output_tokens, duration_ms, session_id)
         VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
         (agent, cost_delta, session_total, input_tokens, output_tokens, duration_ms, session_id)
     )
-    await db.commit()
 
     # Post to Discord cost channel (if configured)
     cost_channel_id = channels_config.get("channels", {}).get("cost", {}).get("id")
@@ -1483,10 +1483,10 @@ async def record_rate_limit_event(agent: str, info, now=None) -> None:
         if resets_at is not None and prior and prior["alerted_for_resets_at"] == resets_at:
             continue  # already said so for this window
 
-        await db.execute(
+        await msgqueue.write_commit(
+            db,
             "UPDATE rate_limit_state SET alerted_for_resets_at = ?"
             " WHERE rate_limit_type = ?", (resets_at, u.type))
-        await db.commit()
 
         consumed = ("in the warning band" if progress is None
                     else f"{progress * 100:.0f}% through the window")
@@ -1966,11 +1966,11 @@ async def write_streaming_response(message_ids: List[str], text: str) -> None:
         return
     placeholders = ",".join("?" * len(message_ids))
     try:
-        await db.execute(
+        await msgqueue.write_commit(
+            db,
             f"UPDATE message_queue SET response = ? WHERE message_id IN ({placeholders})",
             (text, *message_ids),
         )
-        await db.commit()
     except Exception as e:
         log.warning(f"streaming response write failed: {e}")
 
