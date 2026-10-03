@@ -488,6 +488,13 @@ EOF
     # Generate the hooks section of config/claude-settings.json from config/hooks.json.
     python3 "${SCRIPT_DIR}/bin/hooks-sync.py" "${SCRIPT_DIR}" || warn "hooks-sync failed; safety hooks not wired"
 
+    # Fresh install only: create the graph memory schema (and stamp the empty
+    # data dir first). An existing data dir is left alone; the migrator owns it.
+    if [ ! -e "${SCRIPT_DIR}/data" ] || [ -z "$(ls -A "${SCRIPT_DIR}/data" 2>/dev/null)" ]; then
+        (cd "${SCRIPT_DIR}" && python3 -m lib.graph init "${SCRIPT_DIR}/data") \
+            || warn "graph init failed; run: python3 -m lib.graph init"
+    fi
+
     # Update .gitignore
     if ! grep -q "config/.env" .gitignore 2>/dev/null; then
         echo "config/.env" >> .gitignore
