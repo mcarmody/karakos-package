@@ -357,9 +357,10 @@ def test_release_gate_missing_secrets_behave_as_stated():
         assert "if" not in gate[name], name
     for wf in WORKFLOWS.glob("*.yml"):
         assert "DASHBOARD_FETCH_TOKEN" not in wf.read_text(), wf.name
-    # CLAUDE_CODE_OAUTH_TOKEN absent: skip on a PR, fail otherwise
+    # CLAUDE_CODE_OAUTH_TOKEN absent: the real-CLI smoke skips with a notice on every event
+    # (it is run by hand before a release); it never fails the gate for a missing secret.
     real = json.dumps(gate["real-cli-smoke"])
-    assert "= pull_request" in real and "exit 1" in real
+    assert "run=false" in real and "::notice::" in real and "exit 1" not in real
     text = (WORKFLOWS / "release-gate.yml").read_text()
     assert "KARAKOS_REQUIRE_REAL_CLI" in text and "KARAKOS_REQUIRE_DOCKER" in text
 
