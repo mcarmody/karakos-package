@@ -149,6 +149,7 @@ class TurnResult:
     suppress_post: bool = False
     followups: List[Callable] = field(default_factory=list)
     raw_response_text: str = ""   # before an errored turn's text is replaced (2.6)
+    requeued: bool = False        # the primary write failed; rows went back to the queue
 
 
 class ServerState:
@@ -1121,6 +1122,33 @@ async def _drain_stale_self_turn(state: ServerState, shard: str) -> list:
 # One turn
 # =============================================================================
 
+PROCESS_WAIT_S = 15.0   # how long a write waits for a pending respawn
+
+
+def _proc_alive(state: ServerState, shard: str) -> bool:
+    proc = state.agent_processes.get(shard)
+    return bool(proc and proc.stdin and getattr(proc, "returncode", None) is None)
+
+
+async def wait_for_process(state: ServerState, shard: str,
+                           timeout: float = PROCESS_WAIT_S) -> bool:
+    """Wait (bounded) for the shard to have a live subprocess. A drain can run
+    between an interrupt's kill and its respawn; writing then hits no pipe."""
+    deadline = time.monotonic() + timeout
+    while not _proc_alive(state, shard):
+        if time.monotonic() >= deadline:
+            return False
+        await asyncio.sleep(0.05)
+    return True
+
+
+async def _redrain_when_alive(state: ServerState, shard: str) -> None:
+    """After a failed primary write: once the respawn lands, drain again. Bounded,
+    so a shard that is deliberately down does not spin."""
+    if await wait_for_process(state, shard):
+        await drain_shard(state, shard)
+
+
 async def run_turn(state: ServerState, shard: str, batch: TurnBatch,
                    write: bool = True) -> TurnResult:
     """Run one claimed batch through the subprocess and read its reply. With
@@ -1152,6 +1180,9 @@ async def run_turn(state: ServerState, shard: str, batch: TurnBatch,
         # Start typing indicator
         await state.start_typing(shard, channel_id)
 
+        write_failed = False
+        if write:
+            await wait_for_process(state, shard)
         if not write:
             batch.phase = "streaming"
         elif steering_on(state, shard):
@@ -1167,18 +1198,23 @@ async def run_turn(state: ServerState, shard: str, batch: TurnBatch,
                 ok = await state.send_to_agent(shard, batch.content, message_ids)
                 if ok is False:
                     ledger_of(state, shard).remove(entry)
+                    write_failed = True
                 else:
                     batch.primary_entry = entry
                     batch.phase = "streaming"
         else:
             # Send to agent. Through the server's wrapper, not write_user_line
             # directly: tests patch it there.
-            await state.send_to_agent(shard, batch.content, message_ids)
+            write_failed = (await state.send_to_agent(
+                shard, batch.content, message_ids)) is False
 
-        # Read response
+        # Read response (nothing to read when the line never reached the CLI)
         try:
-            response_text, metadata = await state.read_agent_response(
-                shard, channel_id, message_ids)
+            if write_failed:
+                response_text, metadata = "", {}
+            else:
+                response_text, metadata = await state.read_agent_response(
+                    shard, channel_id, message_ids)
         finally:
             # The turn is over: any question still on screen belongs to a
             # subprocess that has stopped waiting for it, and answering it
@@ -1207,6 +1243,19 @@ async def run_turn(state: ServerState, shard: str, batch: TurnBatch,
     finally:
         state.active_turns.pop(shard, None)
 
+    if write_failed:
+        # The CLI never saw these rows: they are not answered, so they are not
+        # complete. Back to the queue; the next drain after the respawn runs them.
+        ids = [r["id"] for r in messages if _row_get(r, "id") is not None]
+        await msgqueue.release(state.db, ids)
+        if state.agent_states.get(shard) == "PROCESSING":
+            state.agent_states[shard] = "IDLE"
+            state.write_agent_beacon(shard, "IDLE", force=True)
+        state.log.warning(f"{shard} write failed; {len(ids)} row(s) returned to the queue")
+        spawn(state, _redrain_when_alive(state, shard))
+        return TurnResult(shard=shard, batch=batch, response_text="", metadata={},
+                          requeued=True)
+
     return TurnResult(shard=shard, batch=batch, response_text=response_text,
                       metadata=metadata)
 
@@ -1218,6 +1267,8 @@ async def finish_turn(state: ServerState, shard: str, result: TurnResult):
     # Every wrapper below (cost, session, Discord token, hold) is keyed by the
     # shard id: rows are per shard, and AGENT_TOKENS holds the owning agent's
     # token under each shard id. For a default shard this is the agent id.
+    if result.requeued:
+        return
     agent = shard
     batch = result.batch
     channel_id = batch.channel_id

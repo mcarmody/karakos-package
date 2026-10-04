@@ -12,6 +12,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 FAKE = Path(__file__).parent / "harness" / "bin" / "claude"
 STATUS_COMPLETE, STATUS_CRASHED = 2, 3
 
@@ -90,3 +92,36 @@ def test_turn_whose_cli_died_is_crashed_not_complete_and_queue_keeps_draining(ha
     assert rows[0]["processed"] == STATUS_CRASHED
     assert rows[0]["response"]          # never silently empty
     assert rows[1]["processed"] == STATUS_COMPLETE and rows[1]["response"] == "alive"
+
+
+def _fail_first_write(h):
+    real = h.module.send_to_agent
+    calls = {"n": 0}
+
+    async def flaky(agent, content, message_ids):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return False
+        return await real(agent, content, message_ids)
+
+    h.module.send_to_agent = flaky
+    return calls
+
+
+@pytest.mark.parametrize("steering", [{"enabled": False}, {"enabled": True}])
+def test_failed_primary_write_requeues_and_is_answered_after_respawn(harness, steering):
+    h = harness(agents=["a"], steering=steering)
+    holder = []
+
+    async def scenario():
+        async with h:
+            holder.append(_fail_first_write(h))
+            h.script(default={"text": "answered"})
+            await h.send("a", "urgent")
+            await h.wait_for(lambda: h.queue_rows("a")[0]["processed"] == STATUS_COMPLETE,
+                             timeout=10)
+
+    run(scenario())
+    row = h.queue_rows("a")[0]
+    assert holder[0]["n"] >= 2
+    assert row["response"] == "answered", row
