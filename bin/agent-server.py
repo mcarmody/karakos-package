@@ -360,6 +360,17 @@ async def init_db():
             context_updated_at TIMESTAMP
         )
     """)
+    # `started`: the CLI has begun this session id (it emitted its init event).
+    # A respawn must --resume a started session; --session-id is only valid for
+    # an id the CLI has never seen ("Session ID ... is already in use").
+    async with db.execute("PRAGMA table_info(sessions)") as cursor:
+        had_started = "started" in {row[1] for row in await cursor.fetchall()}
+    await ensure_column("sessions", "started", "INTEGER DEFAULT 0")
+    if not had_started:
+        # Sessions from before the column that already did work were started.
+        await db.execute(
+            "UPDATE sessions SET started = 1 WHERE input_tokens > 0 "
+            "OR context_tokens > 0 OR compaction_count > 0")
 
     # Cost events table
     await db.execute("""
@@ -571,16 +582,36 @@ async def get_or_create_session(agent: str) -> str:
     log.info(f"Created new session for {agent}: {session_id}")
     return session_id
 
+async def session_started(agent: str) -> bool:
+    """Whether the CLI has already begun this shard's current session id."""
+    if db is None:
+        return False
+    async with db.execute(
+        "SELECT started FROM sessions WHERE agent = ?", (agent,)
+    ) as cursor:
+        row = await cursor.fetchone()
+    return bool(row and row["started"])
+
+
+async def mark_session_started(agent: str):
+    if db is None:
+        return
+    await db.execute("UPDATE sessions SET started = 1 WHERE agent = ? AND started = 0",
+                     (agent,))
+    await db.commit()
+
+
 async def clear_session(agent: str):
     """Clear agent session and create new ID"""
     session_id = str(uuid.uuid4())
     await db.execute(
         """
         INSERT INTO sessions (agent, session_id, input_tokens, compaction_count,
-                              context_tokens)
-        VALUES (?, ?, 0, 0, 0)
+                              context_tokens, started)
+        VALUES (?, ?, 0, 0, 0, 0)
         ON CONFLICT(agent) DO UPDATE SET
             session_id = ?,
+            started = 0,
             input_tokens = 0,
             context_tokens = 0,
             compaction_count = 0,
@@ -759,6 +790,7 @@ async def start_agent_subprocess(shard: str):
     is_default_shard = shard == agent
 
     session_id = await get_or_create_session(shard)
+    resume_session = await session_started(shard)
     # Core + agent section + shard text + house style, composed at spawn so a
     # fleet-wide rule is one edit. Never fails the spawn over a prompt file.
     system_prompt_text = prompt_compose.compose_system_prompt(
@@ -815,7 +847,9 @@ async def start_agent_subprocess(shard: str):
         "--max-turns", str(config.get("max_turns", 200)),
         "--verbose",
         "--dangerously-skip-permissions",
-        "--session-id", session_id,
+        # An id the CLI has already begun is resumed; --session-id is only
+        # valid for a brand-new one (the real CLI exits "already in use").
+        "--resume" if resume_session else "--session-id", session_id,
         "--system-prompt", system_prompt_text,
     ]
 

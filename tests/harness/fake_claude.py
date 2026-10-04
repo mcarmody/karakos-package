@@ -686,8 +686,23 @@ def run_oneshot(prompt, flags):
     return 0
 
 
+def reject_reused_session_id(flags):
+    """Like the real CLI: --session-id for an id already begun is an error
+    (`--resume` is the way back in). Like the real CLI, a session only begins
+    when it receives its first user message, so a never-messaged id can be
+    spawned with --session-id again. Begun = its <sid>.in.jsonl log exists."""
+    log_dir = os.environ.get("FAKE_CLAUDE_LOG_DIR")
+    sid = (flags.get("--session-id") or [None])[0]
+    if log_dir and sid and not flags.get("--resume") and \
+            os.path.exists(os.path.join(log_dir, f"{sid}.in.jsonl")):
+        sys.stderr.write(f"Error: Session ID {sid} is already in use.\n")
+        sys.exit(1)
+
+
 def main():
     flags = parse_argv(sys.argv[1:])
+    if oneshot_prompt(sys.argv[1:]) is None:
+        reject_reused_session_id(flags)
     if "--replay-user-messages" in flags or os.environ.get("FAKE_CLAUDE_QUEUED") == "1":
         sid = (flags.get("--resume") or flags.get("--session-id") or ["no-session"])[0]
         log_dir = os.environ.get("FAKE_CLAUDE_LOG_DIR")
@@ -699,7 +714,7 @@ def main():
     prompt = oneshot_prompt(sys.argv[1:])
     if prompt is not None:
         sys.exit(run_oneshot(prompt, flags))
-    sid = (flags.get("--session-id") or ["no-session"])[0]
+    sid = (flags.get("--resume") or flags.get("--session-id") or ["no-session"])[0]
     log_dir = os.environ.get("FAKE_CLAUDE_LOG_DIR")
     if log_dir:
         os.makedirs(log_dir, exist_ok=True)

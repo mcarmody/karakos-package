@@ -45,7 +45,7 @@ _SERVER_NAMES = (
     "db", "log", "ask_registry", "ux_threads",
     # collaborators
     "post_to_discord", "start_typing", "stop_typing", "write_agent_beacon",
-    "post_cost_update", "update_session_tokens", "update_session_context",
+    "post_cost_update", "mark_session_started", "update_session_tokens", "update_session_context",
     "hold_batch", "agent_hold_until", "schedule_hold_wake", "classify_wall",
     "wall_not_before", "format_attachments", "redact_for_log",
     "send_to_agent", "read_agent_response",
@@ -127,6 +127,7 @@ class TurnBatch:
     terminal_reason: Optional[str] = None
     saw_bg_task: bool = False           # a backgrounded task started during the turn
     timed_out: bool = False             # a follow-on turn never began
+    died: bool = False                  # the process hit EOF before any result event
     primary_entry: Any = None           # the ledger entry of this turn's own write
 
     def __post_init__(self):
@@ -433,6 +434,9 @@ async def write_user_line(state: ServerState, shard: str, content: str,
     try:
         proc.stdin.write(msg.encode())
         await proc.stdin.drain()
+        # The CLI creates a session on its first user message, so from here on
+        # the id is taken: a respawn must --resume it, never --session-id it.
+        await state.mark_session_started(shard)
         if not steer:
             state.log.info(f"Sent message to {shard} ({len(message_ids)} queued messages)")
     except Exception as e:
@@ -832,6 +836,9 @@ async def read_events(
     # Returning it would post half a sentence to the channel and bill it as
     # the reply — so it is dropped here, at the single point every caller of
     # read_agent_response goes through.
+    if eof and not metadata and shard not in state.interrupted_agents:
+        batch.died = True
+        state.log.error(f"{shard} subprocess ended before producing a result")
     if shard in state.interrupted_agents:
         state.interrupted_agents.discard(shard)
         state.log.info(f"{shard} turn discarded (interrupted)")
@@ -1264,6 +1271,13 @@ async def finish_turn(state: ServerState, shard: str, result: TurnResult):
         result.response_text = response_text
         if self_turn:
             result.suppress_post = True
+
+    if batch.died and all_ids and not self_turn:
+        # The subprocess died mid-turn: there is no answer. Recording the rows
+        # complete with an empty response would silently drop the messages.
+        response_text = state.GENERIC_TURN_ERROR
+        final_status = state.STATUS_CRASHED
+        result.response_text = response_text
 
     await state.hooks.fire("on_turn_end", shard, result)
 
