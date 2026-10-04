@@ -42,7 +42,9 @@ def row(h, shard, text):
 
 
 def insert(h, agent, name, channel_id="9", age=60, **kw):
-    """Insert a queued row directly (old enough to steal)."""
+    """Insert a queued row directly (old enough to steal). From a running scenario call it
+    through asyncio.to_thread: a blocking sqlite write on the server's own loop cannot wait
+    out a lock the server holds across an await, and fails "database is locked" after 5 s."""
     created = (datetime.now(timezone.utc) - timedelta(seconds=age)).strftime("%Y-%m-%d %H:%M:%S")
     cols = {"agent": agent, "channel": kw.pop("channel", "c"), "channel_id": channel_id,
             "server": "local", "author": "u", "author_id": "1", "is_bot": 0,
@@ -208,10 +210,10 @@ def test_exclusions_left_for_the_victim(harness):
         async with h:
             await start_busy(h)
             now = int(time.time())
-            insert(h, "a", "call-row", channel_id="0", call_id="cid", reply_to_agent="b")
-            insert(h, "a", "buzz-row", channel_id="0", channel="hive")
-            insert(h, "a", "prio-row", channel_id="0", priority=5)
-            insert(h, "a", "held-row", channel_id="0", not_before=now + 600)
+            await asyncio.to_thread(insert, h, "a", "call-row", channel_id="0", call_id="cid", reply_to_agent="b")
+            await asyncio.to_thread(insert, h, "a", "buzz-row", channel_id="0", channel="hive")
+            await asyncio.to_thread(insert, h, "a", "prio-row", channel_id="0", priority=5)
+            await asyncio.to_thread(insert, h, "a", "held-row", channel_id="0", not_before=now + 600)
             wake(h, "a", "0")
             await asyncio.sleep(2.0)
             for name in ("call-row", "buzz-row", "prio-row", "held-row"):
@@ -265,7 +267,7 @@ def test_thief_held_by_wall_does_not_steal(harness):
     async def scenario():
         async with h:
             await start_busy(h)
-            insert(h, "a-2", "own-held", channel_id="0", not_before=int(time.time()) + 600)
+            await asyncio.to_thread(insert, h, "a-2", "own-held", channel_id="0", not_before=int(time.time()) + 600)
             await asyncio.sleep(0.1)
             await h.send("a", "X2", channel_id="2")
             await asyncio.sleep(2.0)
@@ -300,7 +302,7 @@ def test_victim_in_error_recovery_is_stolen_from(harness):
         async with h:
             h.script(default=say("stolen-ok"))
             h.module.agent_states["a"] = "ERROR_RECOVERY"
-            insert(h, "a", "waiting", channel_id="7", age=1)
+            await asyncio.to_thread(insert, h, "a", "waiting", channel_id="7", age=1)
             wake(h, "a", "7")
             await h.wait_for(lambda: row(h, "a", "waiting")["processed"] == 2, timeout=5)
 
