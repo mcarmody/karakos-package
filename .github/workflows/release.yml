@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   # A v* tag cannot publish an image unless the gate is green on that commit
-  # (fresh install, upgrade from each 1.x bucket, real-CLI smoke). Also runs on
+  # (fresh install, upgrade from each 1.x bucket; real-CLI smoke when the secret is set). Also runs on
   # workflow_dispatch. 7.4's checklist records the green run id before tagging.
   gate:
     uses: ./.github/workflows/release-gate.yml

@@ -1,7 +1,7 @@
 ---
 layout: landing
 title: Karakos — a standing Claude agent for your household, in one install
-description: Karakos packages session persistence, episodic memory, cost guards and self-modifying builder agents into one Docker-installable system. Point it at Discord and an Anthropic key; get a standing assistant with a web dashboard.
+description: Karakos packages session persistence, graph memory, several cooperating agents, cost guards and a build queue into one Docker-installable system. Point it at Discord and an Anthropic login; get a standing assistant with a web dashboard.
 ---
 
 <nav class="nav">
@@ -23,7 +23,7 @@ description: Karakos packages session persistence, episodic memory, cost guards 
       Persistent agents need session lifecycle management, memory consolidation, cost guards
       and orchestration before you get to the part you actually wanted. Karakos ships all of
       it in <strong>one Docker install</strong>. Point it at a Discord server and an Anthropic
-      key, and you get an assistant that remembers, costs what you tell it to, reaches you
+      login, and you get an assistant that remembers, costs what you tell it to, reaches you
       where you already are, and can safely extend its own code.
     </p>
     <div class="cta-row">
@@ -76,8 +76,8 @@ description: Karakos packages session persistence, episodic memory, cost guards 
 
       <div class="card">
         <div class="icon">🧠</div>
-        <h3>Episodic memory</h3>
-        <p>Conversations are consolidated into durable memories with semantic recall, so the agent knows what you told it last Tuesday without you pasting it again.</p>
+        <h3>Graph memory</h3>
+        <p>Conversations are consolidated into a graph of people, things and facts with semantic recall, shared by every agent, so it knows what you told it last Tuesday without you pasting it again.</p>
       </div>
 
       <div class="card">
@@ -111,7 +111,7 @@ description: Karakos packages session persistence, episodic memory, cost guards 
         <tr><th>Hardware</th><td>4 GB RAM minimum (8 GB recommended), 2+ CPU cores, 10 GB disk</td></tr>
         <tr><th>Operating system</th><td>Ubuntu 22.04+, Debian 12+, macOS 12+, Windows 10/11</td></tr>
         <tr><th>Software</th><td>Docker Engine 24+ with Compose v2</td></tr>
-        <tr><th>Accounts</th><td>An Anthropic API key and a Discord bot token</td></tr>
+        <tr><th>Accounts</th><td>An Anthropic account (login through the Claude Code CLI) and a Discord bot token</td></tr>
         <tr><th>Network</th><td>Stable outbound internet for Anthropic API calls</td></tr>
         <tr><th>Runtime</th><td>24/7 recommended — the point is that it is standing, not summoned</td></tr>
         <tr><th>Expected cost</th><td>$5–15/week for typical household usage</td></tr>

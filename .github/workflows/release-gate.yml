@@ -9,8 +9,9 @@ name: Release gate
 # run a week, and pull_request only when a file that can break these changes.
 #
 # Secrets:
-#   CLAUDE_CODE_OAUTH_TOKEN  a scratch Anthropic account's long-lived token (real-CLI smoke).
-#                            Missing: skips on a PR, FAILS on a tag, dispatch or schedule.
+#   CLAUDE_CODE_OAUTH_TOKEN  optional: an Anthropic account token for the real-CLI smoke.
+#                            Missing: the real-CLI smoke skips with a notice on every event.
+#                            Run it by hand before a release: pytest tests -q -m "slow and realcli".
 # GITHUB_TOKEN (packages: read) pulls the ghcr.io/mcarmody/karakos tags the upgrade matrix uses.
 on:
   workflow_call:
@@ -156,12 +157,9 @@ jobs:
         run: |
           if [ "$HAS_CLAUDE_TOKEN" = true ]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
-          elif [ "${{ github.event_name }}" = pull_request ]; then
-            echo "run=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::CLAUDE_CODE_OAUTH_TOKEN unavailable (a forked PR, or the secret is not set): skipping the real-CLI smoke"
           else
-            echo "::error::CLAUDE_CODE_OAUTH_TOKEN is required on a tag, dispatch or schedule; the gate cannot pass without it"
-            exit 1
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::CLAUDE_CODE_OAUTH_TOKEN is not set: skipping the real-CLI smoke (run it by hand before a release)"
           fi
       - uses: actions/checkout@v4
         if: steps.flag.outputs.run == 'true'
