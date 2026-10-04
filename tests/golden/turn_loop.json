@@ -87,7 +87,7 @@
   {
    "agent": "a",
    "channel_id": "10",
-   "content": "dying",
+   "content": "The agent hit an error and the turn did not complete.",
    "dead_letter": true,
    "reply_to": null
   },
@@ -220,6 +220,10 @@
   [
    "INFO",
    "a session tools (2): ['Read', 'Bash']"
+  ],
+  [
+   "ERROR",
+   "a subprocess ended before producing a result"
   ],
   [
    "INFO",
@@ -373,8 +377,8 @@
     "discord_response_id": "discord-5",
     "held": false,
     "message_id": "m6",
-    "processed": 2,
-    "response": "dying"
+    "processed": 3,
+    "response": "The agent hit an error and the turn did not complete."
    },
    {
     "agent": "a",
@@ -423,7 +427,8 @@
    "context_tokens": 1010,
    "input_tokens": 10,
    "last_compacted": null,
-   "session_id": "s10"
+   "session_id": "s10",
+   "started": 1
   },
   {
    "agent": "b",
@@ -431,7 +436,8 @@
    "context_tokens": 1010,
    "input_tokens": 10,
    "last_compacted": null,
-   "session_id": "s11"
+   "session_id": "s11",
+   "started": 1
   },
   {
    "agent": "monitor",
@@ -439,7 +445,8 @@
    "context_tokens": 0,
    "input_tokens": 0,
    "last_compacted": null,
-   "session_id": "s12"
+   "session_id": "s12",
+   "started": 0
   }
  ]
 }

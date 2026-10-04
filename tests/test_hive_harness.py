@@ -470,10 +470,8 @@ def test_callee_exits_mid_answer(harness):
     calls = run(scenario())
     assert h.queue_rows("a")[0]["response"] == "error/callee_failed"
     assert calls[0]["status"] == "error"
-    # Deviation from the spec's "row CRASHED by the respawn watcher": the turn's
-    # finish_turn (shard lock held) writes the reply and marks the row COMPLETE
-    # before the watcher gets the lock, so the watcher's UPDATE matches nothing.
-    assert call_rows(h, "b")[0]["processed"] == 2
+    # The callee died before a result: its row is CRASHED, not complete.
+    assert call_rows(h, "b")[0]["processed"] == 3
 
 
 def test_callee_usage_wall_row_is_held_and_never_runs(harness):
