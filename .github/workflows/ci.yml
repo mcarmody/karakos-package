@@ -148,7 +148,7 @@ jobs:
   # can drift silently. This runs on the existing daily schedule (no new trigger).
   # CLAUDE_CODE_OAUTH_TOKEN is a repository secret for a scratch account. With it
   # missing, the scheduled run skips with a warning (a daily red X for an absent
-  # secret is noise); a manual dispatch fails. The release gate always requires it.
+  # secret is noise); a manual dispatch fails. The release gate skips it without the secret.
   real-cli-smoke:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest

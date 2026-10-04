@@ -14,6 +14,29 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-10-03
+
+2.0 is a new runtime under the same install: an agent registry, shards and a hive, graph memory, a
+Discord outbox, steering, a build queue, and a migrator that upgrades a 1.x install in place.
+Upgrade with `bin/karakos migrate` ([docs/UPGRADING.md](docs/UPGRADING.md)); it backs up first and
+`karakos migrate --restore <backup>` goes back.
+
+Verified for this release: CI unit suite, fresh-install and Docker smokes, and container upgrades
+from v1.3 and v1.5.0 with restore. The real-CLI smoke (`pytest tests -q -m "slow and realcli"`)
+passed against the real `claude` CLI on the release commit. Upgrades from v1.0.0 and v1.1.1 are not
+container-tested (those tags cannot build their own images); the migrator detects and migrates
+their layout, covered by unit fixtures. The Windows installer is unchanged from 1.5.
+
+- Fixed: a respawned agent (reload, interrupt, crash recovery) restarted its existing session with
+  `--session-id`, which the real CLI refuses ("Session ID is already in use"); it now uses
+  `--resume`. A turn whose CLI died before answering is recorded as crashed, not as complete with
+  an empty reply, and a message sent while an agent is restarting waits for the new process or
+  returns to the queue, so neither is dropped silently.
+- Fixed: `karakos migrate --restore` failed with EPERM copying file times onto files the container
+  user does not own, and did not remove files the failed run had created.
+- The release gate no longer requires a `CLAUDE_CODE_OAUTH_TOKEN` secret: without it the real-CLI
+  smoke skips with a notice.
+
 - Documentation for 2.0 (ANDURIL 7.2): UPGRADING rewritten around `bin/karakos migrate` with a drain checklist, ARCHITECTURE restructured for the registry, shards, hive, graph memory, outbox and credentials, new EXTENDING sections (shards, hive, memory, prompts, build queue, upgrade seams, native-deployment lessons), a QUICKSTART with smoke-tagged check commands, `docs/TEST_RESULTS.md` marked historical, and `tests/test_docs.py` to keep them honest.
 
 - Operator switches (ANDURIL 6.4): `/pause [minutes]` holds an agent's queue (the turn in progress finishes; `data/operator-pause.json`, survives restarts; `POST /agents/{name}/pause|resume`), `/resume`, `/effort <level>` (agent-level `--effort` override in `data/runtime-overrides.json`, applied after the turn when busy; `POST /agents/{name}/effort`), and `/interrupt` with an optional `message`. `GET /agents` shards gain `effort`/`effort_source`. A registry `effort:` key, previously inert, is now passed to the CLI as `--effort`.
