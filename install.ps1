@@ -4,6 +4,7 @@
 #
 # Override upstream source via env vars (useful for forks):
 #   $env:KARAKOS_REPO = "user/repo"; .\install.ps1
+#   $env:KARAKOS_BRANCH = "develop"; .\install.ps1   # default: main (releases only)
 
 param(
     [string]$InstallDir = "$env:USERPROFILE\karakos"
@@ -11,6 +12,10 @@ param(
 
 $KarakosRepo = if ($env:KARAKOS_REPO) { $env:KARAKOS_REPO } else { "mcarmody/karakos-package" }
 $KarakosRepoUrl = if ($env:KARAKOS_REPO_URL) { $env:KARAKOS_REPO_URL } else { "https://github.com/$KarakosRepo.git" }
+
+# Installers always get a release: clone `main` explicitly so the repo's default
+# branch (`develop`) never changes what an install receives.
+$KarakosBranch = if ($env:KARAKOS_BRANCH) { $env:KARAKOS_BRANCH } else { "main" }
 
 $ErrorActionPreference = "Stop"
 
@@ -160,11 +165,11 @@ if (Test-Path $InstallDir) {
     } else {
         Remove-Item -Recurse -Force $InstallDir
         Write-Step "Cloning karakos into $InstallDir..."
-        git clone $KarakosRepoUrl $InstallDir
+        git clone --branch $KarakosBranch $KarakosRepoUrl $InstallDir
     }
 } else {
     Write-Step "Cloning karakos into $InstallDir..."
-    git clone $KarakosRepoUrl $InstallDir
+    git clone --branch $KarakosBranch $KarakosRepoUrl $InstallDir
 }
 
 Set-Location $InstallDir

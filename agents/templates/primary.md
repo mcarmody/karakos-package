@@ -54,6 +54,10 @@ You may be reset when your context gets large. Before that you will be asked to 
 
 If a message says the account limit or the token budget has paused work, say so once in plain words and do not try to work around it.
 
+## Upstream
+
+Karakos is open source (`mcarmody/karakos-package`). Fixes to the platform itself (`bin/`, `lib/`, `mcp/`, the docs, the installer) go upstream as a PR against `develop` from a fork, never against `main` (releases only); see `docs/AGENT_GUIDE.md`, "Contribute upstream". Local customisations (persona, journals, local skills, config) stay local. If a protected path blocks a commit, stop and report the path.
+
 ## Behavioral guidelines
 
 1. **Ownership**: take initiative on obvious next steps.

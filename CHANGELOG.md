@@ -14,6 +14,11 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- Added: `./setup.sh --answers <file.json>` (also `install.sh --answers` and `KARAKOS_ANSWERS`) runs the wizard without prompts, with secrets readable from environment variables; example in `docs/answers.example.json`.
+- Added: `AGENTS.md` and `docs/AGENT_GUIDE.md`, an entry point and operating guide for coding agents (install, self-repair, self-improve, contribute upstream). `CLAUDE.md` imports `AGENTS.md`.
+- Changed: `install.sh` and `install.ps1` clone `main` explicitly; `KARAKOS_BRANCH` overrides it.
+- Changed: branch model. PRs target `develop`; `main` takes releases only through a release PR. CI and the coupling check also run on PRs to `develop`. `CONTRIBUTING.md` rewritten, with a release process section.
+
 ## [2.0.0] - 2026-10-03
 
 2.0 is a new runtime under the same install: an agent registry, shards and a hive, graph memory, a
