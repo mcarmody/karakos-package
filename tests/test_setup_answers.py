@@ -14,9 +14,9 @@ import setup_answers as sa  # noqa: E402
 
 GOOD = {
     "system_name": "Hearth", "owner_name": "Alex",
-    "discord_bot_token": "tok", "discord_bot_id": "123456789012345678",
-    "discord_server_id": "123456789012345679", "channel_general": "123456789012345680",
-    "channel_signals": "123456789012345681", "owner_discord_id": "123456789012345682",
+    "discord_bot_token": "tok", "discord_bot_id": "1000000000000001",
+    "discord_server_id": "1000000000000002", "channel_general": "1000000000000003",
+    "channel_signals": "1000000000000004", "owner_discord_id": "1000000000000005",
 }
 
 
