@@ -97,9 +97,10 @@ Maintainers only. Releases go from `develop` to `main` and nowhere else.
    `gh pr create --base main --head develop --title "Release vX.Y.Z"` with the changelog entry
    as the body. The required checks run; `release-gate.yml` (fresh install and
    upgrade from the container) also runs when a file that can break it changed.
-3. **The maintainer approves and merges.** Use a merge commit so `main` stays an
-   ancestor of `develop`; a squash makes the branches diverge.
-4. **Tag `main`** at the merge commit: `git tag vX.Y.Z && git push origin vX.Y.Z`.
+3. **The maintainer approves and merges.** Use a merge commit: it keeps
+   `develop`'s commits in `main`'s history, so the next release PR lists only new
+   work. A squash re-lists everything already released.
+4. **Tag `main`** at the merge commit: `git fetch origin && git tag -a vX.Y.Z origin/main -m "vX.Y.Z" && git push origin vX.Y.Z`.
 5. **`release.yml` runs on the tag** (any `v*` tag). It calls the release gate, then builds
    the multi-arch image and pushes it to `ghcr.io/mcarmody/karakos` as `vX.Y`,
    `vX` and `latest` (there are no patch-level image tags). A tag whose gate fails publishes nothing. Check the run before

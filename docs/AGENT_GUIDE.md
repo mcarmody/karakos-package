@@ -147,7 +147,8 @@ be proposed upstream.
 pre-commit hook (`system/check-protected-paths.py`). Tier 1 (`system/`,
 `config/`, `.karakos/`, `Dockerfile`, `bin/agent-server.py`, `bin/relay.py`,
 `bin/entrypoint.sh`, `bin/scheduler.py`, `bin/hooks-sync.py`) cannot be committed
-by an agent. Tier 2 (rest of `bin/`, `agents/templates/`, `agents/CORE.md`,
+by an agent inside the container workspace, where the hook is installed. A clone on
+the host has no hook, so there the rule is yours to keep and PR review is the gate. Tier 2 (rest of `bin/`, `agents/templates/`, `agents/CORE.md`,
 `agents/HOUSE_STYLE.md`, `mcp/tools-server.py`) needs owner review. Persona,
 journal and inbox files are always writable. If a commit is blocked, stop and
 report the path and the change you wanted; do not bypass the hook or edit the
@@ -202,8 +203,8 @@ git switch -c fix/short-description origin/develop
 
 (Starting from your fork instead: `gh repo fork mcarmody/karakos-package --clone`, which
 names the original remote `upstream`. Substitute `upstream` for `origin` below.)
-The install directory carries generated, git-ignored state (`config/.env`,
-`agents/<id>/`); your branch off `develop` does not include it, but a branch
+The install directory carries generated state (`config/.env`, `config/agents.yaml`,
+`config/channels.json`, `agents/<id>/`) that is not all git-ignored, so stage files by name; your branch off `develop` does not include it, but a branch
 switch in a live install directory changes the files the container mounts. Prefer
 a separate working copy for upstream work:
 `git worktree add -b fix/short-description ~/karakos-pr origin/develop`.
