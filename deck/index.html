@@ -51,22 +51,43 @@
 </section>
 
 <section class="slide">
-  <div class="kicker">Why</div>
-  <h2>The part you would otherwise build first</h2>
+  <div class="kicker">What is it</div>
+  <h2>Claude, given a home and a job</h2>
   <div class="grid2">
     <ul>
-      <li><b>Always up.</b> A conversation survives process restarts and crashes.</li>
-      <li><b>Memory.</b> A knowledge graph of what it learns, recalled with local embeddings. Recall makes no API calls.</li>
-      <li><b>Cost guards.</b> Every turn is metered per agent, with daily and monthly caps enforced before a message is queued.</li>
+      <li><b>Claude</b> is Anthropic's AI model. Normally you open a chat window, ask, and close it; it forgets you.</li>
+      <li><b>Karakos</b> keeps Claude running permanently on a computer you own, as an <b>agent</b>: an assistant that takes actions with tools, not just answers.</li>
+      <li>You talk to it where you already are: a <b>Discord</b> channel, or its own web dashboard.</li>
     </ul>
     <ul>
-      <li><b>Delivery.</b> A Discord outbox with retries: an outage delays an answer instead of losing it.</li>
-      <li><b>Scheduling.</b> Heartbeats, sweeps and one-off "check back in ten minutes" jobs that survive a restart.</li>
-      <li><b>A dashboard.</b> Chat, fleet, memory, history and costs at <code>localhost:3000</code>.</li>
+      <li>It <b>remembers</b> what you tell it, across days and restarts.</li>
+      <li>It <b>works on a schedule</b>: checks, reminders and follow-ups, without being asked each time.</li>
+      <li>It <b>watches its own spending</b> and stops at a limit you set.</li>
+      <li>It installs as <b>one Docker container</b> with a single command.</li>
     </ul>
   </div>
 </section>
-
+<section class="slide">
+  <div class="kicker">What you get</div>
+  <h2>Feature list</h2>
+  <div class="grid2">
+    <ul>
+      <li><b>Always-on agents.</b> A primary assistant plus a cheap monitor that raises alerts. Conversations survive crashes and restarts.</li>
+      <li><b>Discord and web chat.</b> Same agent, same memory, either place.</li>
+      <li><b>Long-term memory.</b> A knowledge graph of people, things and facts, searched locally. Recall costs nothing.</li>
+      <li><b>Cost caps.</b> Spend metered per agent; daily and monthly limits enforced before a message runs, with warnings first.</li>
+      <li><b>Reliable delivery.</b> A Discord outbox with retries: an outage delays a reply, never loses it.</li>
+    </ul>
+    <ul>
+      <li><b>Scheduler.</b> Heartbeats, health sweeps, memory cleanup, and one-off "check back in ten minutes" jobs that survive a restart.</li>
+      <li><b>Dashboard.</b> Ops board, chat, agents, fleet, memory, history and costs at <code>localhost:3000</code>.</li>
+      <li><b>More agents on demand.</b> Builder (spec in, pull request out) and reviewer templates; parallel shards that share memory.</li>
+      <li><b>Your own tools.</b> Drop a script and a <code>tools.json</code> into <code>skills/</code>.</li>
+      <li><b>Guarded self-modification.</b> Agents can improve the system; lifecycle and security files stay locked.</li>
+      <li><b>Onboarding.</b> A new agent starts by learning who you are.</li>
+    </ul>
+  </div>
+</section>
 <section class="slide">
   <div class="kicker">How it fits together</div>
   <h2>One container, four processes</h2>
