@@ -1,5 +1,10 @@
 # Karakos Package
 
+@AGENTS.md
+
+AGENTS.md is the entry point for every coding agent (layout, tests, branch model,
+protected paths, conventions). This file only adds what is specific to Claude Code.
+
 Self-contained, installable multi-agent household assistant system powered by
 Claude. See `README.md` for what it does and `docs/ARCHITECTURE.md` for how
 the pieces fit together.

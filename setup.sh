@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
 # Karakos Setup Wizard — Interactive installation and configuration
+#
+#   ./setup.sh                       interactive wizard
+#   ./setup.sh --answers FILE.json   unattended: same fields and checks, no prompts
+#                                    (KARAKOS_ANSWERS=FILE.json does the same;
+#                                    see docs/answers.example.json)
+#   ./setup.sh --clean               remove generated state and config
 
 set -euo pipefail
 
@@ -8,8 +14,12 @@ pause_on_exit() {
     local rc=$?
     if [ $rc -ne 0 ]; then
         echo
-        echo -e "\033[0;31mSetup failed (exit code $rc). Press any key to close.\033[0m"
-        read -n 1 -s -r < /dev/tty 2>/dev/null || true
+        if [ -n "${ANSWERS_FILE:-}" ]; then
+            echo -e "\033[0;31mSetup failed (exit code $rc).\033[0m" >&2
+        else
+            echo -e "\033[0;31mSetup failed (exit code $rc). Press any key to close.\033[0m"
+            read -n 1 -s -r < /dev/tty 2>/dev/null || true
+        fi
     fi
 }
 trap pause_on_exit EXIT
@@ -29,6 +39,7 @@ AGENTS_CONFIG="${SCRIPT_DIR}/config/agents.yaml"
 CHANNELS_CONFIG="${SCRIPT_DIR}/config/channels.json"
 DOCKER_COMPOSE="${SCRIPT_DIR}/config/docker-compose.yml"
 KARAKOS_CONFIG="${SCRIPT_DIR}/.karakos/config.json"
+ANSWERS_FILE="${KARAKOS_ANSWERS:-}"
 
 # State management
 load_state() {
@@ -163,10 +174,12 @@ check_prerequisites() {
     # Check ports
     if lsof -Pi :3000 -sTCP:LISTEN -t >/dev/null 2>&1; then
         warn "Port 3000 already in use. Dashboard won't start."
-        read -p "Continue anyway? (y/N) " -n 1 -r
-        echo
-        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-            exit 1
+        if [ -z "$ANSWERS_FILE" ]; then
+            read -p "Continue anyway? (y/N) " -n 1 -r
+            echo
+            if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+                exit 1
+            fi
         fi
     fi
 
@@ -236,6 +249,40 @@ authenticate_claude() {
     fi
 }
 
+# Unattended mode: validate the answers file, then load every answer into the
+# wizard's state file so each step below finds its value and skips its prompt.
+# lib/setup_answers.py owns the fields, defaults and checks.
+load_answers() {
+    local parsed
+    [ -f "$ANSWERS_FILE" ] || { error "answers file not found: $ANSWERS_FILE"; exit 1; }
+    parsed=$(python3 "${SCRIPT_DIR}/lib/setup_answers.py" "$ANSWERS_FILE") || exit 1
+    rm -f "$STATE_FILE"
+    (umask 077; echo "$parsed" | jq '{
+        system_name, owner_name, primary_agent_name, monitor_agent_name,
+        discord_bot_token, discord_bot_id, discord_server_id,
+        channel_general, channel_signals, channel_staff, owner_discord_id,
+        cost_daily_limit, cost_monthly_limit, claude_oauth_token}' > "$STATE_FILE")
+    log "Loaded answers from $ANSWERS_FILE"
+}
+
+# Unattended Anthropic auth: there is no browser. Use the token from the answers
+# file (written to config/.env later) or a login already present on this host.
+authenticate_claude_unattended() {
+    CLAUDE_OAUTH_TOKEN=$(get_state claude_oauth_token)
+    if [ -n "$CLAUDE_OAUTH_TOKEN" ]; then
+        log "Using claude_oauth_token from the answers file"
+        # docker-compose.yml bind-mounts these; a missing file would become a directory
+        mkdir -p "$HOME/.claude"
+        [ -e "$HOME/.claude.json" ] || echo '{}' > "$HOME/.claude.json"
+    elif [ -d "$HOME/.claude" ] && [ -e "$HOME/.claude.json" ]; then
+        log "Using the existing claude login in $HOME/.claude"
+    else
+        error "No Anthropic credentials. Run 'claude login' on this host first, or set"
+        error "claude_oauth_token (or claude_oauth_token_env) in the answers file."
+        exit 1
+    fi
+}
+
 # Main setup flow
 main() {
     echo "================================"
@@ -243,8 +290,12 @@ main() {
     echo "================================"
     echo
 
+    if [ -n "$ANSWERS_FILE" ]; then
+        load_answers
+    fi
+
     # Check if resuming
-    if [ -f "$STATE_FILE" ]; then
+    if [ -z "$ANSWERS_FILE" ] && [ -f "$STATE_FILE" ]; then
         log "Found previous setup state"
         read -p "Resume from previous setup? (Y/n) " -n 1 -r
         echo
@@ -317,7 +368,11 @@ main() {
     # Step 4: Anthropic authentication
     echo
     log "Step 4: Anthropic Login"
-    authenticate_claude
+    if [ -n "$ANSWERS_FILE" ]; then
+        authenticate_claude_unattended
+    else
+        authenticate_claude
+    fi
 
     # Step 5: Discord setup
     if [ -z "$(get_state discord_bot_token)" ]; then
@@ -454,6 +509,10 @@ MEMORY_MAX_EPISODES=15
 # Retention
 MESSAGE_RETENTION_DAYS=90
 EOF
+    if [ -n "${CLAUDE_OAUTH_TOKEN:-}" ]; then
+        printf '\n# Anthropic auth from the answers file (no browser login)\nCLAUDE_CODE_OAUTH_TOKEN=%s\n' \
+            "$CLAUDE_OAUTH_TOKEN" >> "$ENV_FILE"
+    fi
 
     chmod 600 "$ENV_FILE"
 
@@ -547,7 +606,9 @@ EOF
 
     # Launch
     echo
-    read -p "$(echo -e ${GREEN}Ready to launch ${SYSTEM_NAME}? Press Enter to start...${NC})" < /dev/tty
+    if [ -z "$ANSWERS_FILE" ]; then
+        read -p "$(echo -e ${GREEN}Ready to launch ${SYSTEM_NAME}? Press Enter to start...${NC})" < /dev/tty
+    fi
     echo
     log "Pulling karakos image from GHCR (this can take a few minutes on first install)..."
     if ! docker compose -f "$DOCKER_COMPOSE" --env-file "$ENV_FILE" pull; then
@@ -575,6 +636,17 @@ EOF
     echo "  Check #signals in Discord for system startup"
     echo
 }
+
+# Handle --answers FILE / --answers=FILE (KARAKOS_ANSWERS is the env spelling)
+case "${1:-}" in
+    --answers)
+        [ -n "${2:-}" ] || { error "--answers needs a file"; exit 2; }
+        ANSWERS_FILE="$2" ;;
+    --answers=*) ANSWERS_FILE="${1#--answers=}" ;;
+esac
+if [ -n "$ANSWERS_FILE" ]; then
+    case "$ANSWERS_FILE" in /*) ;; *) ANSWERS_FILE="$PWD/$ANSWERS_FILE" ;; esac
+fi
 
 # Handle --clean flag
 if [ "${1:-}" = "--clean" ]; then

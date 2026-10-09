@@ -42,6 +42,17 @@ cd ~/karakos
 
 (`KARAKOS_DIR=/somewhere/else` before the installer changes where it clones.)
 
+The installer clones the `main` branch, which holds releases only. To install
+something else (a tag, or `develop` to test unreleased changes), set
+`KARAKOS_BRANCH=<branch-or-tag>`; `KARAKOS_REPO=user/repo` points it at a fork.
+
+**Without prompts.** `./setup.sh --answers answers.json` (or
+`install.sh --answers answers.json`, or `KARAKOS_ANSWERS=answers.json`) runs the
+wizard from a file: [answers.example.json](answers.example.json) lists the fields,
+and a secret can be read from an environment variable instead of stored in the file.
+It still needs the Discord bot from above and a Claude login (or a
+`claude_oauth_token`). Agents installing for you: [AGENT_GUIDE.md](AGENT_GUIDE.md).
+
 ## What the wizard asks
 
 Eight steps, plus one prompt inside the third:

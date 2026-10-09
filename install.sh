@@ -5,12 +5,35 @@
 #
 # Override the upstream source via env vars (useful for forks):
 #   KARAKOS_REPO=user/repo  bash install.sh
+#   KARAKOS_BRANCH=develop  bash install.sh   # default: main (releases only)
+#
+# Unattended install (no prompts; see docs/answers.example.json):
+#   bash install.sh --answers answers.json    # or KARAKOS_ANSWERS=answers.json
+#   curl -fsSL .../install.sh | bash -s -- --answers answers.json
 
 set -euo pipefail
 
 INSTALL_DIR="${KARAKOS_DIR:-$HOME/karakos}"
 KARAKOS_REPO="${KARAKOS_REPO:-mcarmody/karakos-package}"
 KARAKOS_REPO_URL="${KARAKOS_REPO_URL:-https://github.com/${KARAKOS_REPO}.git}"
+# Installers always get a release. `main` only changes through a release PR; the
+# default branch of the repo is `develop`, so name the branch rather than rely on it.
+KARAKOS_BRANCH="${KARAKOS_BRANCH:-main}"
+ANSWERS_FILE="${KARAKOS_ANSWERS:-}"
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --answers)   ANSWERS_FILE="${2:?--answers needs a file}"; shift 2 ;;
+        --answers=*) ANSWERS_FILE="${1#--answers=}"; shift ;;
+        -h|--help)   sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) echo "install.sh: unknown option $1" >&2; exit 2 ;;
+    esac
+done
+if [ -n "$ANSWERS_FILE" ]; then
+    # setup.sh runs from the clone, so hand it an absolute path
+    [ -f "$ANSWERS_FILE" ] || { echo "install.sh: answers file not found: $ANSWERS_FILE" >&2; exit 2; }
+    ANSWERS_FILE="$(cd "$(dirname "$ANSWERS_FILE")" && pwd)/$(basename "$ANSWERS_FILE")"
+fi
 
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -138,18 +161,21 @@ if [ -d "$INSTALL_DIR" ]; then
         echo "  Move or remove it manually, or set KARAKOS_DIR to a different path."
         exit 1
     fi
-    read -p "  Overwrite existing karakos install? (y/N) " -n 1 -r
-    echo
+    REPLY=n
+    if [ -z "$ANSWERS_FILE" ]; then
+        read -p "  Overwrite existing karakos install? (y/N) " -n 1 -r
+        echo
+    fi
     if [[ $REPLY =~ ^[Yy]$ ]]; then
         rm -rf "$INSTALL_DIR"
-        log "Cloning karakos into $INSTALL_DIR..."
-        git clone "$KARAKOS_REPO_URL" "$INSTALL_DIR"
+        log "Cloning karakos ($KARAKOS_BRANCH) into $INSTALL_DIR..."
+        git clone --branch "$KARAKOS_BRANCH" "$KARAKOS_REPO_URL" "$INSTALL_DIR"
     else
         log "Keeping existing installation."
     fi
 else
-    log "Cloning karakos into $INSTALL_DIR..."
-    git clone "$KARAKOS_REPO_URL" "$INSTALL_DIR"
+    log "Cloning karakos ($KARAKOS_BRANCH) into $INSTALL_DIR..."
+    git clone --branch "$KARAKOS_BRANCH" "$KARAKOS_REPO_URL" "$INSTALL_DIR"
 fi
 
 cd "$INSTALL_DIR"
@@ -164,7 +190,11 @@ echo ""
 
 # Run setup with error handling
 setup_exit=0
-./setup.sh || setup_exit=$?
+if [ -n "$ANSWERS_FILE" ]; then
+    ./setup.sh --answers "$ANSWERS_FILE" || setup_exit=$?
+else
+    ./setup.sh || setup_exit=$?
+fi
 
 if [ "$setup_exit" -eq 0 ]; then
     echo ""
