@@ -14,6 +14,11 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- `session` tool `load_last` now returns an explicit error when no agent identity is available (`KARAKOS_AGENT` unset and no `agent` argument) and rejects path-like agent names, instead of guessing (Fixes #160, "session tool: load_last can return another agent's summary").
+- `bin/purge-data.py` derives the agent for session-summary retention by stripping the trailing timestamp, so hyphenated agent names such as `test-agent` get their own budget (Refs #156, "purge-data: hyphenated agent names share one session-summary budget"; the VACUUM-count part is not addressed here).
+
 ## [2.0.0] - 2026-10-03
 
 2.0 is a new runtime under the same install: an agent registry, shards and a hive, graph memory, a
