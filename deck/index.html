@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Karakos 2.0 — intro deck</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Source+Sans+3:wght@400;600;700&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet">
+<style>
+  :root { --bg:#f3ebe3; --ink:#2e2521; --muted:#8a7a70; --accent:#c2643a; --card:#fbf6f1; --line:#e2d6cc; --green:#7c9a5a; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--ink); font-family:"Source Sans 3", system-ui, sans-serif; }
+  body { overflow:hidden; }
+  .slide { position:absolute; inset:0; padding:6vh 7vw; display:none; flex-direction:column; justify-content:center;
+           background: radial-gradient(circle at 92% 8%, #f6d6c0 0, transparent 38%), var(--bg); }
+  .slide.active { display:flex; }
+  .kicker { font-size:1.6vh; letter-spacing:.25em; text-transform:uppercase; color:var(--muted); margin-bottom:1.6vh; }
+  h1 { font-size:8vh; line-height:1.02; margin:0 0 2vh; font-weight:700; }
+  h1 .k { color:var(--accent); }
+  h2 { font-size:5vh; margin:0 0 3vh; font-weight:700; }
+  p.lead { font-size:3vh; max-width:62vw; color:#4a3d36; margin:0 0 2vh; line-height:1.35; }
+  ul { margin:0; padding-left:1.2em; }
+  li { font-size:2.6vh; line-height:1.45; margin-bottom:1.1vh; }
+  li b { color:var(--ink); }
+  .muted { color:var(--muted); }
+  .grid2 { display:grid; grid-template-columns: 1fr 1fr; gap:3vw; align-items:start; }
+  .grid-shot { display:grid; grid-template-columns: 0.9fr 1.6fr; gap:3vw; align-items:center; }
+  img.shot { width:100%; border-radius:14px; box-shadow:0 18px 50px rgba(80,50,30,.18); border:1px solid var(--line); background:#fff; }
+  .pair { display:grid; grid-template-columns:1fr 1fr; gap:2vw; }
+  .pair figure { margin:0; }
+  figcaption { font-size:1.8vh; color:var(--muted); margin-top:1vh; text-align:center; }
+  pre { background:#2e2521; color:#f6e9df; font-family:"JetBrains Mono", monospace; font-size:2vh; padding:2vh 2vw; border-radius:12px; margin:0 0 2.2vh; white-space:pre-wrap; word-break:break-all; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:2.4vh 2vw; box-shadow:0 8px 24px rgba(80,50,30,.08); }
+  .card h3 { margin:0 0 1.2vh; font-size:2.6vh; }
+  .diagram { font-family:"JetBrains Mono", monospace; font-size:2vh; line-height:1.35; white-space:pre; background:var(--card); border:1px solid var(--line); border-radius:14px; padding:2vh 2vw; }
+  .footer { position:fixed; bottom:2.2vh; left:7vw; right:7vw; display:flex; justify-content:space-between; font-size:1.6vh; color:var(--muted); z-index:5; }
+  .nav { position:fixed; bottom:1.6vh; right:2vw; z-index:6; display:flex; gap:.6vw; }
+  .nav button { border:1px solid var(--line); background:var(--card); color:var(--ink); border-radius:999px; padding:.8vh 1.2vw; font-size:1.8vh; cursor:pointer; }
+  a { color:var(--accent); }
+  .pill { display:inline-block; padding:.4vh 1vw; border-radius:999px; background:#e6edd9; color:#4f6b33; font-weight:600; font-size:1.8vh; margin-right:.6vw; }
+</style>
+</head>
+<body>
+
+<section class="slide active">
+  <div class="kicker">Karakos 2.0 · open source · MIT</div>
+  <h1><span class="k">Karakos</span><br>a standing Claude agent<br>on your own hardware</h1>
+  <p class="lead">It answers in your Discord, remembers you between restarts, and stops spending at a cap you set. One Docker container.</p>
+  <p class="muted">github.com/mcarmody/karakos-package</p>
+</section>
+
+<section class="slide">
+  <div class="kicker">Why</div>
+  <h2>The part you would otherwise build first</h2>
+  <div class="grid2">
+    <ul>
+      <li><b>Always up.</b> A conversation survives process restarts and crashes.</li>
+      <li><b>Memory.</b> A knowledge graph of what it learns, recalled with local embeddings. Recall makes no API calls.</li>
+      <li><b>Cost guards.</b> Every turn is metered per agent, with daily and monthly caps enforced before a message is queued.</li>
+    </ul>
+    <ul>
+      <li><b>Delivery.</b> A Discord outbox with retries: an outage delays an answer instead of losing it.</li>
+      <li><b>Scheduling.</b> Heartbeats, sweeps and one-off "check back in ten minutes" jobs that survive a restart.</li>
+      <li><b>A dashboard.</b> Chat, fleet, memory, history and costs at <code>localhost:3000</code>.</li>
+    </ul>
+  </div>
+</section>
+
+<section class="slide">
+  <div class="kicker">How it fits together</div>
+  <h2>One container, four processes</h2>
+  <div class="grid2">
+<div class="diagram">  Discord          browser
+     │                │ :3000
+  relay.py       dashboard (Next.js)
+     └──────┬─────────┘
+            ▼  HTTP + token
+     agent-server.py :18791
+       • message queue
+       • cost guard
+       • agent sessions (claude CLI)
+            ▲
+     scheduler.py
+       heartbeats · oneshots</div>
+    <ul>
+      <li><code>supervisord</code> runs everything; there is no multi-service stack to reason about.</li>
+      <li>Agents are Claude Code sessions, signed in with your own Claude login. There is no API key to paste.</li>
+      <li>State lives in one workspace on disk: queue, graph memory, logs.</li>
+      <li>The prebuilt image comes from GHCR (~1.2 GB). Nothing compiles locally.</li>
+    </ul>
+  </div>
+</section>
+
+<section class="slide">
+  <div class="kicker">Dashboard</div>
+  <div class="grid-shot">
+    <div>
+      <h2>Ops board</h2>
+      <ul>
+        <li>Health of every agent at a glance.</li>
+        <li>CPU, memory and disk.</li>
+        <li>Spend today against the cap.</li>
+      </ul>
+    </div>
+    <img class="shot" src="img/ops-board.png" alt="Karakos ops board">
+  </div>
+</section>
+
+<section class="slide">
+  <div class="kicker">Dashboard</div>
+  <div class="grid-shot">
+    <div>
+      <h2>Chat</h2>
+      <ul>
+        <li>Talk to any agent from the browser, as well as from Discord.</li>
+        <li>Reload or clear a session with one click.</li>
+        <li>The same queue and memory sit behind both.</li>
+      </ul>
+    </div>
+    <img class="shot" src="img/chat.png" alt="Karakos chat">
+  </div>
+</section>
+
+<section class="slide">
+  <div class="kicker">Agents</div>
+  <h2>Two by default, more on one command</h2>
+  <div class="pair">
+    <figure><img class="shot" src="img/agents.png" alt="Agents page"><figcaption>Agents: the primary assistant and a cheap monitor that raises alerts</figcaption></figure>
+    <figure><img class="shot" src="img/fleet.png" alt="Fleet page"><figcaption>Fleet: shards, parallel conversations that share memory, talk through the hive</figcaption></figure>
+  </div>
+</section>
+
+<section class="slide">
+  <div class="kicker">Memory and spend</div>
+  <h2>It remembers, and it stops</h2>
+  <div class="pair">
+    <figure><img class="shot" src="img/memory.png" alt="Memory page"><figcaption>Memory: entities, links and facts, searchable</figcaption></figure>
+    <figure><img class="shot" src="img/costs.png" alt="Costs page"><figcaption>Costs: per-agent spend against daily and monthly caps</figcaption></figure>
+  </div>
+</section>
+
+<section class="slide">
+  <div class="kicker">Extending it</div>
+  <h2>Builders, reviewers, your own tools</h2>
+  <div class="grid2">
+    <div class="card">
+      <h3>Add a builder agent</h3>
+<pre>make shell
+bin/create-agent.sh --template builder \
+  --model sonnet builder</pre>
+      <p class="muted" style="font-size:2.2vh;margin:0">It takes a spec and opens a pull request. A <b>reviewer</b> template reviews before merge.</p>
+    </div>
+    <ul>
+      <li><b>Your own tools:</b> drop <code>tools.json</code> and a script in <code>skills/&lt;name&gt;/</code>, and the tool server picks it up at start.</li>
+      <li><b>Fenced self-modification:</b> builders can change the system, but <code>config/protected-paths.json</code> blocks the files that own lifecycle and security.</li>
+      <li><b>Onboarding:</b> a fresh agent starts by learning who you are.</li>
+    </ul>
+  </div>
+</section>
+
+<section class="slide">
+  <div class="kicker">Install · today</div>
+  <h2>Before you start</h2>
+  <div class="grid2">
+    <ul>
+      <li><b>Docker</b> running (Engine 24+ with Compose v2), plus Git and <code>jq</code>.</li>
+      <li><b>A Claude account</b> to sign in with: <code>claude login</code>.</li>
+      <li><b>A Discord bot</b>: create the app, copy its token, invite it, and note your channel IDs. This is the slowest step, so do it first.</li>
+      <li>4 GB RAM minimum (8 recommended) and 10 GB of disk.</li>
+    </ul>
+    <div class="card">
+      <h3>Guides</h3>
+      <ul>
+        <li><a href="https://github.com/mcarmody/karakos-package/blob/main/docs/DISCORD_SETUP.md">docs/DISCORD_SETUP.md</a></li>
+        <li><a href="https://github.com/mcarmody/karakos-package/blob/main/docs/QUICKSTART.md">docs/QUICKSTART.md</a></li>
+      </ul>
+      <p class="muted" style="font-size:2.1vh;margin:1.4vh 0 0">The README estimates $5–15 a week for typical use; the caps keep a surprise small.</p>
+    </div>
+  </div>
+</section>
+
+<section class="slide">
+  <div class="kicker">Install · one line</div>
+  <h2>Run the installer, then answer the wizard</h2>
+  <p class="muted" style="font-size:2.2vh">macOS, Linux, or Windows through WSL2</p>
+<pre>curl -fsSL https://raw.githubusercontent.com/mcarmody/karakos-package/main/install.sh | bash</pre>
+  <ul>
+    <li>The wizard asks for a system name, your Claude login, the Discord token and channel IDs, and your spend caps.</li>
+    <li>It pulls the image, starts the container, and prints the dashboard password.</li>
+    <li>Open <b>http://localhost:3000</b>, log in as <code>admin</code>, and say hello in Discord.</li>
+    <li class="muted">On Windows, use the Linux one-liner inside WSL2. The PowerShell installer has not been retested for 2.0.</li>
+  </ul>
+</section>
+
+<section class="slide">
+  <div class="kicker">Live</div>
+  <h1>Demo:<br><span class="k">a household running on it</span></h1>
+  <p class="lead">The hub at home is the same lineage, grown up: several agents, voice, kitchen, garden, builds, and a nightly review of its own mistakes.</p>
+</section>
+
+<section class="slide">
+  <div class="kicker">Links</div>
+  <div class="grid-shot">
+    <div>
+      <h2>Get it</h2>
+      <ul>
+        <li><a href="https://github.com/mcarmody/karakos-package">github.com/mcarmody/karakos-package</a></li>
+        <li><a href="https://mcarmody.github.io/karakos-package/">mcarmody.github.io/karakos-package</a></li>
+        <li><span class="pill">v2.0.0</span> MIT licence. Issues and PRs welcome.</li>
+      </ul>
+    </div>
+    <img class="shot" src="img/site.png" alt="Karakos site">
+  </div>
+</section>
+
+<div class="footer"><span>Karakos 2.0</span><span id="count"></span></div>
+<div class="nav"><button id="prev" aria-label="Previous">←</button><button id="next" aria-label="Next">→</button></div>
+<script>
+  const slides = [...document.querySelectorAll('.slide')];
+  let i = Math.max(0, Math.min(slides.length - 1, (parseInt(location.hash.slice(1)) || 1) - 1));
+  function show(n) {
+    i = Math.max(0, Math.min(slides.length - 1, n));
+    slides.forEach((s, k) => s.classList.toggle('active', k === i));
+    document.getElementById('count').textContent = (i + 1) + ' / ' + slides.length;
+    history.replaceState(null, '', '#' + (i + 1));
+  }
+  document.addEventListener('keydown', e => {
+    if (['ArrowRight', 'PageDown', ' ', 'Enter'].includes(e.key)) { e.preventDefault(); show(i + 1); }
+    if (['ArrowLeft', 'PageUp', 'Backspace'].includes(e.key)) { e.preventDefault(); show(i - 1); }
+    if (e.key === 'Home') show(0);
+    if (e.key === 'End') show(slides.length - 1);
+  });
+  document.getElementById('next').onclick = () => show(i + 1);
+  document.getElementById('prev').onclick = () => show(i - 1);
+  show(i);
+</script>
+</body>
+</html>
