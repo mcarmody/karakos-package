@@ -1,0 +1,19 @@
+{
+  "_comment": "Answers for ./setup.sh --answers docs/answers.example.json. Copy, edit, keep out of git. Any field may be given as '<field>_env': 'ENV_VAR_NAME' instead of a literal value. Optional: 'claude_oauth_token' (or '_env') when the host has no 'claude login' session.",
+
+  "system_name": "Hearth",
+  "owner_name": "Alex",
+  "primary_agent_name": "Hearth",
+  "monitor_agent_name": "monitor",
+
+  "discord_bot_token_env": "KARAKOS_DISCORD_BOT_TOKEN",
+  "discord_bot_id": "1000000000000001",
+  "discord_server_id": "1000000000000002",
+  "channel_general": "1000000000000003",
+  "channel_signals": "1000000000000004",
+  "channel_staff": "",
+  "owner_discord_id": "1000000000000005",
+
+  "cost_daily_limit": "25.00",
+  "cost_monthly_limit": "500.00"
+}

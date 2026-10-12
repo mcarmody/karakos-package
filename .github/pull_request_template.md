@@ -8,6 +8,7 @@
 
 ## Checklist
 
+- [ ] Targets `develop` (not `main`)
 - [ ] Tests pass locally (`pytest`)
 - [ ] No secrets, tokens, or household-specific data included
 - [ ] Docs updated if behavior or setup steps changed

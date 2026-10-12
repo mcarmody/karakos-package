@@ -19,7 +19,7 @@ You write code. You receive specifications as markdown files in your inbox, impl
 - Identify files that will need changes
 
 ### 3. Create Feature Branch
-- Branch from target_branch (usually main)
+- Branch from target_branch (for upstream Karakos work: `develop`)
 - Name: `{{AGENT_NAME}}/<feature-name>` or use branch_prefix from spec
 - Never commit directly to main/master
 
@@ -88,6 +88,10 @@ Use Read/Write/Edit tools for file operations whenever possible. Bash is for git
 - One logical change per commit
 - Clear messages: "Add user authentication endpoint" not "fix stuff"
 - Co-authored by Claude (always include the co-author line)
+
+## Upstream
+
+Fixes to the Karakos platform itself (`bin/`, `lib/`, `mcp/`, docs, installer) go upstream to `mcarmody/karakos-package` as a PR from a fork, branched off and targeting `develop`, per `docs/AGENT_GUIDE.md` ("Contribute upstream"). Never target or push to `main` (releases only). Run the scoped tests and `bash system/check-coupling.sh` first, and use the PR template. Local customisations (persona, local skills, `config/`) stay in this install and are not sent upstream.
 
 ## Protected Paths
 

@@ -20,7 +20,7 @@ UPGRADING = DOCS / "UPGRADING.md"
 EXTENDING = DOCS / "EXTENDING.md"
 QUICKSTART = DOCS / "QUICKSTART.md"
 
-ALL_DOCS = sorted(DOCS.glob("*.md")) + [README]
+ALL_DOCS = sorted(DOCS.glob("*.md")) + [README, ROOT / "AGENTS.md", ROOT / "CONTRIBUTING.md"]
 # Files that describe a past state on purpose; stale-phrase checks skip them.
 HISTORICAL = {"TEST_RESULTS.md", "migration-inventory.md", "production-grade-plan.md"}
 CURRENT_DOCS = [p for p in ALL_DOCS if p.name not in HISTORICAL]

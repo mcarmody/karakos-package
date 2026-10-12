@@ -14,6 +14,18 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [2.0.1] - 2026-10-12
+
+### Added
+
+- `./setup.sh --answers <file.json>` (also `install.sh --answers` and `KARAKOS_ANSWERS`) runs the wizard without prompts, with secrets readable from environment variables; example in `docs/answers.example.json`.
+- `AGENTS.md` and `docs/AGENT_GUIDE.md`, an entry point and operating guide for coding agents (install, self-repair, self-improve, contribute upstream). `CLAUDE.md` imports `AGENTS.md`.
+
+### Changed
+
+- `install.sh` and `install.ps1` clone `main` explicitly; `KARAKOS_BRANCH` overrides it.
+- Branch model: PRs target `develop`; `main` takes releases only through a release PR. CI and the coupling check also run on PRs to `develop`. `CONTRIBUTING.md` rewritten, with a release process section.
+
 ### Fixed
 
 - `session` tool `load_last` now returns an explicit error when no agent identity is available (`KARAKOS_AGENT` unset and no `agent` argument) and rejects path-like agent names, instead of guessing (Fixes #160, "session tool: load_last can return another agent's summary").
@@ -187,7 +199,9 @@ Initial release: an installable multi-agent household system — Discord
 integration, local dashboard, episodic memory, session persistence, cost
 tracking, and builder/reviewer agents behind guardrails.
 
-[Unreleased]: https://github.com/mcarmody/karakos-package/compare/v1.5.0...HEAD
+[Unreleased]: https://github.com/mcarmody/karakos-package/compare/v2.0.1...HEAD
+[2.0.1]: https://github.com/mcarmody/karakos-package/compare/v2.0.0...v2.0.1
+[2.0.0]: https://github.com/mcarmody/karakos-package/compare/v1.5.0...v2.0.0
 [1.5.0]: https://github.com/mcarmody/karakos-package/compare/v1.4.1...v1.5.0
 [1.4.1]: https://github.com/mcarmody/karakos-package/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/mcarmody/karakos-package/compare/v1.3...v1.4.0
