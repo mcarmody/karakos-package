@@ -14,6 +14,10 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- Agents see where each message was posted: the batch line carries the channel name, channel id and server (Discord guild name, or `dm`), printed once per run of same-channel rows. A thread reads as `parent/thread`. Channels missing from `channels.json` show their Discord name instead of `unknown`. Queue rows for Discord messages now store the guild name in `server` rather than `discord`; `server` is also what the edit-reroute lookup matches on, so the relay's edit and reaction paths send the same value.
+
 ## [2.0.2] - 2026-10-19
 
 ### Fixed
