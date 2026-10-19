@@ -241,3 +241,26 @@ def test_backup_roots_include_an_existing_overlay(tmp_path):
     (config.parent / "overlay").mkdir()
     roots, _ = backup._sources(data, config)
     assert ("overlay", config.parent / "overlay") in roots
+
+
+def test_backup_and_restore_round_trip_with_an_overlay_repo(tmp_path):
+    """The overlay's git objects are read-only; a restore onto the live overlay must not fail,
+    and the overlay's own git history is not part of the backup."""
+    ws = tmp_path / "install"
+    data, config = ws / "data", ws / "config"
+    data.mkdir(parents=True)
+    write(config / "agents.yaml", "agents: {}\n")
+    ovd = init_overlay(ws)
+    write(ovd / "config" / "agents.yaml", "agents: {a: 1}\n")
+    git(ovd, "add", "config/agents.yaml")
+    assert git(ovd, "commit", "-q", "-m", "seam").returncode == 0
+
+    out = backup.backup(data, config, tmp_path / "backups")
+    m = backup.verify(out)
+    assert any(f["path"] == "overlay/config/agents.yaml" for f in m["files"])
+    assert not any("/.git/" in f["path"] for f in m["files"])
+
+    write(ovd / "config" / "agents.yaml", "agents: {changed: true}\n")
+    backup.restore(out, data_dir=data, config_dir=config)  # must not raise PermissionError
+    assert (ovd / "config" / "agents.yaml").read_text() == "agents: {a: 1}\n"
+    assert (ovd / ".git").is_dir()

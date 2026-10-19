@@ -26,6 +26,12 @@ def _copy(src, dst) -> None:
     except PermissionError:
         pass
 
+def _overlay_git(label, root, p) -> bool:
+    """The overlay's own .git is not backed up: its objects are read-only, so a restore onto
+    the live overlay would fail, and its history lives on the overlay's remote."""
+    return label == "overlay" and ".git" in p.relative_to(root).parts
+
+
 def _sha256(p: Path) -> str:
     h = hashlib.sha256()
     with open(p, "rb") as f:
@@ -82,7 +88,8 @@ def backup(data_dir, config_dir, dest) -> Path:
             for p in sorted(root.rglob("*")):
                 if p.is_file() and not p.name.endswith(_SKIP_SUFFIXES) \
                         and p.name != ".schema-version.tmp" \
-                        and dest not in p.parents and out not in p.parents:
+                        and dest not in p.parents and out not in p.parents \
+                        and not _overlay_git(label, root, p):
                     files.append((f"{label}/{p.relative_to(root).as_posix()}", p))
         if env:
             files.append((".env", env))
@@ -90,7 +97,8 @@ def backup(data_dir, config_dir, dest) -> Path:
         for label, root in roots:
             for p in sorted(root.rglob("*")):
                 if p.is_dir() and dest not in p.parents and p != dest \
-                        and out not in p.parents and p != out:
+                        and out not in p.parents and p != out \
+                        and not _overlay_git(label, root, p):
                     dirs.append(f"{label}/{p.relative_to(root).as_posix()}")
         entries = []
         for rel, src in files:
