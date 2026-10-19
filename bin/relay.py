@@ -180,6 +180,15 @@ def safe_attachment_name(filename: str, index: int) -> str:
 REPLY_CONTEXT_MAX_CHARS = 1000
 
 
+def server_label(obj) -> str:
+    """Guild name for a Discord channel or message, "dm" outside a guild.
+
+    Queue rows store this as `server`, and the edit lookup matches on it, so
+    every relay path that names a message must use this one helper."""
+    guild = getattr(obj, "guild", None)
+    return guild.name if guild else "dm"
+
+
 def format_reply_context(target, max_chars: int = REPLY_CONTEXT_MAX_CHARS) -> str:
     """Render the replied-to message as a delimited block for the agent.
 
@@ -516,6 +525,7 @@ ATTACHMENTS_DIR = WORKSPACE_ROOT / "data" / "attachments"
 # be refused identically on every refire.
 DEFERRED_MESSAGES_DIR = WORKSPACE_ROOT / "data" / "deferred-messages"
 HEALTH_FILE = WORKSPACE_ROOT / "data" / "health" / "relay.json"
+HEALTH_INTERVAL_S = 60
 
 # Attachments the relay will pull down before handing a message to an agent.
 # Discord's own ceiling is 25 MB on an unboosted server, so the default cap
@@ -564,6 +574,7 @@ agent_config: Dict = {}
 channels_config: Dict = {}
 registry_obj = None
 discord_id_to_agent: Dict[int, str] = {}
+discord_role_id_to_agent: Dict[int, str] = {}
 active_dispatches: Dict[str, asyncio.Task] = {}
 dispatch_semaphores: Dict[str, asyncio.Semaphore] = {}
 
@@ -593,7 +604,7 @@ def spool_deferred_message(payload: dict, reason: str) -> Optional[Path]:
 
 def load_config():
     """Load agent and channel configuration"""
-    global agent_config, channels_config, discord_id_to_agent, registry_obj
+    global agent_config, channels_config, discord_id_to_agent, discord_role_id_to_agent, registry_obj
 
     # Load agents (config/agents.yaml via the registry; no legacy fallback)
     try:
@@ -621,6 +632,16 @@ def load_config():
             bot_id = os.environ.get(bot_id_env)
             if bot_id:
                 discord_id_to_agent[int(bot_id)] = agent_name
+        role_id_env = config.get("discord_role_id_env")
+        if role_id_env:
+            role_id = os.environ.get(role_id_env)
+            if role_id:
+                discord_role_id_to_agent[int(role_id)] = agent_name
+
+    for name, cfg in (channels_config.get("channels") or {}).items():
+        if isinstance(cfg, dict) and cfg.get("mention_only") is True and cfg.get("reply_gate"):
+            log.error(f"channel '{name}' sets both mention_only and reply_gate; "
+                      f"treating it as mention_only (reply_gate ignored)")
 
     _config_state["mtimes"] = _config_mtimes()
     log.info(f"Loaded config for {len(agent_config)} agents, {len(channels_config.get('channels', {}))} channels")
@@ -657,7 +678,8 @@ def maybe_reload_config():
     current = _config_mtimes()
     if current == st["mtimes"]:
         return
-    saved = (agent_config, channels_config, registry_obj, dict(discord_id_to_agent))
+    saved = (agent_config, channels_config, registry_obj, dict(discord_id_to_agent),
+             dict(discord_role_id_to_agent))
     try:
         load_config()
         if registry_obj is None:
@@ -667,6 +689,8 @@ def maybe_reload_config():
         agent_config, channels_config, registry_obj = saved[:3]
         discord_id_to_agent.clear()
         discord_id_to_agent.update(saved[3])
+        discord_role_id_to_agent.clear()
+        discord_role_id_to_agent.update(saved[4])
         if st["failed"] != current:
             log.error(f"config reload failed, keeping previous config: {e}")
         st["failed"] = current
@@ -828,6 +852,7 @@ class DiscordAdapter(discord.Client):
         self.guest_budget = GuestBudget()
         self.presence = PresenceTracker()
         self._presence_task = None
+        self._health_task = None
 
     async def setup_hook(self):
         """Initialize HTTP session"""
@@ -843,6 +868,8 @@ class DiscordAdapter(discord.Client):
         """Bot logged in"""
         log.info(f"Discord bot ready as {self.user.name} (ID: {self.user.id})")
         await self.write_health_heartbeat()
+        if self._health_task is None or self._health_task.done():
+            self._health_task = asyncio.create_task(self.health_loop())
         self.start_presence_loop()
 
     async def on_resumed(self):
@@ -929,11 +956,18 @@ class DiscordAdapter(discord.Client):
             channel_config = channels_config.get("channels", {}).get(channel_name, {}) or {}
 
         # The mentioned agent (if any); routing is decided below.
+        mention_only = channel_config.get("mention_only") is True
         target_agent = None
         for mention in message.mentions:
             if mention.bot and mention.id in discord_id_to_agent:
                 target_agent = discord_id_to_agent[mention.id]
                 break
+        if target_agent is None:
+            for role in getattr(message, "role_mentions", None) or ():
+                agent = discord_role_id_to_agent.get(role.id)
+                if agent:
+                    target_agent = agent
+                    break
 
         # System commands run here, not in the agent. An agent that has stopped
         # reading its queue cannot process its own `/clear`, and that is the
@@ -964,7 +998,7 @@ class DiscordAdapter(discord.Client):
             self.guest_budget.reset(message.channel.id)
 
             raw_gate = channel_config.get("reply_gate")
-            if raw_gate:
+            if raw_gate and not mention_only:
                 gate_cfg = reply_gate_config.parse(raw_gate)
                 replied_to = None
                 ref = getattr(message, "reference", None)
@@ -1011,6 +1045,7 @@ class DiscordAdapter(discord.Client):
             registry_obj, own_name, target_agent, bool(message.author.bot),
             channel_opt_out=channel_config.get("route") is False,
             parent_channel_name=parent_name,
+            mention_only=mention_only,
         ) if registry_obj is not None else None
         if route is None:
             return  # No routing
@@ -1717,6 +1752,7 @@ class DiscordAdapter(discord.Client):
         route = routing.route_message(
             registry_obj, name, agent, False,
             channel_opt_out=(channels_config.get("channels", {}).get(name) or {}).get("route") is False,
+            mention_only=(channels_config.get("channels", {}).get(name) or {}).get("mention_only") is True,
         ) if registry_obj is not None else None
         if route is None:
             return
@@ -1735,7 +1771,7 @@ class DiscordAdapter(discord.Client):
             "shard": route.shard,
             "channel": name,
             "channel_id": str(payload.channel_id),
-            "server": "discord",
+            "server": server_label(channel),
             "author": reactor,
             "author_id": str(payload.user_id),
             "is_bot": False,
@@ -1805,7 +1841,7 @@ class DiscordAdapter(discord.Client):
             return
         cached = getattr(payload, "cached_message", None)
         ok, detail, body = await self.agent_server_post_json("/message/edit", {
-            "server": "discord",
+            "server": server_label(channel),
             "message_id": str(payload.message_id),
             "channel_id": str(payload.channel_id),
             "author_id": str(author_id),
@@ -1911,8 +1947,17 @@ class DiscordAdapter(discord.Client):
         """Send message to agent server"""
         agent = route.agent
         channel_name, thread_parent = self.resolve_channel(message.channel)
+        parent = getattr(message.channel, "parent", None)
         if not channel_name:
-            channel_name = "unknown"
+            channel_name = (getattr(message.channel, "name", None)
+                            or getattr(parent, "name", None) or "unknown")
+        if parent is not None:
+            # A thread reads as "parent/thread" so the agent can tell where it is.
+            parent_label = channel_name if thread_parent else getattr(parent, "name", None)
+            thread_label = getattr(message.channel, "name", None)
+            if parent_label and thread_label:
+                channel_name = f"{parent_label}/{thread_label}"
+        guild = getattr(message, "guild", None)
 
         attachments = await self.download_attachments(message)
 
@@ -1930,13 +1975,16 @@ class DiscordAdapter(discord.Client):
             "shard": route.shard,
             "channel": channel_name,
             "channel_id": str(message.channel.id),
-            "server": "discord",
+            "server": server_label(message),
+            "guild_id": str(guild.id) if guild else None,
             "author": message.author.display_name,
             "author_id": str(message.author.id),
             "is_bot": message.author.bot,
             "content": content,
             "message_id": str(message.id),
-            "mentions_agent": any(m.id in discord_id_to_agent for m in message.mentions),
+            "mentions_agent": any(m.id in discord_id_to_agent for m in message.mentions) or any(
+                r.id in discord_role_id_to_agent
+                for r in getattr(message, "role_mentions", None) or ()),
             "attachments": attachments,
         }
         if thread_parent:
@@ -2007,15 +2055,23 @@ class DiscordAdapter(discord.Client):
             HEALTH_FILE.parent.mkdir(parents=True, exist_ok=True)
             with open(HEALTH_FILE, "w") as f:
                 json.dump({
-                    "timestamp": datetime.now().isoformat(),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
                     "status": "healthy",
                     "reply_gate": dict(self.reply_gate.stats),
                 }, f)
         except OSError as e:
             log.debug("health heartbeat failed: %s", e)
 
+    async def health_loop(self):
+        """Refresh relay.json so the monitor's 300 s staleness check sees a live relay."""
+        while True:
+            await self.write_health_heartbeat()
+            await asyncio.sleep(HEALTH_INTERVAL_S)
+
     async def close(self):
         """Cleanup on shutdown"""
+        if self._health_task:
+            self._health_task.cancel()
         if self._presence_task:
             self._presence_task.cancel()
         if self.http_session:

@@ -1555,7 +1555,7 @@ async def record_rate_limit_event(agent: str, info, now=None) -> None:
             " WHERE rate_limit_type = ?", (resets_at, u.type))
 
         consumed = ("in the warning band" if progress is None
-                    else f"{progress * 100:.0f}% through the window")
+                    else f"{progress * 100:.0f}% of the window's time elapsed")
         log.warning(f"{agent} rate-limit headroom low: type={u.type}, "
                     f"status={u.status}, {consumed}")
 
@@ -2029,6 +2029,15 @@ def ux_thread_cfg(channel_id) -> Optional["discord_ux.ThreadCfg"]:
     if name is None:
         return None
     return ux_config().for_channel(name).threads
+
+
+def ux_tool_streaming(channel_id) -> Optional[bool]:
+    """A channel's `ux.tool_streaming` override, or None to inherit the agent's
+    setting. Never raises: a UX lookup must not cost the turn."""
+    try:
+        return ux_for_channel_id(channel_id).tool_streaming
+    except Exception:
+        return None
 
 
 def _ux_now() -> float:
@@ -2904,7 +2913,8 @@ async def handle_message_edit(request):
     row, followups = await load()
     if row is None:
         return web.json_response({"status": "unknown", "message_id": message_id})
-    cfg = ux_config().for_channel(row["channel"]).edit_reroute
+    # A thread row is labelled "parent/thread"; the parent's config governs it.
+    cfg = ux_config().for_channel((row["channel"] or "").split("/", 1)[0]).edit_reroute
     if cfg is None:
         return web.json_response({"status": "disabled", "message_id": message_id})
 
@@ -4830,7 +4840,14 @@ async def graceful_shutdown(sig):
         await http_session.close()
 
     log.info("Shutdown complete")
-    sys.exit(0)
+
+
+async def _shutdown_and_exit(sig):
+    """Signal-handler task. Exits via os._exit, not sys.exit: a SystemExit raised
+    inside a task is never retrieved, so asyncio logged it as an unhandled task error."""
+    await graceful_shutdown(sig)
+    logging.shutdown()
+    os._exit(0)
 
 # =============================================================================
 # Server Startup
@@ -4922,8 +4939,8 @@ async def startup(app):
 
     # Register signal handlers in event loop context
     loop = asyncio.get_running_loop()
-    loop.add_signal_handler(signal.SIGTERM, lambda: asyncio.create_task(graceful_shutdown("SIGTERM")))
-    loop.add_signal_handler(signal.SIGINT, lambda: asyncio.create_task(graceful_shutdown("SIGINT")))
+    loop.add_signal_handler(signal.SIGTERM, lambda: asyncio.create_task(_shutdown_and_exit("SIGTERM")))
+    loop.add_signal_handler(signal.SIGINT, lambda: asyncio.create_task(_shutdown_and_exit("SIGINT")))
 
     log.info(f"Agent server ready on port {PORT}")
 

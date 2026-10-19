@@ -81,6 +81,9 @@ Files, *in container*: `logs/agent-server.log`, `logs/relay.log`,
 heartbeats are `data/health/*.json` and `data/health/agents/<agent>.json`. The full
 tree is in [ARCHITECTURE.md](ARCHITECTURE.md#data-layout). The signals channel
 gets health alerts (`bin/health-monitor.py` daily, `bin/wedge-check.py` every minute).
+For a one-shot, read-only check of the whole install from inside the container, run
+`python3 bin/self-diagnose.py` (add `--json` for tools; exit 1 on any warn or critical). `python3 bin/self-test.py` runs that, then calls one
+read-only tool on each MCP server and reports PASS or FAIL per step.
 
 ## Self-repair
 
@@ -102,6 +105,23 @@ destroying data (`down -v`, `reset`) is not: ask first. Run the API calls with
 If none of these fit, read `make logs`, then `logs/agent-server.log`, and write
 down what you saw before changing anything. If the cause is a platform bug,
 [contribute the fix](#contribute-upstream).
+
+## Managing yourself
+
+The `karakos-admin` MCP tools (`mcp/admin-server.py`) let an agent look at and steer its own runtime:
+
+- `get_usage`: rate-limit headroom for every agent (`GET /usage`).
+- `get_cost`: spend for every agent, or one with `agent` (`GET /cost`, `GET /cost/<agent>`).
+- `tail_log`: last lines of `logs/<service>.log`, secrets redacted (default 40, max 200).
+- `set_effort`: set reasoning effort: low, medium, high, xhigh, max, or default.
+- `get_queue`: what an agent still has to answer.
+- `pause_agent` / `resume_agent`: hold or release a queue, optionally for 1-1440 minutes.
+- `get_findings`: the latest health findings summary.
+
+Self-scoping: `reload_agent`, `reset_agent`, `set_effort`, `pause_agent` and `resume_agent`
+act on the calling agent only. A primary agent (`role: primary` in `config/agents.yaml`) or an
+operator with no agent identity may act on any agent. Anyone else gets a permission error:
+ask the primary agent or the owner.
 
 ## Self-improve
 
@@ -184,6 +204,9 @@ only through a release PR from `develop` that the maintainer approves; do not op
 PRs against it, push to it or tag. Both branches require a PR and passing checks
 `lint-and-syntax`, `unit-tests` and `docker-smoke`, and forbid force-push and
 deletion. Process and releases: [CONTRIBUTING.md](../CONTRIBUTING.md).
+
+Fixes to the package go upstream as PRs against `develop`. Personal changes (config,
+personas, skills) go in the private overlay, never in a fork: see [OVERLAY.md](OVERLAY.md).
 
 You need an authenticated `gh` (`gh auth login`, or `GH_TOKEN` in the environment).
 

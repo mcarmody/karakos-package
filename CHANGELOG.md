@@ -18,6 +18,45 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - `bin/buildq doctor [--json]` checks what a build needs (config, queue database, builder and reviewer agents, `claude`/`git`/`gh` per host, GitHub auth) and exits non-zero on any failure. `bin/buildq enable [--no-agents]` turns the queue on, creates the builder and reviewer agents when missing, and runs the doctor. Both work while the queue is disabled.
 - GitHub CLI (`gh`) in the image, from GitHub's apt repository, so builds can open PRs without a host install.
+- Self-management tools in the `karakos-admin` MCP server: `get_usage`, `get_cost`, `tail_log`, `set_effort`, `get_queue`, `pause_agent`, `resume_agent` and `get_findings`. An agent may reload, reset, set effort on, pause or resume only itself, unless it is the primary or the call is an operator's. (Refs #232, "MÍRDAIN G1: `self` ops surface in the admin MCP")
+- Friction review (no LLM): `lib/friction_review.py`, `bin/friction-review.py` and a nightly `friction-review` job group the friction log into recurring causes and write `data/friction/YYYY-MM-DD.md` with a drafted issue and proposed fix each. Nothing is filed or edited automatically: `--file --yes` is the explicit, once-per-cause approval step, and only for causes seen on two separate days. (Refs #237, build B; the `friction` MCP action is a follow-up)
+- Friction sensor (no LLM): `lib/friction.py`, `bin/friction-sensor.py` and an hourly `friction-sensor` job scan the agent stream logs for tool errors, non-zero Bash exits, denials, rate-limit pressure and repeated commands, append to `data/friction-log.jsonl` and refresh `data/friction/weekly.md`. Read-only: nothing edits a prompt or persona. (Refs #237, build A; the nightly review and `friction` MCP action are build B)
+- `bin/self-test.py`: runs `bin/self-diagnose.py`, then starts both MCP servers over stdio and calls one read-only tool on each; PASS/FAIL per step, `--json`, exit 0/1. (Refs #236, part 2; builds on the `bin/self-diagnose.py` PR)
+- `bin/self-diagnose.py`: read-only whole-install diagnosis (agent server health, outbox, monitor findings, job heartbeats, pre-commit hook, disk, schema stamp, log errors), ranked output, `--json`, exit 0/1. (Refs #236, part 1; the admin MCP tool, `--self-test` canary, build-queue and version-drift sections are follow-ups)
+
+## [2.1.0] - 2026-10-19
+
+### Changed
+
+- Agents see where each message was posted: the batch line carries the channel name, channel id and server (Discord guild name, or `dm`), printed once per run of same-channel rows. A thread reads as `parent/thread`. Channels missing from `channels.json` show their Discord name instead of `unknown`. Queue rows for Discord messages now store the guild name in `server` rather than `discord`; `server` is also what the edit-reroute lookup matches on, so the relay's edit and reaction paths send the same value.
+
+### Added
+
+- Private overlay repo for per-install data: `overlay/` is its own git repo holding config, personas and skills (named seams), applied over the package so installs never fork it; `bin/overlay.py` runs `init`, `status`, `apply`, `capture`, `pull`, `push` and `check-secrets`. (Refs #243, "MÍRDAIN G12: a private overlay repo for per-install data, so installs never fork the package")
+- Memory hygiene: `memory` gains `forget` and `supersede`, `graph` gains `delete_entity`, `delete_edge` and `merge_entities`, `taskboard` gains `delete`. All are soft deletes with a `memory_audit` row (tombstone for tasks); hard delete stays operator-only. (Refs #238, build A; the dedup script is build B and not included)
+- Per-channel `ux.tool_streaming` in `channels.json`: a channel can turn the tool-activity lines on or off, overriding the agent's `tool_streaming`; unset inherits the agent setting. (Refs #228, "v2.0.0 fresh-install defects from Babybel live-fire check")
+
+### Fixed
+
+- Fresh install initialises the memory graph at first boot (`data/memory/graph.db`), so `memory` and `graph` tools no longer report uninitialised; the not-initialised message names both `python3 -m lib.graph init` (fresh install) and `karakos migrate` (1.x upgrade). Fixes #227 ("Fresh install leaves memory graph uninitialised"). (Refs #228, "v2.0.0 fresh-install defects from Babybel live-fire check")
+- Rate-limit warning says "of the window's time elapsed" instead of "through the window", so elapsed time is no longer read as usage. (Refs #228, "v2.0.0 fresh-install defects from Babybel live-fire check")
+- Agent server exits 0 on SIGTERM/SIGINT without a "Task exception was never retrieved" traceback: the shutdown handler no longer raises `SystemExit` inside a task. (Refs #228, "v2.0.0 fresh-install defects from Babybel live-fire check")
+- `preflight.sh` passes the Docker engine, Compose v2 and WSL integration checks inside the container (`/.dockerenv` or `KARAKOS_IN_CONTAINER=1`) instead of failing on host-only tooling. (Refs #228, "v2.0.0 fresh-install defects from Babybel live-fire check")
+- `workspace status` reports the real release: `installed_version` (and `version`) comes from the root `VERSION` file, and `schema_version` from `data/.schema-version`; `VERSION` is in the image and the release process sets it. (Refs #228, "v2.0.0 fresh-install defects from Babybel live-fire check")
+
+### Removed
+
+- The `discord` tool's `online` action. It never worked: the agent environment holds no Discord token. (Refs #228, "v2.0.0 fresh-install defects from Babybel live-fire check")
+
+## [2.0.2] - 2026-10-19
+
+### Fixed
+
+- Relay refreshes `relay.json` every 60 s from a background task, so the monitor's 300 s staleness check no longer pages on a quiet relay; the heartbeat timestamp is now UTC. (Refs #228, "v2.0.0 fresh-install defects from Babybel live-fire check")
+- MCP tools server refreshes `mcp-tools.json` every 120 s while it runs (not in `--test-tool` mode), so the 600 s staleness check no longer pages on a quiet server. (Refs #228, "v2.0.0 fresh-install defects from Babybel live-fire check")
+- Drift check no longer reports `job-late` for a job whose two most recent runs straddle a scheduler restart. (Refs #228, "v2.0.0 fresh-install defects from Babybel live-fire check")
+- `register-discord-commands.py` sends a `User-Agent` header, so slash-command registration no longer fails with HTTP 403 "error code: 1010". (Refs #228, "v2.0.0 fresh-install defects from Babybel live-fire check")
+- `wait-for` no longer times out early when the clock reads a whole second. (PR #226)
 
 ## [2.0.1] - 2026-10-12
 
@@ -204,7 +243,9 @@ Initial release: an installable multi-agent household system — Discord
 integration, local dashboard, episodic memory, session persistence, cost
 tracking, and builder/reviewer agents behind guardrails.
 
-[Unreleased]: https://github.com/mcarmody/karakos-package/compare/v2.0.1...HEAD
+[Unreleased]: https://github.com/mcarmody/karakos-package/compare/v2.1.0...develop
+[2.1.0]: https://github.com/mcarmody/karakos-package/compare/v2.0.2...v2.1.0
+[2.0.2]: https://github.com/mcarmody/karakos-package/compare/v2.0.1...v2.0.2
 [2.0.1]: https://github.com/mcarmody/karakos-package/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/mcarmody/karakos-package/compare/v1.5.0...v2.0.0
 [1.5.0]: https://github.com/mcarmody/karakos-package/compare/v1.4.1...v1.5.0

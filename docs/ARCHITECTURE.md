@@ -281,6 +281,8 @@ Replaces cron, with the container's full environment. The loop ticks every
 | Flush deferred messages | every 5 min | `bin/flush-deferred-messages.py` |
 | Claude CLI rollback guard | at startup, then hourly | `bin/cli-upgrade-watchdog.sh` |
 | Memory consolidation | daily 03:00 | `lib/monitor_jobs/memory_consolidate.py` (also `bin/graph-consolidate.py [--dry-run]`) |
+| Friction sensor | hourly, offset :10 | `lib/monitor_jobs/friction_sensor.py` (also `bin/friction-sensor.py [--summary]`): scans `logs/agent-streams/` for tool errors, non-zero Bash exits, denials, rate-limit pressure and repeated commands; appends to `data/friction-log.jsonl`, refreshes `data/friction/weekly.md`. No LLM, read-only on the logs |
+| Friction review | daily 03:30 | `lib/monitor_jobs/friction_review.py` (also `bin/friction-review.py`): groups `data/friction-log.jsonl` into recurring causes, writes `data/friction/YYYY-MM-DD.md` with a drafted issue and proposed fix per cause. Report only; filing upstream needs `--file --yes` from a person and only covers causes seen on two separate days |
 | Health monitor | daily 04:00 | `bin/health-monitor.py` |
 | Data purge | daily 04:30 | `bin/purge-data.py` |
 | Update check | Mondays 05:00 | `bin/check-updates.sh` — pokes signals on a new release |
@@ -483,7 +485,7 @@ required. Keys, all optional: `model`, `effort` (`low`, `medium`, `high`,
 `reset_mode`, `prompt` (and the legacy `system_prompt`), `tool_streaming`,
 `stream_to_channel`, `dashboard_chat`, `allowed_tools`, `disallowed_tools`,
 `env`, `label`, `work_stealing`, `steering`, `shards` (each with its `channels`)
-and `discord` (`token_env`, `bot_id_env`). Unknown keys warn and are ignored.
+and `discord` (`token_env`, `bot_id_env`, `role_id_env`). Unknown keys warn and are ignored.
 The server reads it at start and on reload; the relay re-reads it when the file
 changes.
 
@@ -497,6 +499,8 @@ Extension points are four hooks, `before_claim`, `on_turn_start`, `on_event` and
 account breaker, the token budget and the weekly governor (see
 [Guard rails](#guard-rails)). A gate that defers a drain changes nothing in the
 queue or in shard states and arms a timer to resume.
+
+Each queued row reaches the model as `[created_at] [#channel (channel <id>, server <name>)] author: content`; the location tag is printed only where it differs from the row before (an unresolved channel shows `channel <id>, server <name>`). The relay sets `server` to the Discord guild name (`dm` outside a guild) and a thread's `channel` to `parent/thread`.
 
 ## Queue and sessions
 
@@ -613,6 +617,17 @@ job (`lib/graph/consolidate.py`) builds episodes from the previous day's
 messages, decays and archives them, merges duplicates, tidies entities and
 backfills embeddings.
 
+**Cleaning memory:** agents delete softly. `memory.forget` archives one
+observation and `memory.supersede` replaces it with new text (the old row gets
+`superseded_by`); both drop out of recall. `graph.delete_entity` archives an
+entity and removes its edges, `graph.delete_edge` removes one relation, and
+`graph.merge_entities` folds one entity into another (observations, mentions,
+aliases and edges move; the old name keeps resolving). Every call writes a
+`memory_audit` row with the agent, reason and, for edges, the removed row.
+The table is created on first use, so the schema version does not change.
+Hard delete is not an agent action. `taskboard.delete` tombstones a task with
+`deleted_at` in `data/taskboard.json`; `list` hides it.
+
 ## Comms
 
 - **Relay routing.** The relay holds the one Discord websocket and sends each
@@ -635,7 +650,8 @@ backfills embeddings.
   carries `outbox` (`pending`, `sending`, `dead`, `oldest_pending_age_s`);
   `dead_letters` counts dead rows and `dead_letter_path` is deprecated.
 - **Discord switches** (all off by default; `threads`, `reaction_notices`,
-  `edit_reroute`, `suppress_embeds`): [DISCORD_SETUP.md](DISCORD_SETUP.md#optional-behaviours).
+  `edit_reroute`, `suppress_embeds`; `tool_streaming` is a per-channel override of
+  the agent's setting): [DISCORD_SETUP.md](DISCORD_SETUP.md#optional-behaviours).
 - **Pause and effort.** `/pause [minutes]` and `/resume` hold and release a
   shard's queue (`lib/operator_pause.py`, `data/operator-pause.json`; the turn in
   progress finishes). `/effort <level>` sets an agent-level `--effort` override
@@ -734,6 +750,9 @@ data/                                  # named volume
 │   ├── claude-cli.json                # known-good CLI version
 │   └── wedge-check-state.json
 ├── taskboard.json
+├── friction-log.jsonl                 # friction sensor events (hourly scan)
+├── friction/weekly.md                 # 7-day friction summary
+├── friction/YYYY-MM-DD.md             # nightly review: causes and drafted issues
 ├── outbox/outbox.db                   # durable Discord replies: retry + audit (6.1)
 ├── build-queue.db                     # build queue (when enabled)
 ├── discord-dead-letter.jsonl.migrated # 1.x dead letters, imported into the outbox and kept
