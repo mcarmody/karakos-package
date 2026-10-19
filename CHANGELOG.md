@@ -14,6 +14,11 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `bin/buildq doctor [--json]` checks what a build needs (config, queue database, builder and reviewer agents, `claude`/`git`/`gh` per host, GitHub auth) and exits non-zero on any failure. `bin/buildq enable [--no-agents]` turns the queue on, creates the builder and reviewer agents when missing, and runs the doctor. Both work while the queue is disabled.
+- GitHub CLI (`gh`) in the image, from GitHub's apt repository, so builds can open PRs without a host install.
+
 ## [2.0.1] - 2026-10-12
 
 ### Added
