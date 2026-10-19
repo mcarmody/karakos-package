@@ -44,8 +44,6 @@ from _handshake import initialize_result  # noqa: E402
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
-import yaml  # PyYAML, in requirements.txt
-
 WORKSPACE_ROOT = Path(os.environ.get("WORKSPACE_ROOT", str(Path(__file__).resolve().parent.parent)))
 SERVER_URL = os.environ.get("AGENT_SERVER_URL", f"http://127.0.0.1:{os.environ.get('AGENT_SERVER_PORT', '18791')}").rstrip("/")
 TOKEN = os.environ.get("AGENT_SERVER_TOKEN", "")
@@ -104,6 +102,7 @@ def tool_reload_agent(args: dict) -> dict:
     name = args.get("name")
     if not name or not NAME_RE.match(name):
         raise ValueError(f"invalid agent name: {name!r}")
+    _check_scope(name)
     return _http("POST", f"/agents/{name}/reload")
 
 
@@ -113,6 +112,7 @@ def tool_reset_agent(args: dict) -> dict:
     name = args.get("name")
     if not name or not NAME_RE.match(name):
         raise ValueError(f"invalid agent name: {name!r}")
+    _check_scope(name)
     return _http("POST", f"/agents/{name}/reset")
 
 
@@ -172,6 +172,7 @@ def _caller() -> str:
 def _role_of(agent: str) -> str | None:
     """agents.<agent>.role from config/agents.yaml; None on any read error."""
     try:
+        import yaml  # PyYAML, in requirements.txt; a missing module means role unknown
         data = yaml.safe_load((WORKSPACE_ROOT / "config" / "agents.yaml").read_text()) or {}
         role = ((data.get("agents") or {}).get(agent) or {}).get("role")
     except Exception:  # noqa: BLE001 - unreadable or malformed registry: role unknown

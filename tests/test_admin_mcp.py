@@ -256,6 +256,31 @@ def test_scope_denial_over_rpc(tmp_path, monkeypatch):
     assert "may only manage itself" in resp["error"]["message"]
 
 
+def test_reload_and_reset_scoped_to_self(admin, http_calls, monkeypatch, tmp_path):
+    monkeypatch.setattr(admin, "WORKSPACE_ROOT", tmp_path)
+    _write_agents(tmp_path, {"worker": "builder"})
+    monkeypatch.setenv("KARAKOS_AGENT", "worker")
+    for tool in (admin.tool_reload_agent, admin.tool_reset_agent):
+        with pytest.raises(PermissionError):
+            tool({"name": "marvin"})
+    assert http_calls == []
+    admin.tool_reload_agent({"name": "worker"})
+    admin.tool_reset_agent({"name": "worker"})
+    assert http_calls == [
+        ("POST", "/agents/worker/reload", None),
+        ("POST", "/agents/worker/reset", None),
+    ]
+
+
+def test_reload_and_reset_unscoped_for_operator(admin, http_calls, no_caller):
+    admin.tool_reload_agent({"name": "marvin"})
+    admin.tool_reset_agent({"name": "marvin"})
+    assert http_calls == [
+        ("POST", "/agents/marvin/reload", None),
+        ("POST", "/agents/marvin/reset", None),
+    ]
+
+
 def test_get_cost_all_and_one(admin, http_calls, no_caller):
     admin.tool_get_cost({})
     admin.tool_get_cost({"agent": "marvin"})
