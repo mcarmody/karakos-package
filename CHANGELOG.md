@@ -14,6 +14,14 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Per-channel `ux.tool_streaming` in `channels.json`: a channel can turn the tool-activity lines on or off, overriding the agent's `tool_streaming`; unset inherits the agent setting. (Refs #228, "v2.0.0 fresh-install defects from Babybel live-fire check")
+
+### Removed
+
+- The `discord` tool's `online` action. It never worked: the agent environment holds no Discord token. (Refs #228, "v2.0.0 fresh-install defects from Babybel live-fire check")
+
 ## [2.0.2] - 2026-10-19
 
 ### Fixed
