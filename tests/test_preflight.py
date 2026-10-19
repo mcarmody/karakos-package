@@ -156,6 +156,7 @@ def run(tmp_path: Path, mock_bin: Path | None = None,
 
     env = os.environ.copy()
     env.pop("WSL_DISTRO_NAME", None)  # Never run WSL check unless test explicitly sets it
+    env.pop("KARAKOS_IN_CONTAINER", None)  # Host run unless a test explicitly sets it
     env["PREFLIGHT_REPO_ROOT"] = str(repo_root)
 
     if mock_bin is not None:
