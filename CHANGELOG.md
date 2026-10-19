@@ -14,6 +14,30 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-10-19
+
+### Changed
+
+- Agents see where each message was posted: the batch line carries the channel name, channel id and server (Discord guild name, or `dm`), printed once per run of same-channel rows. A thread reads as `parent/thread`. Channels missing from `channels.json` show their Discord name instead of `unknown`. Queue rows for Discord messages now store the guild name in `server` rather than `discord`; `server` is also what the edit-reroute lookup matches on, so the relay's edit and reaction paths send the same value.
+
+### Added
+
+- Private overlay repo for per-install data: `overlay/` is its own git repo holding config, personas and skills (named seams), applied over the package so installs never fork it; `bin/overlay.py` runs `init`, `status`, `apply`, `capture`, `pull`, `push` and `check-secrets`. (Refs #243, "MÍRDAIN G12: a private overlay repo for per-install data, so installs never fork the package")
+- Memory hygiene: `memory` gains `forget` and `supersede`, `graph` gains `delete_entity`, `delete_edge` and `merge_entities`, `taskboard` gains `delete`. All are soft deletes with a `memory_audit` row (tombstone for tasks); hard delete stays operator-only. (Refs #238, build A; the dedup script is build B and not included)
+- Per-channel `ux.tool_streaming` in `channels.json`: a channel can turn the tool-activity lines on or off, overriding the agent's `tool_streaming`; unset inherits the agent setting. (Refs #228, "v2.0.0 fresh-install defects from Babybel live-fire check")
+
+### Fixed
+
+- Fresh install initialises the memory graph at first boot (`data/memory/graph.db`), so `memory` and `graph` tools no longer report uninitialised; the not-initialised message names both `python3 -m lib.graph init` (fresh install) and `karakos migrate` (1.x upgrade). Fixes #227 ("Fresh install leaves memory graph uninitialised"). (Refs #228, "v2.0.0 fresh-install defects from Babybel live-fire check")
+- Rate-limit warning says "of the window's time elapsed" instead of "through the window", so elapsed time is no longer read as usage. (Refs #228, "v2.0.0 fresh-install defects from Babybel live-fire check")
+- Agent server exits 0 on SIGTERM/SIGINT without a "Task exception was never retrieved" traceback: the shutdown handler no longer raises `SystemExit` inside a task. (Refs #228, "v2.0.0 fresh-install defects from Babybel live-fire check")
+- `preflight.sh` passes the Docker engine, Compose v2 and WSL integration checks inside the container (`/.dockerenv` or `KARAKOS_IN_CONTAINER=1`) instead of failing on host-only tooling. (Refs #228, "v2.0.0 fresh-install defects from Babybel live-fire check")
+- `workspace status` reports the real release: `installed_version` (and `version`) comes from the root `VERSION` file, and `schema_version` from `data/.schema-version`; `VERSION` is in the image and the release process sets it. (Refs #228, "v2.0.0 fresh-install defects from Babybel live-fire check")
+
+### Removed
+
+- The `discord` tool's `online` action. It never worked: the agent environment holds no Discord token. (Refs #228, "v2.0.0 fresh-install defects from Babybel live-fire check")
+
 ## [2.0.2] - 2026-10-19
 
 ### Fixed
@@ -209,7 +233,8 @@ Initial release: an installable multi-agent household system — Discord
 integration, local dashboard, episodic memory, session persistence, cost
 tracking, and builder/reviewer agents behind guardrails.
 
-[Unreleased]: https://github.com/mcarmody/karakos-package/compare/v2.0.2...HEAD
+[Unreleased]: https://github.com/mcarmody/karakos-package/compare/v2.1.0...develop
+[2.1.0]: https://github.com/mcarmody/karakos-package/compare/v2.0.2...v2.1.0
 [2.0.2]: https://github.com/mcarmody/karakos-package/compare/v2.0.1...v2.0.2
 [2.0.1]: https://github.com/mcarmody/karakos-package/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/mcarmody/karakos-package/compare/v1.5.0...v2.0.0

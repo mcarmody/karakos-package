@@ -498,6 +498,8 @@ account breaker, the token budget and the weekly governor (see
 [Guard rails](#guard-rails)). A gate that defers a drain changes nothing in the
 queue or in shard states and arms a timer to resume.
 
+Each queued row reaches the model as `[created_at] [#channel (channel <id>, server <name>)] author: content`; the location tag is printed only where it differs from the row before (an unresolved channel shows `channel <id>, server <name>`). The relay sets `server` to the Discord guild name (`dm` outside a guild) and a thread's `channel` to `parent/thread`.
+
 ## Queue and sessions
 
 `data/memory/agent-server.db` holds `message_queue`, `sessions`, `cost_events`
@@ -613,6 +615,17 @@ job (`lib/graph/consolidate.py`) builds episodes from the previous day's
 messages, decays and archives them, merges duplicates, tidies entities and
 backfills embeddings.
 
+**Cleaning memory:** agents delete softly. `memory.forget` archives one
+observation and `memory.supersede` replaces it with new text (the old row gets
+`superseded_by`); both drop out of recall. `graph.delete_entity` archives an
+entity and removes its edges, `graph.delete_edge` removes one relation, and
+`graph.merge_entities` folds one entity into another (observations, mentions,
+aliases and edges move; the old name keeps resolving). Every call writes a
+`memory_audit` row with the agent, reason and, for edges, the removed row.
+The table is created on first use, so the schema version does not change.
+Hard delete is not an agent action. `taskboard.delete` tombstones a task with
+`deleted_at` in `data/taskboard.json`; `list` hides it.
+
 ## Comms
 
 - **Relay routing.** The relay holds the one Discord websocket and sends each
@@ -635,7 +648,8 @@ backfills embeddings.
   carries `outbox` (`pending`, `sending`, `dead`, `oldest_pending_age_s`);
   `dead_letters` counts dead rows and `dead_letter_path` is deprecated.
 - **Discord switches** (all off by default; `threads`, `reaction_notices`,
-  `edit_reroute`, `suppress_embeds`): [DISCORD_SETUP.md](DISCORD_SETUP.md#optional-behaviours).
+  `edit_reroute`, `suppress_embeds`; `tool_streaming` is a per-channel override of
+  the agent's setting): [DISCORD_SETUP.md](DISCORD_SETUP.md#optional-behaviours).
 - **Pause and effort.** `/pause [minutes]` and `/resume` hold and release a
   shard's queue (`lib/operator_pause.py`, `data/operator-pause.json`; the turn in
   progress finishes). `/effort <level>` sets an agent-level `--effort` override
