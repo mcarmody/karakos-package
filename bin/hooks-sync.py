@@ -29,8 +29,7 @@ def _cmd(name: str) -> dict:
 
 
 def desired(cfg: dict) -> dict[str, list[dict]]:
-    bash = [_cmd("bash-safety-rails.py"), _cmd("block-bare-ssh.py"),
-            _cmd("protected-paths-edit.py")]
+    bash = [_cmd("bash-safety-rails.py"), _cmd("block-bare-ssh.py")]
     if cfg.get("heavy_build_block") is True:
         bash.append(_cmd("block-heavy-build.py"))
     return {
@@ -39,7 +38,8 @@ def desired(cfg: dict) -> dict[str, list[dict]]:
         ],
         "PreToolUse": [
             {"matcher": "Edit|Write|MultiEdit|Read", "hooks": [_cmd("resolve-symlink-edit.py")]},
-            {"matcher": "Edit|Write|MultiEdit|NotebookEdit", "hooks": [_cmd("protected-paths-edit.py")]},
+            # One group for the file tools and Bash: a hook script is wired exactly once.
+            {"matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash", "hooks": [_cmd("protected-paths-edit.py")]},
             {"matcher": "Bash", "hooks": bash},
         ],
         "Stop": [

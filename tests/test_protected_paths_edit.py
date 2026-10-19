@@ -175,18 +175,17 @@ def test_hook_is_executable():
     assert HOOK.stat().st_mode & stat.S_IXUSR
 
 
-def test_hooks_sync_wires_hook_for_file_tools_and_bash():
+def test_hooks_sync_wires_hook_once_for_file_tools_and_bash():
     desired = import_script("hooks-sync").desired({})["PreToolUse"]
-    by_matcher = {g["matcher"]: [h["command"] for h in g["hooks"]] for g in desired}
-    assert any(c.endswith("protected-paths-edit.py")
-               for c in by_matcher["Edit|Write|MultiEdit|NotebookEdit"])
-    bash_cmds = by_matcher["Bash"]
-    assert bash_cmds[-1].endswith("protected-paths-edit.py")
-    assert bash_cmds[-2].endswith("block-bare-ssh.py")
+    groups = [g for g in desired
+              if any(h["command"].endswith("protected-paths-edit.py") for h in g["hooks"])]
+    assert len(groups) == 1
+    assert groups[0]["matcher"] == "Edit|Write|MultiEdit|NotebookEdit|Bash"
 
 
 def test_shipped_settings_wire_hook():
     settings = json.loads((PACKAGE_ROOT / "config" / "claude-settings.json").read_text())
-    groups = {g["matcher"]: g["hooks"] for g in settings["hooks"]["PreToolUse"]}
-    for matcher in ("Edit|Write|MultiEdit|NotebookEdit", "Bash"):
-        assert any(h["command"].endswith("protected-paths-edit.py") for h in groups[matcher])
+    groups = [g for g in settings["hooks"]["PreToolUse"]
+              if any(h["command"].endswith("protected-paths-edit.py") for h in g["hooks"])]
+    assert len(groups) == 1
+    assert groups[0]["matcher"] == "Edit|Write|MultiEdit|NotebookEdit|Bash"

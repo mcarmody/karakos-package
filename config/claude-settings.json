@@ -31,7 +31,7 @@
         ]
       },
       {
-        "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash",
         "hooks": [
           {
             "type": "command",
@@ -49,10 +49,6 @@
           {
             "type": "command",
             "command": "$WORKSPACE_ROOT/system/hooks/block-bare-ssh.py"
-          },
-          {
-            "type": "command",
-            "command": "$WORKSPACE_ROOT/system/hooks/protected-paths-edit.py"
           }
         ]
       }
