@@ -14,6 +14,10 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Memory hygiene: `memory` gains `forget` and `supersede`, `graph` gains `delete_entity`, `delete_edge` and `merge_entities`, `taskboard` gains `delete`. All are soft deletes with a `memory_audit` row (tombstone for tasks); hard delete stays operator-only. (Refs #238, build A; the dedup script is build B and not included)
+
 ### Fixed
 
 - Fresh install initialises the memory graph at first boot (`data/memory/graph.db`), so `memory` and `graph` tools no longer report uninitialised; the not-initialised message names both `python3 -m lib.graph init` (fresh install) and `karakos migrate` (1.x upgrade). Fixes #227 ("Fresh install leaves memory graph uninitialised"). (Refs #228, "v2.0.0 fresh-install defects from Babybel live-fire check")
