@@ -50,7 +50,8 @@ def _sqlite_copy(src: Path, dst: Path) -> None:
 def _sources(data_dir: Path, config_dir: Path):
     """(label, path) roots to capture. Labels are the top-level names in the backup."""
     roots = [("data", data_dir), ("config", config_dir),
-             ("agents", config_dir.parent / "agents")]
+             ("agents", config_dir.parent / "agents"),
+             ("overlay", config_dir.parent / "overlay")]
     out = [(l, p) for l, p in roots if p.is_dir()]
     env = config_dir / ".env"
     if not env.is_file():
