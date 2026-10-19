@@ -81,6 +81,9 @@ Files, *in container*: `logs/agent-server.log`, `logs/relay.log`,
 heartbeats are `data/health/*.json` and `data/health/agents/<agent>.json`. The full
 tree is in [ARCHITECTURE.md](ARCHITECTURE.md#data-layout). The signals channel
 gets health alerts (`bin/health-monitor.py` daily, `bin/wedge-check.py` every minute).
+For a one-shot, read-only check of the whole install from inside the container, run
+`python3 bin/self-diagnose.py` (add `--json` for tools; exit 1 on any warn or critical). `python3 bin/self-test.py` runs that, then calls one
+read-only tool on each MCP server and reports PASS or FAIL per step.
 
 ## Self-repair
 
@@ -201,6 +204,9 @@ only through a release PR from `develop` that the maintainer approves; do not op
 PRs against it, push to it or tag. Both branches require a PR and passing checks
 `lint-and-syntax`, `unit-tests` and `docker-smoke`, and forbid force-push and
 deletion. Process and releases: [CONTRIBUTING.md](../CONTRIBUTING.md).
+
+Fixes to the package go upstream as PRs against `develop`. Personal changes (config,
+personas, skills) go in the private overlay, never in a fork: see [OVERLAY.md](OVERLAY.md).
 
 You need an authenticated `gh` (`gh auth login`, or `GH_TOKEN` in the environment).
 

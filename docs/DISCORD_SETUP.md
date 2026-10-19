@@ -108,6 +108,8 @@ If you want each agent to post under its own identity:
    DISCORD_BOT_ID_BUILDER=<id>
    ```
 5. In `config/agents.yaml`, set each agent's `discord.token_env` and `discord.bot_id_env`
+   (and `discord.role_id_env` if you want a Discord role to address the agent; see
+   `mention_only` below)
 
 Without multi-bot setup, all agents post through the primary bot.
 
@@ -162,6 +164,36 @@ counters are in `data/health/relay.json` under `reply_gate`. Set
 `KARAKOS_REPLY_CLASSIFIER=off` in `config/.env` to disable the tier install-wide
 without editing channels.
 
+**`mention_only`** — for channels where an agent should speak only when it is
+addressed on purpose. Set `"mention_only": true` on the channel and the agent
+answers only a direct @mention of its bot, or a mention of a Discord role mapped
+to it. A plain message, a reply to the agent, and a message that opens with its
+name all stay silent. Channel ownership and the primary fallback do not apply
+either: a shard that owns the channel still does not answer an unmentioned
+message. A channel that sets both `mention_only` and `reply_gate` logs an error
+at load and is treated as `mention_only`.
+
+Role mentions need one extra key per agent, naming the environment variable that
+holds the role's id (right-click the role in Discord with developer mode on, then
+Copy Role ID). In `config/agents.yaml`:
+
+```yaml
+agents:
+  main:
+    discord:
+      token_env: DISCORD_BOT_TOKEN_MAIN
+      bot_id_env: DISCORD_BOT_ID_MAIN
+      role_id_env: DISCORD_ROLE_ID_MAIN
+```
+
+and in `config/.env`, `DISCORD_ROLE_ID_MAIN=<role id>`. A mention of a mapped
+role routes to that agent the same way a mention of its bot does. A role mention
+with no mapped agent is ignored.
+
+```json
+"front-desk": { "id": "...", "default_agent": "main", "mention_only": true }
+```
+
 **`guest_agents`** — lets bots from *outside* this install address your agents
 in that channel. Off by default, so a stranger's bot in a shared server is
 ignored.
@@ -181,9 +213,11 @@ Set `GUEST_TURN_LIMIT` in `config/.env` to change the cap.
 
 Four small behaviours that make a busy channel and a long-running agent easier
 to live with. Every one is **off by default**, so an upgraded install behaves
-exactly as before. They are set in `config/channels.json`: a top-level `"ux"`
+exactly as before. The fifth key, `tool_streaming`, is not one of these: it
+overrides the agent's own setting (see the table). They are set in `config/channels.json`: a top-level `"ux"`
 object applies to every channel, and a channel's own `"ux"` object overrides it
-key by key. A key set in neither place is off. A wrong type or an unknown key is
+key by key. A key set in neither place is off (`tool_streaming` is the exception:
+unset, it inherits the agent's setting). A wrong type or an unknown key is
 logged once and treated as off.
 
 ```json
@@ -204,6 +238,7 @@ logged once and treated as off.
 | `reaction_notices` | `false`, `"owner"` (or `true`), `"humans"` | Tells the agent when a person reacts to one of its messages. The agent normally answers `PASS`, which is not posted. One notice per user and message per minute, at most 10 per channel per minute. | Read Message History |
 | `edit_reroute` | `false`, `true`, or `{"window_s": 900, "max_followups": 3}` | When a person edits a message an agent already received: a still-queued message is rewritten in place, otherwise the agent gets a follow-up with the old and new text. An edit after a `PASS` or empty reply is ignored. | Read Message History |
 | `suppress_embeds` | `false`, `true` | Agent text replies and tool lines are posted with link previews suppressed. Ask prompts keep their embeds. Messages already posted are not changed. | none |
+| `tool_streaming` | `false`, `true`; unset inherits the agent | Turns the `-# ⚙ Tool — …` activity lines on or off for this channel. Precedence: channel `ux.tool_streaming` > agent `tool_streaming` in `agents.yaml` > default `true`. A top-level `ux.tool_streaming` applies to every channel that does not set its own, so it also overrides the agent setting. | none |
 
 `true` for `threads` means `after_s` 60 and `max_lines` 40; `true` for `edit_reroute`
 means `window_s` 900 and `max_followups` 3.
