@@ -14,8 +14,11 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [2.2.0] - 2026-10-19
+
 ### Added
 
+- Per-channel `mention_only` in channels.json and per-agent `discord.role_id_env`, so a role ping routes to the agent. (Refs #244)
 - Friction review (no LLM): `lib/friction_review.py`, `bin/friction-review.py` and a nightly `friction-review` job group the friction log into recurring causes and write `data/friction/YYYY-MM-DD.md` with a drafted issue and proposed fix each. Nothing is filed or edited automatically: `--file --yes` is the explicit, once-per-cause approval step, and only for causes seen on two separate days. (Refs #237, build B; the `friction` MCP action is a follow-up)
 - Friction sensor (no LLM): `lib/friction.py`, `bin/friction-sensor.py` and an hourly `friction-sensor` job scan the agent stream logs for tool errors, non-zero Bash exits, denials, rate-limit pressure and repeated commands, append to `data/friction-log.jsonl` and refresh `data/friction/weekly.md`. Read-only: nothing edits a prompt or persona. (Refs #237, build A; the nightly review and `friction` MCP action are build B)
 - `bin/self-test.py`: runs `bin/self-diagnose.py`, then starts both MCP servers over stdio and calls one read-only tool on each; PASS/FAIL per step, `--json`, exit 0/1. (Refs #236, part 2; builds on the `bin/self-diagnose.py` PR)
@@ -240,7 +243,8 @@ Initial release: an installable multi-agent household system — Discord
 integration, local dashboard, episodic memory, session persistence, cost
 tracking, and builder/reviewer agents behind guardrails.
 
-[Unreleased]: https://github.com/mcarmody/karakos-package/compare/v2.1.0...develop
+[Unreleased]: https://github.com/mcarmody/karakos-package/compare/v2.2.0...develop
+[2.2.0]: https://github.com/mcarmody/karakos-package/compare/v2.1.0...v2.2.0
 [2.1.0]: https://github.com/mcarmody/karakos-package/compare/v2.0.2...v2.1.0
 [2.0.2]: https://github.com/mcarmody/karakos-package/compare/v2.0.1...v2.0.2
 [2.0.1]: https://github.com/mcarmody/karakos-package/compare/v2.0.0...v2.0.1
