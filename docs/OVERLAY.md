@@ -34,7 +34,8 @@ into the install and overwrites the install copy. Two rules limit it:
 - It never writes a path that `git ls-files` of the package checkout lists as tracked. Such a
   path is reported as `skip-tracked` and the install copy is left alone.
 - A skill the package ships is never overwritten or captured, whatever the overlay holds
-  (any file under a shipped skill directory is `skip-tracked`).
+  (any file under a shipped skill directory is `skip-tracked`). This relies on the install
+  being a git checkout: with no `.git`, nothing counts as tracked.
 
 `apply` is idempotent: files that already match are reported as `unchanged`.
 
@@ -106,7 +107,22 @@ secret is never copied into the overlay.
 ## Backups
 
 `lib/migrate/backup.py` includes `overlay/` in a backup when it exists, next to `data`,
-`config` and `agents`. A restore puts it back.
+`config` and `agents`. The overlay's own `.git` is left out: its objects are read-only, so a
+restore onto the live overlay would fail, and its history is on the overlay's remote. A restore
+puts the seam files back on the same machine. On a new machine, clone the overlay remote
+(`init --remote`, into an empty or absent `overlay/`) and then run `apply`.
+
+## Known gap: the container
+
+The compose file bind-mounts only `config/`, `agents/` and `.karakos/`. `overlay/` is not
+mounted, so `bin/entrypoint.sh` finds no `overlay/.git` inside the container and its `apply`
+does nothing. Run `python3 bin/overlay.py apply` on the host instead:
+
+- `config/` and `agents/` changes reach the container through the bind mounts;
+- `skills/` is baked into the image, so a skill change needs an image rebuild.
+
+Mounting `overlay/` is a compose change (`config/` is a protected path), so it is not part of
+this change.
 
 ## Is the vault tool the same thing?
 
