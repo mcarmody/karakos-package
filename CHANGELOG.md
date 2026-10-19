@@ -16,6 +16,7 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Edit-time protected-path gate: the PreToolUse hook `system/hooks/protected-paths-edit.py` denies agent `Edit`, `Write`, `MultiEdit`, `NotebookEdit` and file-writing Bash commands (`tee`, `cp`, `mv`, `rm`, `sed` and others) on tier 1 paths from `config/protected-paths.json`, and logs tier 2 edits to `logs/protected-edits.jsonl`. Agents only; shell redirections are not detected. (Refs #240, "MÍRDAIN G9: Edit-time protected-path gate and a governed self-mod tool"; build A)
 - `bin/buildq doctor [--json]` checks what a build needs (config, queue database, builder and reviewer agents, `claude`/`git`/`gh` per host, GitHub auth) and exits non-zero on any failure. `bin/buildq enable [--no-agents]` turns the queue on, creates the builder and reviewer agents when missing, and runs the doctor. Both work while the queue is disabled.
 - GitHub CLI (`gh`) in the image, from GitHub's apt repository, so builds can open PRs without a host install.
 - Self-management tools in the `karakos-admin` MCP server: `get_usage`, `get_cost`, `tail_log`, `set_effort`, `get_queue`, `pause_agent`, `resume_agent` and `get_findings`. An agent may reload, reset, set effort on, pause or resume only itself, unless it is the primary or the call is an operator's. (Refs #232, "MÍRDAIN G1: `self` ops surface in the admin MCP")
