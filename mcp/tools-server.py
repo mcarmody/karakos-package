@@ -131,13 +131,13 @@ CORE_TOOLS = [
     },
     {
         "name": "memory",
-        "description": "Durable graph memory. Actions: write (store one fact, episode or pattern, optionally about a named subject), recall (ranked search over memory with one hop of linked entities; modes auto, keyword, recent), status (counts and embedding state). Deprecated aliases, removed in 2.1: remember (use write), facts (use recall with kinds=[\"fact\"]), recent (use recall with mode=\"recent\").",
+        "description": "Durable graph memory. Actions: write (store one fact, episode or pattern, optionally about a named subject), recall (ranked search over memory with one hop of linked entities; modes auto, keyword, recent), status (counts and embedding state), forget (soft-delete one observation by id; keeps an audit row), supersede (replace an observation by id with new text; the old one stops appearing in recall). Deprecated aliases, removed in 2.1: remember (use write), facts (use recall with kinds=[\"fact\"]), recent (use recall with mode=\"recent\").",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["write", "recall", "status", "remember", "facts", "recent"],
+                    "enum": ["write", "recall", "status", "forget", "supersede", "remember", "facts", "recent"],
                     "description": "The action to perform"
                 },
                 "content": {
@@ -194,6 +194,19 @@ CORE_TOOLS = [
                     "type": "string",
                     "description": "Restrict recall to observations about this entity name"
                 },
+                "id": {
+                    "type": "integer",
+                    "description": "Observation id from recall (forget, supersede)"
+                },
+                "text": {
+                    "type": "string",
+                    "path_mode": "none",
+                    "description": "Replacement content (supersede; max 4000 chars)"
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Why (forget; optional, kept in the audit row)"
+                },
                 "mode": {
                     "type": "string",
                     "enum": ["auto", "keyword", "recent"],
@@ -205,13 +218,13 @@ CORE_TOOLS = [
     },
     {
         "name": "graph",
-        "description": "Link entities in the memory graph. Actions: add_entity (create or update a named entity; returns the existing one on a name or alias match), add_edge (create or reinforce a typed relation between two entities, by name or id).",
+        "description": "Link entities in the memory graph. Actions: add_entity (create or update a named entity; returns the existing one on a name or alias match), add_edge (create or reinforce a typed relation between two entities, by name or id), delete_entity (soft-delete an entity and drop its edges), delete_edge (remove one relation), merge_entities (fold one entity into another). Deletes are audited; hard delete is operator-only.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["add_entity", "add_edge"],
+                    "enum": ["add_entity", "add_edge", "delete_entity", "delete_edge", "merge_entities"],
                     "description": "The action to perform"
                 },
                 "name": {
@@ -249,6 +262,18 @@ CORE_TOOLS = [
                     "type": "number",
                     "description": "0-5 (add_edge; default 1.0; an existing edge is reinforced instead)"
                 },
+                "from": {
+                    "type": "string",
+                    "description": "Entity name or id to fold away (merge_entities)"
+                },
+                "into": {
+                    "type": "string",
+                    "description": "Entity name or id that keeps everything (merge_entities)"
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Why (delete_entity, delete_edge, merge_entities; optional)"
+                },
                 "create_missing": {
                     "type": "boolean",
                     "description": "Create unknown src/dst names as 'thing' entities (add_edge; default true)"
@@ -282,13 +307,13 @@ CORE_TOOLS = [
     },
     {
         "name": "taskboard",
-        "description": "Task and todo tracking. Actions: list (show tasks), add (create task), update (modify task), complete (mark done).",
+        "description": "Task and todo tracking. Actions: list (show tasks), add (create task), update (modify task), complete (mark done), delete (tombstone a task; hidden from list).",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["list", "add", "update", "complete"],
+                    "enum": ["list", "add", "update", "complete", "delete"],
                     "description": "The action to perform"
                 },
                 "title": {
@@ -297,7 +322,7 @@ CORE_TOOLS = [
                 },
                 "id": {
                     "type": "string",
-                    "description": "Task ID (for update/complete)"
+                    "description": "Task ID (for update/complete/delete)"
                 },
                 "status": {
                     "type": "string",
@@ -778,6 +803,33 @@ def hive_call(args: dict, monotonic=time.monotonic) -> dict:
             return {"status": "timeout", "error": "Timed out waiting for an answer."}
 
 
+def _installed_version() -> str:
+    """The release this workspace was built from: the VERSION file at the root,
+    else `git describe` in the workspace, else "unknown"."""
+    try:
+        version = (WORKSPACE / "VERSION").read_text().strip()
+        if version:
+            return version
+    except OSError:
+        pass
+    try:
+        out = subprocess.run(["git", "describe", "--tags", "--always"], cwd=str(WORKSPACE),
+                             capture_output=True, text=True, timeout=5)
+        if out.returncode == 0 and out.stdout.strip():
+            return out.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return "unknown"
+
+
+def _schema_version():
+    """The `schema` field of data/.schema-version, or None if absent or unreadable."""
+    try:
+        return json.loads((WORKSPACE / "data" / ".schema-version").read_text()).get("schema")
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
 def handle_core_tool(tool_name: str, args: dict) -> dict:
     """Handle built-in core tools."""
 
@@ -797,9 +849,12 @@ def handle_core_tool(tool_name: str, args: dict) -> dict:
             config = {}
             if config_path.exists():
                 config = json.loads(config_path.read_text())
+            installed = _installed_version()
             return {
                 "system_name": config.get("system_name", os.environ.get("SYSTEM_NAME", "Karakos")),
-                "version": config.get("version", "1.0.0"),
+                "version": installed,
+                "installed_version": installed,
+                "schema_version": _schema_version(),
                 "owner": config.get("owner_name", os.environ.get("OWNER_NAME", "User")),
                 "workspace": str(WORKSPACE),
             }
@@ -948,7 +1003,7 @@ def handle_core_tool(tool_name: str, args: dict) -> dict:
             tasks = json.loads(tasks_file.read_text()).get("tasks", [])
 
         if action == "list":
-            return {"tasks": tasks}
+            return {"tasks": [t for t in tasks if not t.get("deleted_at")]}
         elif action == "add":
             task = {
                 "id": f"task-{int(time.time())}",
@@ -962,7 +1017,7 @@ def handle_core_tool(tool_name: str, args: dict) -> dict:
         elif action == "update":
             task_id = args.get("id", "")
             for task in tasks:
-                if task["id"] == task_id:
+                if task["id"] == task_id and not task.get("deleted_at"):
                     changed = {k: args[k] for k in ("status", "title", "notes", "assignee")
                                if args.get(k) is not None}
                     if not changed:
@@ -975,11 +1030,19 @@ def handle_core_tool(tool_name: str, args: dict) -> dict:
         elif action == "complete":
             task_id = args.get("id", "")
             for task in tasks:
-                if task["id"] == task_id:
+                if task["id"] == task_id and not task.get("deleted_at"):
                     task["status"] = "done"
                     task["completed_at"] = datetime.now(timezone.utc).isoformat()
                     tasks_file.write_text(json.dumps({"tasks": tasks}, indent=2))
                     return {"task": task}
+            return {"error": f"Task not found: {task_id}"}
+        elif action == "delete":
+            task_id = args.get("id", "")
+            for task in tasks:
+                if task["id"] == task_id and not task.get("deleted_at"):
+                    task["deleted_at"] = datetime.now(timezone.utc).isoformat()
+                    tasks_file.write_text(json.dumps({"tasks": tasks}, indent=2))
+                    return {"status": "ok", "id": task_id, "deleted": True}
             return {"error": f"Task not found: {task_id}"}
 
     elif tool_name == "vault":
