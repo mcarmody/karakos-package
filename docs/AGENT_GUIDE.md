@@ -81,6 +81,9 @@ Files, *in container*: `logs/agent-server.log`, `logs/relay.log`,
 heartbeats are `data/health/*.json` and `data/health/agents/<agent>.json`. The full
 tree is in [ARCHITECTURE.md](ARCHITECTURE.md#data-layout). The signals channel
 gets health alerts (`bin/health-monitor.py` daily, `bin/wedge-check.py` every minute).
+For a one-shot, read-only check of the whole install from inside the container, run
+`python3 bin/self-diagnose.py` (add `--json` for tools; exit 1 on any warn or critical). `python3 bin/self-test.py` runs that, then calls one
+read-only tool on each MCP server and reports PASS or FAIL per step.
 
 ## Self-repair
 
@@ -102,6 +105,38 @@ destroying data (`down -v`, `reset`) is not: ask first. Run the API calls with
 If none of these fit, read `make logs`, then `logs/agent-server.log`, and write
 down what you saw before changing anything. If the cause is a platform bug,
 [contribute the fix](#contribute-upstream).
+
+## Managing yourself
+
+The `karakos-admin` MCP tools (`mcp/admin-server.py`) let an agent look at and steer its own runtime:
+
+- `get_usage`: rate-limit headroom for every agent (`GET /usage`).
+- `get_cost`: spend for every agent, or one with `agent` (`GET /cost`, `GET /cost/<agent>`).
+- `tail_log`: last lines of `logs/<service>.log`, secrets redacted (default 40, max 200).
+- `set_effort`: set reasoning effort: low, medium, high, xhigh, max, or default.
+- `get_queue`: what an agent still has to answer.
+- `pause_agent` / `resume_agent`: hold or release a queue, optionally for 1-1440 minutes.
+- `get_findings`: the latest health findings summary.
+
+Self-scoping: `reload_agent`, `reset_agent`, `set_effort`, `pause_agent` and `resume_agent`
+act on the calling agent only. A primary agent (`role: primary` in `config/agents.yaml`) or an
+operator with no agent identity may act on any agent. Anyone else gets a permission error:
+ask the primary agent or the owner.
+
+### Protected paths at edit time
+
+The paths in `config/protected-paths.json` are guarded when you edit them, not only at commit. The
+PreToolUse hook `system/hooks/protected-paths-edit.py` runs on `Edit`, `Write`, `MultiEdit`,
+`NotebookEdit` and on Bash commands that write through `tee`, `cp`, `mv`, `rm`, `sed`, `install`, `ln`,
+`truncate`, `dd`, `chmod`, `chown` or `patch`.
+
+- A tier 1 path is denied with `Protected path (tier 1): <path>. Do not edit it; report to the owner.`
+  Do not work around it: tell the owner which path you needed to change and why.
+- A tier 2 path is allowed and recorded in `logs/protected-edits.jsonl` (`ts`, `agent`, `tool`, `path`, `tier`, `decision`). Tier 1 denies are recorded there too.
+- Paths in `unprotected_overrides` (persona, journal, inbox) are allowed and not logged.
+- It applies to agents only (`KARAKOS_AGENT` is set). An operator's own `claude` session is not restricted.
+- Symlinks are resolved first, so a link to a protected file is protected. Paths outside the workspace are not.
+- Known gap: shell redirections (`echo x > bin/relay.py`) and interpreters that write files themselves (`python -c`, `perl -i`) are not detected. Commit-time protection still applies.
 
 ## Self-improve
 

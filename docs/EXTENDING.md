@@ -68,7 +68,9 @@ auto-discovered from `.claude/skills/`. Karakos "skills" are a separate,
 package-specific convention — a `tools.json` schema plus a `scripts/`
 implementation, discovered by `mcp/tools-server.py` and exposed as MCP
 tools. A frontmatter-only `SKILL.md` dropped under `skills/` will not load
-here; it needs `tools.json` and `scripts/` as shown below.
+as a tool; it needs `tools.json` and `scripts/` as shown below. With `name`
+and `description` frontmatter it is a *procedure skill* instead: instructions
+only, listed and read with the `skill` tool (see `skills/README.md`).
 
 ### 1. Create the Skill Directory
 
@@ -775,6 +777,13 @@ cancel and a bounded retry; `bin/buildq` is the operator CLI. Keys:
 `cost_ceiling_usd` (applies to ssh runs only), `retry`, `governor`,
 `unreachable_grace_s`. Host names, ssh targets and probe commands come only from
 this file, never from a brief.
+
+`bin/buildq doctor` lists what a build needs (the config, the queue database,
+a builder and a reviewer agent, and `claude`, `git` and `gh` on each host) and
+exits non-zero when anything is missing. `bin/buildq enable` turns the queue on
+and creates the builder and reviewer agents (`--no-agents` skips that), then
+runs the doctor. A build also needs `GH_TOKEN` or `GITHUB_TOKEN` in
+`config/.env`, or `gh auth login` on the host.
 
 **Provisioning a remote build host.** The dispatcher pipes `bin/build-runner.sh`
 to the host over ssh. The host needs `bash`, `git`, the `claude` CLI and, for
