@@ -15,6 +15,7 @@ import pytest
 from conftest import PACKAGE_ROOT
 
 sys.path.insert(0, str(PACKAGE_ROOT / "lib"))
+import token_budget  # noqa: E402
 import usage_gate  # noqa: E402
 
 SHARDS = {"a": ["a", "a-2"]}
@@ -103,6 +104,9 @@ def test_budget_pauses_the_agent_with_hysteresis_and_one_notice(harness, clock):
 
     async def scenario():
         async with h:
+            # Boot drains evaluate the budget and warm the process-wide usage
+            # cache; drop it so the rows written below are what the gate sums.
+            token_budget._cache.clear()
             h.module.RATE_LIMIT_ALERT_CHANNEL_ID = "999"
             for shard in ("a", "a-2"):
                 await sql(h, "INSERT INTO cost_events (agent, cost_delta, session_total,"
@@ -152,6 +156,7 @@ def test_budget_pause_answers_queued_calls(harness, clock):
 
     async def scenario():
         async with h:
+            token_budget._cache.clear()  # see test above: boot warms the usage cache
             await sql(h, "INSERT INTO cost_events (agent, cost_delta, session_total,"
                    " input_tokens, output_tokens) VALUES ('a', 0, 0, 900, 900)")
             await sql(h, "INSERT INTO message_queue (agent, channel, channel_id, server,"
@@ -190,11 +195,14 @@ def test_governor_defers_machine_rows_only(harness, clock):
             rows = {r["content"]: r for r in h.queue_rows("a")}
             assert rows["hb1"]["response"] == "superseded" and rows["hb1"]["processed"] == 4
             assert rows["hb2"]["processed"] == 0
-            # a human message runs, and the queued heartbeat rides along
+            # a human message runs; the queued heartbeat is another channel, so
+            # it is not in that turn and stays deferred
             await h.send("a", "hello")
-            await h.wait_idle("a")
+            await h.wait_for(lambda: any(r["content"] == "hello" and r["processed"] == 2
+                                         for r in h.queue_rows("a")))
             sent = "\n".join(h.sent_to("a"))
-            assert "hello" in sent and "hb2" in sent
+            assert "hello" in sent and "hb2" not in sent
+            assert {r["content"]: r["processed"] for r in h.queue_rows("a")}["hb2"] == 0
             # scheduler is never gated
             await set_week(h, 99)
             await h.poke("a", "scheduler", "remind me")
