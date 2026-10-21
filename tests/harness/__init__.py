@@ -151,7 +151,9 @@ class Harness:
         # settle before the test body changes a shard's state: a drain that
         # passed its IDLE check before the change would otherwise claim a row
         # the test has just queued behind ERROR_RECOVERY.
-        await asyncio.gather(*list(self.module.STATE.bg_tasks))
+        state = getattr(self.module, "STATE", None)
+        if state is not None:
+            await asyncio.gather(*list(state.bg_tasks))
         if os.environ.get("KARAKOS_DB_TRACE"):
             await self._trace_db()
         # The ephemeral port is only known now, after the shards have spawned, so
