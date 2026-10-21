@@ -3,4 +3,4 @@ useDefault = true
 
 [allowlist]
 description = "test fixtures and example placeholders"
-paths = ['''^tests/''', '''^docs/answers\.example\.json$''']
+paths = ['''(^|/)tests/''', '''(^|/)docs/answers\.example\.json$''']
