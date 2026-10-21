@@ -1,0 +1,3 @@
+# Paths or path:kind pairs exempt from bin/verify-public-safety.py
+LICENSE
+CHANGELOG.md:name
