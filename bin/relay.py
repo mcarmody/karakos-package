@@ -94,7 +94,7 @@ SYS_COMMANDS = frozenset({"clear", "reload", "status", "usage"})
 SLASH_COMMANDS = frozenset({
     "status", "health", "usage", "help",
     "cost", "clear", "reload", "interrupt", "kill", "flush",
-    "logs", "pause", "resume", "effort",
+    "logs", "pause", "resume", "effort", "model",
 })
 
 INTERRUPT_MESSAGE_MAX = 1900
@@ -134,6 +134,8 @@ def slash_args(cmd: str, options: Dict) -> str:
         return s("minutes")
     if cmd == "effort":
         return s("level")
+    if cmd == "model":
+        return s("model")
     if cmd == "interrupt":
         return s("message")
     # Everything else is either untargeted or agent-targeted, and the target
@@ -643,6 +645,10 @@ def load_config():
             log.error(f"channel '{name}' sets both mention_only and reply_gate; "
                       f"treating it as mention_only (reply_gate ignored)")
 
+    unlisted = channels_config.get("unlisted_channels")
+    if unlisted is not None and unlisted not in ("ignore", "mention_only"):
+        log.error("unlisted_channels=%r is not supported (ignore, mention_only); using ignore", unlisted)
+
     _config_state["mtimes"] = _config_mtimes()
     log.info(f"Loaded config for {len(agent_config)} agents, {len(channels_config.get('channels', {}))} channels")
 
@@ -722,6 +728,10 @@ def default_agent_for(channel_name) -> Optional[str]:
         return None
     shard = registry_obj.shard_for_channel(channel_name)
     return shard.agent if shard else None
+
+
+def unlisted_mentions_enabled() -> bool:
+    return (channels_config or {}).get("unlisted_channels") == "mention_only"
 
 
 def load_server_ids(config: Dict) -> set:
@@ -1035,8 +1045,10 @@ class DiscordAdapter(discord.Client):
                     )
                     return
 
-        # B24: a mention only routes in a channel listed in channels.json.
-        if channel_name is None:
+        # B24: an unlisted channel never routes, unless channels.json sets
+        # "unlisted_channels": "mention_only", in which case an @mention does.
+        unlisted_mentions = channel_name is None and unlisted_mentions_enabled()
+        if channel_name is None and not (unlisted_mentions and target_agent):
             if target_agent:
                 log.info(f"route channel={message.channel.id} unlisted, mention ignored")
             return
@@ -1046,6 +1058,7 @@ class DiscordAdapter(discord.Client):
             channel_opt_out=channel_config.get("route") is False,
             parent_channel_name=parent_name,
             mention_only=mention_only,
+            unlisted_mentions=unlisted_mentions,
         ) if registry_obj is not None else None
         if route is None:
             return  # No routing
@@ -1273,6 +1286,8 @@ class DiscordAdapter(discord.Client):
                 f"`{agent}` resumed." if ok else f"resume failed for `{agent}` — {detail}")
         elif cmd == "effort":
             await self.sys_effort(message, agent, args)
+        elif cmd == "model":
+            await self.sys_model(message, agent, args)
         elif cmd == "cost":
             await self.sys_cost(message, agent)
 
@@ -1327,6 +1342,26 @@ class DiscordAdapter(discord.Client):
         applied, deferred = body.get("applied") or [], body.get("deferred") or []
         now = body.get("effort") or "the CLI default"
         parts = [f"`{agent}` effort is now {now}."]
+        if applied:
+            parts.append("Applied now: " + ", ".join(f"`{x}`" for x in applied) + ".")
+        if deferred:
+            parts.append("After the current turn: " + ", ".join(f"`{x}`" for x in deferred) + ".")
+        await self.sys_reply(message, " ".join(parts))
+
+    async def sys_model(self, message, agent: str, args: str):
+        """Set the agent-level model override (owner only). The allowed ids live
+        in config/models.yaml; the agent server checks them."""
+        model = args.strip()
+        if not model:
+            await self.sys_reply(message, "usage: /model <model id|default>")
+            return
+        ok, detail, body = await self.agent_server_post_json(
+            f"/agents/{agent}/model", {"model": model})
+        if not ok:
+            await self.sys_reply(message, f"model failed for `{agent}` — {detail}")
+            return
+        applied, deferred = body.get("applied") or [], body.get("deferred") or []
+        parts = [f"`{agent}` model is now {body.get('model')} ({body.get('source')})."]
         if applied:
             parts.append("Applied now: " + ", ".join(f"`{x}`" for x in applied) + ".")
         if deferred:

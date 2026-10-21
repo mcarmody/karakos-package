@@ -14,6 +14,14 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [2.3.0] - 2026-10-20
+
+### Added
+
+- Opt-in `"unlisted_channels": "mention_only"` in `config/channels.json`: an @mention of an agent now routes in a channel that is not listed, inside a configured server. Default `"ignore"` keeps the B24 refusal. Touches tier-1 `bin/relay.py`: maintainer review.
+- Persona and prompt rollback (#241): `snapshot_persona` and `restore_persona` admin MCP tools (`lib/persona_snapshots.py`) copy an agent's `persona/` and `SYSTEM_PROMPT.md` to `data/persona-snapshots/<name>/<id>/` (newest 10 kept). Taken automatically before `create_agent` overwrites a prompt and before a `reload_agent` that follows a persona change. A restore snapshots the current state first. Self-scoped like the other admin tools.
+- Runtime model switching (#233): `/model` slash command, `POST /agents/{name}/model` and a `set_model` admin MCP tool set an agent-level model override in `data/runtime-overrides.json`, applied at the next spawn (after the turn in flight, like `/effort`). Allowed ids are listed in the new `config/models.yaml` (aliases `opus`, `sonnet`, `haiku` by default), not in code; without that file only the agent's registry model is allowed. An agent may switch only its own model; the primary may switch any. Touches tier-1 `bin/agent-server.py` and `bin/relay.py`: maintainer review.
+
 ## [2.2.0] - 2026-10-19
 
 ### Added
@@ -248,7 +256,8 @@ Initial release: an installable multi-agent household system — Discord
 integration, local dashboard, episodic memory, session persistence, cost
 tracking, and builder/reviewer agents behind guardrails.
 
-[Unreleased]: https://github.com/mcarmody/karakos-package/compare/v2.2.0...develop
+[Unreleased]: https://github.com/mcarmody/karakos-package/compare/v2.3.0...develop
+[2.3.0]: https://github.com/mcarmody/karakos-package/compare/v2.2.0...v2.3.0
 [2.2.0]: https://github.com/mcarmody/karakos-package/compare/v2.1.0...v2.2.0
 [2.1.0]: https://github.com/mcarmody/karakos-package/compare/v2.0.2...v2.1.0
 [2.0.2]: https://github.com/mcarmody/karakos-package/compare/v2.0.1...v2.0.2
