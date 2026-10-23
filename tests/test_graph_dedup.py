@@ -167,7 +167,7 @@ def test_fewer_words_is_reported_never_merged(store, a, b, cos):
 
 def test_an_abbreviation_that_fits_two_entities_merges_neither(store):
     a = ent(store, "ian h.", (1, 0))
-    b = ent(store, "Ian Cooper", (0.795, 0.606))   # cosine 0.795 to "ian h.", as measured
+    b = ent(store, "Ian Holloway", (0.795, 0.606))   # cosine 0.795 to "ian h.", as measured
     d = ent(store, "Ian Hartley", (0.795, -0.606))   # the two Ians stay far apart
     assert entity_dedup.candidates(store) == []
     assert {r["why"] for r in entity_dedup.report_only(store)} == {"ambiguous"}

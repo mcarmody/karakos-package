@@ -104,7 +104,7 @@ def _scan(store, threshold):
                 v = verdict(a_["name"], b_["name"], score, threshold)
                 if v:
                     found.append((score, a_, b_, v))
-    # an abbreviation that fits two entities ("ian h." -> Ian Hartley, Ian Cooper) is
+    # an abbreviation that fits two entities ("ian h." -> Ian Hartley, Ian Holloway) is
     # a guess: report it, merge neither
     partners = {}
     for _, a, b, v in found:
