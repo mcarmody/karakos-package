@@ -173,6 +173,22 @@ either: a shard that owns the channel still does not answer an unmentioned
 message. A channel that sets both `mention_only` and `reply_gate` logs an error
 at load and is treated as `mention_only`.
 
+**`context_messages`** — a channel-level key (not inside `reply_gate`; that one
+sizes the classifier's window and is separate). An agent's turn normally carries
+only the message that woke it, so in a `mention_only` channel "take this feedback"
+has nothing to point at. With this key the relay prepends the messages that
+arrived in the channel since the agent last posted there (other agents' posts
+included, the triggering message excluded), oldest first, one line each:
+`[context] Author (HH:MM): text`, times in UTC. The default is 8, the range 0 to
+20, and `0` delivers the bare message as before. Each message is cut to 300
+characters and the relay remembers the last 20 per channel, in memory only; when
+older messages were left out, the block ends its first line with a note telling
+the agent to call `discord` history for more.
+
+```json
+{ "channels": { "ops": { "mention_only": true, "context_messages": 12 } } }
+```
+
 **`unlisted_channels`** — a top-level key in `channels.json` for channels that are
 not listed in it. `"ignore"` (the default, also used when the key is absent) never
 routes an unlisted channel, even on an @mention. `"mention_only"` makes an unlisted
@@ -224,12 +240,12 @@ Set `GUEST_TURN_LIMIT` in `config/.env` to change the cap.
 ## Optional behaviours
 
 Four small behaviours that make a busy channel and a long-running agent easier
-to live with. Every one is **off by default**, so an upgraded install behaves
-exactly as before. The fifth key, `tool_streaming`, is not one of these: it
-overrides the agent's own setting (see the table). They are set in `config/channels.json`: a top-level `"ux"`
+to live with. Each of those four is **off by default**, so an upgraded install behaves
+exactly as before. `tool_streaming` is not one of these: it
+overrides the agent's own setting (see the table). `reactions` is **on** by default (see the table). They are set in `config/channels.json`: a top-level `"ux"`
 object applies to every channel, and a channel's own `"ux"` object overrides it
 key by key. A key set in neither place is off (`tool_streaming` is the exception:
-unset, it inherits the agent's setting). A wrong type or an unknown key is
+unset, it inherits the agent's setting; `reactions` is the other: unset, it is on). A wrong type or an unknown key is
 logged once and treated as off.
 
 ```json
@@ -251,6 +267,7 @@ logged once and treated as off.
 | `edit_reroute` | `false`, `true`, or `{"window_s": 900, "max_followups": 3}` | When a person edits a message an agent already received: a still-queued message is rewritten in place, otherwise the agent gets a follow-up with the old and new text. An edit after a `PASS` or empty reply is ignored. | Read Message History |
 | `suppress_embeds` | `false`, `true` | Agent text replies and tool lines are posted with link previews suppressed. Ask prompts keep their embeds. Messages already posted are not changed. | none |
 | `tool_streaming` | `false`, `true`; unset inherits the agent | Turns the `-# ⚙ Tool — …` activity lines on or off for this channel. Precedence: channel `ux.tool_streaming` > agent `tool_streaming` in `agents.yaml` > default `true`. A top-level `ux.tool_streaming` applies to every channel that does not set its own, so it also overrides the agent setting. | none |
+| `reactions` | `true` (default), `false` | Lets an agent react with an emoji. A final reply of exactly `REACT: <emoji>` adds that reaction to the message that started the turn instead of posting text, and the `discord` tool's `react` action does the same for any message (`channel`, `message_id`, `emoji`; a custom emoji is `name:id`). When off, `REACT: ...` posts as plain text and the tool action returns an error. A reaction on a message that is not a real Discord message (an edit, a reaction notice, an internal row) is skipped. | Add Reactions |
 
 `true` for `threads` means `after_s` 60 and `max_lines` 40; `true` for `edit_reroute`
 means `window_s` 900 and `max_followups` 3.

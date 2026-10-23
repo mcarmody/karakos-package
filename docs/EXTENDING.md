@@ -451,6 +451,7 @@ want to edit:
 | Variable | Description |
 |---|---|
 | `STREAM_LOG_RETENTION_DAYS` / `HANDOFF_TURN_TIMEOUT_S` | Raw stream-log retention (default 7) and the wait for a context-handoff turn |
+| `MEMORY_ENTITY_DEDUP` | `report` or `live` turns on the Sunday entity dedup pass of the nightly job (`bin/graph-dedup.py`); unset is off |
 | `MEMORY_DECAY_RATE` | Episode importance decay per pass (0–1), applied from `base_importance` |
 | `MEMORY_CUTOFF` | Importance below which an episode is eligible to be dropped |
 | `MEMORY_PRUNE_GRACE_DAYS` | Days an episode is protected from pruning regardless of score, measured from `inserted_at`; default 7 |
@@ -712,6 +713,30 @@ agents:
     work_stealing: {enabled: false, after_s: 5, max_rows: 5}   # idle shards take rows waiting behind a busy sibling
     steering: {enabled: true, coalesce_ms: 300, max_lines_per_turn: 8}  # messages that arrive mid-turn are written to the running turn
 ```
+
+### Posting to another channel
+
+An agent's reply goes to the channel its turn came from. The `send` tool posts
+somewhere else, for example a report to an operations channel. It is **off**: an
+agent can only use channel ids listed in its own `send.channels`, which is empty
+by default.
+
+```yaml
+agents:
+  main:
+    send:
+      channels: ["<channel-id>"]   # quoted Discord ids; only these may be used
+      per_hour: 20                        # rolling hour, per agent (1 to 200)
+```
+
+`send` with action `channels` lists what the agent may use; action `send` takes a
+`channel` (name from `channels.json`, or id) and `content` (up to 4000 characters)
+and queues an outbox row, so delivery survives outages like any reply. An unlisted
+channel and an unknown one get the same refusal. Over the limit the call fails with
+the wait time. `@everyone`, `@here` and role mentions are broken in the text and
+every message goes out with empty `allowed_mentions`, so nothing pings. Each send
+logs one line (agent, channel, length, outbox id; never the text). Code:
+`lib/cross_send.py`, `POST /send` in `bin/agent-server.py`.
 
 ## Memory
 

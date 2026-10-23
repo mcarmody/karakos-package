@@ -37,6 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 # lib/ is a package root for lib.migrate (the schema-stamp guard).
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import ask_handler  # noqa: E402
+import cross_send  # noqa: E402
 import discord_ux  # noqa: E402
 import hive as hive_lib  # noqa: E402
 import msgqueue  # noqa: E402
@@ -1829,6 +1830,33 @@ def _discord_error_detail(status: Optional[int], body: str) -> str:
     return out
 
 
+MAX_OUTBOUND_ATTACHMENT_BYTES = int(os.environ.get("MAX_ATTACHMENT_BYTES", str(25 * 1024 * 1024)))
+MAX_OUTBOUND_ATTACHMENTS = int(os.environ.get("MAX_ATTACHMENTS_PER_MESSAGE", "10"))
+# Agents may attach only files they put in this folder, never the rest of data/
+# (which holds the message store and other state).
+OUTGOING_ATTACHMENT_DIR = WORKSPACE_ROOT / "data" / "outgoing"
+
+
+def _attachment_form(payload: Dict[str, Any], paths: List[str]) -> "aiohttp.FormData":
+    """Multipart body for a message with files: `payload_json` plus `files[n]`.
+
+    Files are read when the request is built, so a retry re-reads them; a path
+    that has gone missing raises FileNotFoundError (the sender treats that as
+    permanent).
+    """
+    form = aiohttp.FormData()
+    form.add_field("payload_json", json.dumps(payload), content_type="application/json")
+    total = 0
+    for n, path in enumerate(paths):
+        data = Path(path).read_bytes()
+        total += len(data)
+        if total > MAX_OUTBOUND_ATTACHMENT_BYTES:   # grew since it was checked
+            raise OSError("attachments grew past the size limit")
+        form.add_field(f"files[{n}]", data,
+                       filename=Path(path).name, content_type="application/octet-stream")
+    return form
+
+
 async def outbox_send_row(row: Dict[str, Any]) -> Optional[str]:
     """Send one claimed (`sending`) outbox row, from `chunks_done` onward.
 
@@ -1868,11 +1896,35 @@ async def outbox_send_row(row: Dict[str, Any]) -> Optional[str]:
             payload["message_reference"] = {"message_id": row["reply_to"]}
         if row.get("flags"):
             payload["flags"] = row["flags"]
+        if row.get("allowed_mentions"):
+            payload["allowed_mentions"] = json.loads(row["allowed_mentions"])
         status: Optional[int] = None
         retry_after = None
         detail = ""
+        files_too_big = False
         try:
-            async with http_session.post(url, headers=headers, json=payload) as resp:
+            request_kwargs: Dict[str, Any] = {"json": payload}
+            files = json.loads(row.get("attachments") or "[]") if idx == 0 else []
+            if files:
+                payload["attachments"] = [{"id": n, "filename": Path(f).name}
+                                          for n, f in enumerate(files)]
+                try:
+                    # checked again now: the file may have been swapped or grown
+                    # (or a symlink planted) since the reply was queued
+                    files = outbox_lib.resolve_attachments(
+                        files, OUTGOING_ATTACHMENT_DIR, MAX_OUTBOUND_ATTACHMENT_BYTES,
+                        MAX_OUTBOUND_ATTACHMENTS)
+                    form = _attachment_form(payload, files)
+                except (OSError, outbox_lib.AttachmentError) as e:
+                    log.error(f"Discord outbox: attachment unreadable for {rid}: {e}")
+                    outbox_lib.record_failure(conn, rid, "permanent", None,
+                                              f"attachment unreadable: {type(e).__name__}",
+                                              None, _outbox_now())
+                    return None
+                # multipart sets its own Content-Type (with the boundary)
+                headers = {"Authorization": headers["Authorization"]}
+                request_kwargs = {"data": form}
+            async with http_session.post(url, headers=headers, **request_kwargs) as resp:
                 status = resp.status
                 if status in (200, 201):
                     data = await resp.json()
@@ -1898,10 +1950,33 @@ async def outbox_send_row(row: Dict[str, Any]) -> Optional[str]:
                     except Exception:
                         body = ""
                     detail = _discord_error_detail(status, body)
+                    files_too_big = status == 413 and bool(files)
         except asyncio.CancelledError:
             raise
         except Exception as e:
             status, detail = None, f"{type(e).__name__}: {str(e)[:100]}"
+        if files_too_big:
+            # Discord's bot upload limit is not fixed; do not lose the reply text with
+            # the files. Send this chunk once more without them, saying why.
+            log.warning(f"Discord outbox: files refused as too large for {rid}; sending text only")
+            note = "\n\n(files not sent: too large for Discord)"
+            text = chunks[idx] + note if len(chunks[idx]) + len(note) <= MAX_DISCORD_MSG_LEN \
+                else chunks[idx]
+            plain = {k: v for k, v in payload.items() if k != "attachments"}
+            plain["content"] = text
+            try:
+                async with http_session.post(url, headers=headers, json=plain) as resp2:
+                    if resp2.status in (200, 201):
+                        msg_id = str((await resp2.json()).get("id"))
+                        outbox_lib.record_chunk(conn, rid, msg_id, _outbox_now())
+                        ids.append(msg_id)
+                        continue
+                    status, detail = resp2.status, _discord_error_detail(
+                        resp2.status, await resp2.text())
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                status, detail = None, f"{type(e).__name__}: {str(e)[:100]}"
         kind = outbox_lib.classify(status)
         log.error(f"Discord outbox: chunk {idx + 1}/{len(chunks)} for {rid} failed ({detail})")
         outbox_lib.record_failure(conn, rid, kind, status, detail, retry_after, _outbox_now())
@@ -2081,6 +2156,33 @@ async def ux_create_thread(agent: str, channel_id: str, message_id: Optional[str
     return None
 
 
+async def add_reaction(agent: str, channel_id: str, message_id: str, emoji_path: str) -> bool:
+    """Add `emoji_path` (already percent-encoded, see discord_ux.emoji_path) as
+    the agent's own reaction. Single attempt, one retry after a 429. Never
+    raises: a reaction is an acknowledgement, and losing one costs nothing."""
+    token = AGENT_TOKENS.get(agent) or (list(AGENT_TOKENS.values())[0] if AGENT_TOKENS else None)
+    if not token or not channel_id or channel_id == "0":
+        log.info(f"skip reaction (no token or channel) agent={agent}")
+        return False
+    url = (f"https://discord.com/api/v10/channels/{channel_id}/messages/"
+           f"{message_id}/reactions/{emoji_path}/@me")
+    try:
+        for attempt in (1, 2):
+            async with http_session.put(url, headers={"Authorization": f"Bot {token}"}) as resp:
+                if resp.status in (200, 204):
+                    return True
+                if resp.status == 429 and attempt == 1:
+                    wait = min(float((await resp.json()).get("retry_after", 1)), 5.0)
+                    await asyncio.sleep(wait)
+                    continue
+                log.warning(f"reaction by {agent} in {channel_id} failed: "
+                            f"{_discord_error_detail(resp.status, await resp.text())}")
+                return False
+    except Exception as e:
+        log.warning(f"reaction by {agent} in {channel_id} failed: {type(e).__name__}: {e}")
+    return False
+
+
 async def post_to_discord(agent: str, channel_id: str, content: str,
                           reply_to: Optional[str] = None,
                           dead_letter: bool = False,
@@ -2111,6 +2213,20 @@ async def post_to_discord(agent: str, channel_id: str, content: str,
     # Skip posting if channel_id is "0" (silent mode)
     if channel_id == "0":
         return None
+
+    # `[[attach: path]]` lines become file attachments on durable replies only.
+    attachments: List[str] = []
+    if dead_letter and "[[attach:" in (content or ""):
+        content, attachments, notes = outbox_lib.extract_attachments(
+            content, OUTGOING_ATTACHMENT_DIR, MAX_OUTBOUND_ATTACHMENT_BYTES,
+            MAX_OUTBOUND_ATTACHMENTS)
+        for note in notes:
+            log.warning(f"outbound attachment refused agent={agent}: {note}")
+        if notes:
+            content = (content + "\n\n" if content else "") + "\n".join(
+                f"(attachment not sent: {n})" for n in notes)
+        if attachments and not content.strip():
+            content = "Attached: " + ", ".join(Path(a).name for a in attachments)
 
     # Get agent's Discord token, fallback to primary agent
     token = AGENT_TOKENS.get(agent)
@@ -2150,7 +2266,8 @@ async def post_to_discord(agent: str, channel_id: str, content: str,
                     claimed=True,
                     now=_outbox_now(), content_sha=outbox_lib.content_sha(content),
                     chunks_total=len(chunks),
-                    queue_message_id=queue_message_id)
+                    queue_message_id=queue_message_id,
+                    attachments=attachments)
             except Exception as e:
                 _outbox_broken("enqueue", e)
             else:
@@ -2718,6 +2835,9 @@ async def crash_recovery():
         for msg in unposted:
             if not msg["response"] or not post_guard.post_decision(msg["response"])[0]:
                 continue
+            if (discord_ux.parse_react_reply(msg["response"])
+                    and ux_for_channel_id(msg["channel_id"]).reactions):
+                continue  # a reaction, never text
             poster = STATE.agent_of(msg["agent"])
             matched = None
             conn = _outbox_store()
@@ -4131,6 +4251,102 @@ def _hive_unknown_detail():
         {s.agent for s in effective_specs()} | {s.id for s in effective_specs()}))
 
 
+_send_limiter = cross_send.RateLimiter()
+
+
+def _send_resolve_channel(ref) -> Optional[str]:
+    """A channel id from a channels.json name or a bare id, else None."""
+    ref = str(ref or "").strip()
+    entry = (channels_config.get("channels") or {}).get(ref)
+    if isinstance(entry, dict) and entry.get("id"):
+        return str(entry["id"])
+    return ref if ref.isdigit() else None
+
+
+async def handle_send(request):
+    """POST /send {agent, action: "channels"|"send", channel?, content?}: the
+    `send` tool. Posts to a channel other than the turn's, only when the id is
+    in the agent's `send.channels` allowlist (empty by default). Rate limited
+    per agent; text is mention-neutralised and queued with empty
+    allowed_mentions. Delivery is the outbox's."""
+    if not _bearer_ok(request):
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    try:
+        data = await request.json()
+    except Exception:
+        data = None
+    if not isinstance(data, dict):
+        return web.json_response({"error": "Invalid JSON"}, status=400)
+    shard = _hive_known(data.get("agent"))
+    if not shard:
+        return web.json_response({"error": "unknown agent"}, status=400)
+    agent = spec_of(shard).agent
+    allowed, per_hour = cross_send.parse_config((agent_config.get(agent) or {}).get("send"))
+    names = {str(c.get("id")): n for n, c in (channels_config.get("channels") or {}).items()
+             if isinstance(c, dict)}
+    if data.get("action") == "channels":
+        return web.json_response({"channels": [{"id": c, "name": names.get(c)} for c in allowed],
+                                  "per_hour": per_hour})
+    channel_id = _send_resolve_channel(data.get("channel"))
+    if channel_id is None or channel_id not in allowed:
+        # The same answer for an unknown channel and a forbidden one.
+        return web.json_response({"error": "channel not allowed for send"}, status=403)
+    problem = cross_send.check_content(data.get("content"))
+    if problem:
+        return web.json_response({"error": problem}, status=400)
+    text = cross_send.neutralise_mentions(data["content"])
+    ok, _ = post_guard.post_decision(text)
+    if not ok:
+        return web.json_response({"error": "content is empty or not postable"}, status=400)
+    conn = _outbox_store()
+    if conn is None:
+        return web.json_response({"error": "outbox unavailable"}, status=503)
+    allowed_now, wait = _send_limiter.allow(agent, per_hour, time.monotonic())
+    if not allowed_now:
+        return web.json_response(
+            {"error": f"rate limit: {per_hour} sends per hour; next slot in {int(wait) + 1} s"},
+            status=429)
+    rid, _claimed = outbox_lib.enqueue(
+        conn, shard, channel_id, text, now=_outbox_now(),
+        content_sha=outbox_lib.content_sha(text),
+        allowed_mentions=cross_send.NO_MENTIONS)
+    _outbox_notify()
+    log.info(cross_send.audit_line(shard, channel_id, len(text), rid))
+    return web.json_response({"queued": True, "outbox_id": rid, "channel_id": channel_id}, status=202)
+
+
+async def handle_react(request):
+    """POST /react {agent, emoji, channel_id?, message_id?}: the `react` action
+    of the discord tool. Channel and message default to the agent's active turn."""
+    if not _bearer_ok(request):
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    try:
+        data = await request.json()
+    except Exception:
+        data = None
+    if not isinstance(data, dict):
+        return web.json_response({"error": "Invalid JSON"}, status=400)
+    shard = _hive_known(data.get("agent"))
+    if not shard:
+        return web.json_response({"error": "unknown agent"}, status=400)
+    emoji = discord_ux.emoji_path(data.get("emoji"))
+    if emoji is None:
+        return web.json_response(
+            {"error": "emoji must be a unicode emoji or name:id for a custom one"}, status=400)
+    turn = STATE.active_turns.get(shard)
+    channel_id = str(data.get("channel_id") or (turn.channel_id if turn else "") or "")
+    message_id = str(data.get("message_id") or "")
+    if not message_id and turn:
+        message_id = next((m for m in reversed(turn.message_ids) if str(m).isdigit()), "")
+    if not channel_id.isdigit() or not message_id.isdigit():
+        return web.json_response({"error": "no channel or message to react to"}, status=400)
+    if not ux_for_channel_id(channel_id).reactions:
+        return web.json_response({"error": f"reactions disabled for {channel_id}"}, status=403)
+    if not await add_reaction(shard, channel_id, message_id, emoji):
+        return web.json_response({"error": "Discord refused the reaction"}, status=502)
+    return web.json_response({"reacted": True, "channel_id": channel_id, "message_id": message_id})
+
+
 async def handle_hive_buzz(request):
     """POST /hive/buzz {from, to, message}: leave another shard a message."""
     if not _bearer_ok(request):
@@ -5067,6 +5283,8 @@ def create_app(with_lifecycle: bool = True) -> web.Application:
     app.router.add_post("/ask", handle_ask_create)
     app.router.add_get("/ask/{ask_id}", handle_ask_status)
     app.router.add_post("/ask/{ask_id}/answer", handle_ask_answer)
+    app.router.add_post("/react", handle_react)
+    app.router.add_post("/send", handle_send)
     app.router.add_post("/hive/buzz", handle_hive_buzz)
     app.router.add_post("/hive/call", handle_hive_call_create)
     app.router.add_get("/hive/call/{call_id}", handle_hive_call_get)

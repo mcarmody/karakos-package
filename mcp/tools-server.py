@@ -284,22 +284,53 @@ CORE_TOOLS = [
     },
     {
         "name": "discord",
-        "description": "Discord server read-only access. Actions: history (view messages), channels (list channels).",
+        "description": "Discord server access. Actions: history (view messages), channels (list channels), react (add an emoji reaction to a message; defaults to the message that started this turn; unavailable where reactions are switched off).",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["history", "channels"],
+                    "enum": ["history", "channels", "react"],
                     "description": "The action to perform"
                 },
                 "channel": {
                     "type": "string",
-                    "description": "Channel name or ID (required for history)"
+                    "description": "Channel name or ID (required for history; for react, default: this turn's channel)"
+                },
+                "message_id": {
+                    "type": "string",
+                    "description": "react: the message to react to (default: the message that started this turn)"
+                },
+                "emoji": {
+                    "type": "string",
+                    "description": "react: a unicode emoji, or name:id for a custom one"
                 },
                 "limit": {
                     "type": "integer",
                     "description": "Number of messages (default 20, max 50)"
+                }
+            },
+            "required": ["action"]
+        }
+    },
+    {
+        "name": "send",
+        "description": "Post a message to a Discord channel other than the one this turn came from. Off unless the operator lists the channel in your `send.channels` setting; you can only use channels shown by action `channels`. Rate limited. @everyone, @here and role mentions are neutralised and nothing pings. Actions: channels (list the channels you may post to), send (queue a message; delivery is asynchronous).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["channels", "send"],
+                    "description": "The action to perform"
+                },
+                "channel": {
+                    "type": "string",
+                    "description": "send: a channel name or id from `channels`"
+                },
+                "content": {
+                    "type": "string",
+                    "description": "send: the message text (up to 4000 characters)"
                 }
             },
             "required": ["action"]
@@ -354,6 +385,28 @@ CORE_TOOLS = [
                 "action": {"type": "string", "enum": ["list", "read", "validate"],
                            "description": "The action to perform"},
                 "name": {"type": "string", "description": "Skill directory name (read, validate)"},
+            },
+            "required": ["action"],
+        },
+    },
+    {
+        "name": "friction",
+        "description": (
+            "Friction log review. recent: the newest tool errors, denied tools and "
+            "repeated commands from data/friction-log.jsonl, with the recurring "
+            "causes. propose_issue: draft an upstream issue for one cause and ask "
+            "the user (ask_user) whether to file it; it files only on their yes, "
+            "and only for a cause seen on two separate days."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["recent", "propose_issue"],
+                           "description": "The action to perform"},
+                "days": {"type": "integer", "description": "Look back this many days (default 7)"},
+                "limit": {"type": "integer", "description": "Rows to return (recent; default 30)"},
+                "cause": {"type": "string", "description": "Cause id from recent (propose_issue)"},
+                "repo": {"type": "string", "description": "owner/name to file on (propose_issue)"},
             },
             "required": ["action"],
         },
@@ -992,6 +1045,26 @@ def handle_core_tool(tool_name: str, args: dict) -> dict:
             if channels_path.exists():
                 return json.loads(channels_path.read_text())
             return {"channels": {}}
+        elif action == "react":
+            channel = args.get("channel")
+            channel_id = None
+            if channel:
+                channel_id = str(channel)
+                if not channel_id.isdigit():
+                    cfg_path = WORKSPACE / "config" / "channels.json"
+                    try:
+                        entry = (json.loads(cfg_path.read_text()).get("channels") or {}).get(channel_id)
+                    except (OSError, ValueError):
+                        entry = None
+                    channel_id = str(entry.get("id")) if isinstance(entry, dict) and entry.get("id") else None
+                    if channel_id is None:
+                        return {"error": f"Unknown channel: {channel}"}
+            status, body = agent_server_request("POST", "/react", {
+                "agent": KARAKOS_AGENT, "emoji": args.get("emoji"),
+                "channel_id": channel_id, "message_id": args.get("message_id")})
+            if status == 200:
+                return body
+            return {"error": body.get("error") or f"react failed (HTTP {status})"}
         elif action == "history":
             channel = args.get("channel", "general")
             limit = min(args.get("limit", 20), 50)
@@ -1014,6 +1087,31 @@ def handle_core_tool(tool_name: str, args: dict) -> dict:
                 except json.JSONDecodeError:
                     continue
             return {"messages": messages[-limit:], "channel": channel}
+
+    elif tool_name == "send":
+        action = args.get("action")
+        if action not in ("channels", "send"):
+            return {"error": f"Unknown send action: {action}"}
+        status, body = agent_server_request("POST", "/send", {
+            "agent": KARAKOS_AGENT, "action": action,
+            "channel": args.get("channel"), "content": args.get("content")})
+        if status in (200, 202):
+            return body
+        return {"error": body.get("error") or f"send failed (HTTP {status})"}
+
+    elif tool_name == "friction":
+        from lib import friction_review as fr
+        action = args.get("action")
+        days = args.get("days") if isinstance(args.get("days"), int) and args["days"] > 0 else 7
+        try:
+            if action == "recent":
+                limit = args.get("limit") if isinstance(args.get("limit"), int) and args["limit"] > 0 else 30
+                return fr.recent(WORKSPACE, days, min(limit, 200))
+            if action == "propose_issue":
+                return fr.propose_issue(WORKSPACE, args.get("cause"), args.get("repo"), ask_user, days=days)
+        except (ValueError, LookupError, RuntimeError) as e:
+            return {"error": str(e)}
+        return {"error": f"Unknown friction action: {action}"}
 
     elif tool_name == "skill":
         from lib import procedure_skills as ps

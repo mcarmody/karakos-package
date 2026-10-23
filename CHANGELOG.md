@@ -14,6 +14,27 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [2.4.0] - 2026-10-23
+
+### Fixed
+
+- `purge-data`: a `VACUUM` that cannot take its lock no longer turns committed tool-audit deletes into a reported 0 (#156). The hyphenated-agent-name half of #156 was already fixed on `develop` (`_summary_agent`, covered by `tests/test_purge.py`).
+
+### Added
+
+- Cross-channel send (#278). New `send` tool (`channels`, `send`) posts to a channel other than the active turn's, only for ids in the agent's new `send.channels` list in `agents.yaml` (empty by default, so off) and at most `send.per_hour` (default 20) per rolling hour. The text is mention-neutralised, rows are queued in the outbox with empty `allowed_mentions` (new `outbox.allowed_mentions` column, added at open like `attachments`), and each send logs one audit line without the text. Tier 1: `bin/agent-server.py` gains `POST /send` and sends `allowed_mentions` when a row has it. New `lib/cross_send.py`.
+- Agent emoji reactions (#285). A final reply of exactly `REACT: <emoji>` adds that reaction to the message that started the turn instead of posting text, and the `discord` tool gains a `react` action (`channel`, `message_id`, `emoji`). New `ux` key `reactions`, on by default, per-channel override; when off, `REACT:` posts as text and the tool action returns an error. Changes `bin/agent-server.py` (tier 1: `add_reaction` and the `/react` route only), `lib/turn_loop.py`, `lib/discord_ux.py`, `mcp/tools-server.py`, `agents/CORE.md`.
+- Entity dedup (build B of #238): `bin/graph-dedup.py` lists, and with `--live` merges (at most 50 per run), same-kind entities whose embeddings are nearly identical, using the soft `merge_entities`. The nightly `memory-consolidate` job runs it on Sundays when `MEMORY_ENTITY_DEDUP` is `report` or `live`; off by default. A pair also needs a second signal from the names (identical number tokens and the same number of words, plus a shared word, close spelling or an abbreviation; names with fewer words and ambiguous abbreviations are only listed for review), so dates and version numbers no longer merge; the weekly pass honours `dry_run` and scores in blocks.
+- Outbound Discord file attachments (#277). A durable reply can carry files: put
+  `[[attach: path]]` on its own line and the outbox sends them with the first chunk
+  as multipart. Paths must resolve inside `data/outgoing/` (symlinks followed; the rest of `data/`, including the message store, is off limits), be non-empty and
+  within `MAX_ATTACHMENT_BYTES` (also the cap on all files together) / `MAX_ATTACHMENTS_PER_MESSAGE`; files are checked again when sent; if Discord answers 413 the first chunk is retried once without the files and says so; a refused file is
+  reported in the reply and the text still goes out. New `attachments` column on the
+  outbox table, added in place by `open_store`.
+- `friction` action in the tools MCP server (#237): `recent` returns the newest friction rows and recurring causes; `propose_issue` drafts the upstream issue for one cause and files it only after the user answers yes through `ask_user` (and only for a cause seen on two separate days). Nothing is filed automatically. A long draft is cut at 1,800 characters and the question says so; if filing fails after a yes the result is `file_failed` with the error and the draft.
+- `diagnose` tool in the `karakos-admin` MCP server (part 3 of #236) returns the `bin/self-diagnose.py` findings; two new sections, `buildqueue` (runnable builds queued with none running; builds held by `not_before` are ignored) and `version` (warns only when the data was stamped by a newer package than the code). Read-only.
+- Channel context for agents (#276): the relay prepends the messages that arrived in the channel since the agent's own last post there (`[context] Author (HH:MM): text`, oldest first, the triggering message excluded) to each delivered message. Channel-level `context_messages` sets how many: default 8, 0 to 20, 0 is off. In memory only (`lib/channel_context.py`); documented in `docs/DISCORD_SETUP.md`.
+
 ## [2.3.1] - 2026-10-21
 
 ### Fixed
@@ -26,6 +47,10 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Build-time calibration (#242): `bin/estimate.py` (`calibrate`, `show`, `for KIND --builds N`) reads finished builds from `data/build-queue.db` read-only and writes median and 80th-percentile minutes per kind to `data/estimates/calibration.json`. A kind with fewer than three finished builds is reported as too thin to quote, not guessed.
+- Procedure skills shipped with the package (#235 build B): `restart-and-recover`, `diag`,
+  `estimate`, `worktree-setup` and `skill-author`, instruction-only `SKILL.md` files under
+  `skills/`, listed and read with the `skill` tool. Package-neutral wording.
 - Opt-in `"unlisted_channels": "mention_only"` in `config/channels.json`: an @mention of an agent now routes in a channel that is not listed, inside a configured server. Default `"ignore"` keeps the B24 refusal. Touches tier-1 `bin/relay.py`: maintainer review.
 - Persona and prompt rollback (#241): `snapshot_persona` and `restore_persona` admin MCP tools (`lib/persona_snapshots.py`) copy an agent's `persona/` and `SYSTEM_PROMPT.md` to `data/persona-snapshots/<name>/<id>/` (newest 10 kept). Taken automatically before `create_agent` overwrites a prompt and before a `reload_agent` that follows a persona change. A restore snapshots the current state first. Self-scoped like the other admin tools.
 - Runtime model switching (#233): `/model` slash command, `POST /agents/{name}/model` and a `set_model` admin MCP tool set an agent-level model override in `data/runtime-overrides.json`, applied at the next spawn (after the turn in flight, like `/effort`). Allowed ids are listed in the new `config/models.yaml` (aliases `opus`, `sonnet`, `haiku` by default), not in code; without that file only the agent's registry model is allowed. An agent may switch only its own model; the primary may switch any. Touches tier-1 `bin/agent-server.py` and `bin/relay.py`: maintainer review.
@@ -264,7 +289,8 @@ Initial release: an installable multi-agent household system — Discord
 integration, local dashboard, episodic memory, session persistence, cost
 tracking, and builder/reviewer agents behind guardrails.
 
-[Unreleased]: https://github.com/mcarmody/karakos-package/compare/v2.3.1...develop
+[Unreleased]: https://github.com/mcarmody/karakos-package/compare/v2.4.0...develop
+[2.4.0]: https://github.com/mcarmody/karakos-package/compare/v2.3.1...v2.4.0
 [2.3.1]: https://github.com/mcarmody/karakos-package/compare/v2.3.0...v2.3.1
 [2.3.0]: https://github.com/mcarmody/karakos-package/compare/v2.2.0...v2.3.0
 [2.2.0]: https://github.com/mcarmody/karakos-package/compare/v2.1.0...v2.2.0

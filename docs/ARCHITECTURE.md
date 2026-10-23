@@ -282,7 +282,7 @@ Replaces cron, with the container's full environment. The loop ticks every
 | Claude CLI rollback guard | at startup, then hourly | `bin/cli-upgrade-watchdog.sh` |
 | Memory consolidation | daily 03:00 | `lib/monitor_jobs/memory_consolidate.py` (also `bin/graph-consolidate.py [--dry-run]`) |
 | Friction sensor | hourly, offset :10 | `lib/monitor_jobs/friction_sensor.py` (also `bin/friction-sensor.py [--summary]`): scans `logs/agent-streams/` for tool errors, non-zero Bash exits, denials, rate-limit pressure and repeated commands; appends to `data/friction-log.jsonl`, refreshes `data/friction/weekly.md`. No LLM, read-only on the logs |
-| Friction review | daily 03:30 | `lib/monitor_jobs/friction_review.py` (also `bin/friction-review.py`): groups `data/friction-log.jsonl` into recurring causes, writes `data/friction/YYYY-MM-DD.md` with a drafted issue and proposed fix per cause. Report only; filing upstream needs `--file --yes` from a person and only covers causes seen on two separate days |
+| Friction review | daily 03:30 | `lib/monitor_jobs/friction_review.py` (also `bin/friction-review.py`): groups `data/friction-log.jsonl` into recurring causes, writes `data/friction/YYYY-MM-DD.md` with a drafted issue and proposed fix per cause. Report only; filing upstream needs `--file --yes` from a person and only covers causes seen on two separate days. The `friction` tool (`recent`, `propose_issue`) lets an agent read the log and, after a yes through `ask_user`, file one cause |
 | Health monitor | daily 04:00 | `bin/health-monitor.py` |
 | Data purge | daily 04:30 | `bin/purge-data.py` |
 | Update check | Mondays 05:00 | `bin/check-updates.sh` — pokes signals on a new release |
@@ -484,7 +484,7 @@ required. Keys, all optional: `model`, `effort` (`low`, `medium`, `high`,
 `token_budget_min_pause_s`, `context_budget_tokens`, `handoff_on_reset`,
 `reset_mode`, `prompt` (and the legacy `system_prompt`), `tool_streaming`,
 `stream_to_channel`, `dashboard_chat`, `allowed_tools`, `disallowed_tools`,
-`env`, `label`, `work_stealing`, `steering`, `shards` (each with its `channels`)
+`env`, `label`, `work_stealing`, `steering`, `send`, `shards` (each with its `channels`)
 and `discord` (`token_env`, `bot_id_env`, `role_id_env`). Unknown keys warn and are ignored.
 The server reads it at start and on reload; the relay re-reads it when the file
 changes.
@@ -617,6 +617,21 @@ job (`lib/graph/consolidate.py`) builds episodes from the previous day's
 messages, decays and archives them, merges duplicates, tidies entities and
 backfills embeddings.
 
+**Entity dedup:** `bin/graph-dedup.py` (`lib/graph/entity_dedup.py`) finds live
+entities of one kind whose embeddings have cosine similarity of at least 0.92 and
+folds the one with fewer observations into the other with `merge_entities`.
+Embeddings of bare names rate unrelated things alike (two dates, two version
+numbers) and a name against a longer one that starts with it ("Mike" and "Mike
+Tyson"), and there is no unmerge, so a pair also needs a second signal from the
+names: identical number tokens, the same number of words, and either a shared
+word or close spelling, or words that differ only by shortening ("ian h." and
+"Ian Hartley") at a cosine of at least 0.6. An abbreviation that fits more than one
+entity merges none of them. Pairs where one name has fewer words, and ambiguous
+abbreviations, are listed for review and never merged. Scoring runs in blocks, so memory grows with the kind size times a
+fixed block, not its square. It lists pairs by default; `--live` merges at most 50
+per run. The nightly job can run it on Sundays when `MEMORY_ENTITY_DEDUP` is
+`report` or `live`; a job run with `dry_run` never merges.
+
 **Cleaning memory:** agents delete softly. `memory.forget` archives one
 observation and `memory.supersede` replaces it with new text (the old row gets
 `superseded_by`); both drop out of recall. `graph.delete_entity` archives an
@@ -649,9 +664,16 @@ Hard delete is not an agent action. `taskboard.delete` tombstones a task with
   /outbox/{id}/retry` and `POST /outbox/{id}/discard` with it up. `GET /health`
   carries `outbox` (`pending`, `sending`, `dead`, `oldest_pending_age_s`);
   `dead_letters` counts dead rows and `dead_letter_path` is deprecated.
+  A durable reply can carry files: a line `[[attach: path]]` is stripped from the
+  text and the file is sent with the first chunk as multipart (`attachments` column,
+  `lib/outbox.py` `resolve_attachments`). Only files inside `data/outgoing/` qualify (checked again at send time), capped by
+  `MAX_ATTACHMENT_BYTES` (per file and in total) and `MAX_ATTACHMENTS_PER_MESSAGE`; a refused file is named in
+  the reply and a file that vanishes before sending makes the row `dead`.
 - **Discord switches** (all off by default; `threads`, `reaction_notices`,
   `edit_reroute`, `suppress_embeds`; `tool_streaming` is a per-channel override of
-  the agent's setting): [DISCORD_SETUP.md](DISCORD_SETUP.md#optional-behaviours).
+  the agent's setting; `reactions` is on by default and lets an agent answer
+  `REACT: <emoji>` or use the `discord` tool's `react` action, `POST /react`):
+  [DISCORD_SETUP.md](DISCORD_SETUP.md#optional-behaviours).
 - **Pause and effort.** `/pause [minutes]` and `/resume` hold and release a
   shard's queue (`lib/operator_pause.py`, `data/operator-pause.json`; the turn in
   progress finishes). `/effort <level>` sets an agent-level `--effort` override
@@ -757,7 +779,9 @@ data/                                  # named volume
 ├── friction/weekly.md                 # 7-day friction summary
 ├── friction/YYYY-MM-DD.md             # nightly review: causes and drafted issues
 ├── outbox/outbox.db                   # durable Discord replies: retry + audit (6.1)
+├── outgoing/                          # the only folder an agent may attach files from
 ├── build-queue.db                     # build queue (when enabled)
+├── estimates/calibration.json         # build-time medians per kind (bin/estimate.py calibrate)
 ├── discord-dead-letter.jsonl.migrated # 1.x dead letters, imported into the outbox and kept
 ├── operator-pause.json                # /pause holds, keyed by shard id
 ├── runtime-overrides.json             # /effort and /model overrides, keyed by agent id
