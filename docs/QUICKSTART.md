@@ -275,12 +275,13 @@ install was ever working.
 **The agent is down and I cannot reach it.**
 The agent API and the agent cannot help you here, so go around them.
 Run `make logs` first and read the first error, before you restart anything.
-A restart rotates the log that holds the cause.
+A restart starts a new stream log, so the cause scrolls out of the newest file.
 Run `make shell` to get a shell in the container.
-Inside it, `ps -eo pid,etime,cmd | grep claude` lists the agent processes.
+The image has no `ps`, so list the agent processes from `/proc`:
+`for p in /proc/[0-9]*; do echo "${p#/proc/} $(tr '\0' ' ' < $p/cmdline 2>/dev/null)"; done | grep claude`.
 A pid that changes between two runs means a crash loop.
 The files `logs/agent-server.log` and `logs/agent-streams/` hold the last output.
-From the host, `docker compose -f config/docker-compose.yml --env-file config/.env exec karakos ps -eo pid,etime,cmd` gives the same list.
+From the host, `docker compose -f config/docker-compose.yml --env-file config/.env top karakos` gives the same list, with start times.
 Conversation transcripts are in `~/.claude/projects/` on the host.
 Do not delete them when a session is locked. The lock is the problem, and the transcripts are the agent's memory.
 
