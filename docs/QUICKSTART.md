@@ -272,6 +272,18 @@ then remove the volumes (`docker compose -f config/docker-compose.yml down -v`)
 and start again — this destroys the data in them, so take a backup first if the
 install was ever working.
 
+**The agent is down and I cannot reach it.**
+The agent API and the agent cannot help you here, so go around them.
+Run `make logs` first and read the first error, before you restart anything.
+A restart rotates the log that holds the cause.
+Run `make shell` to get a shell in the container.
+Inside it, `ps -eo pid,etime,cmd | grep claude` lists the agent processes.
+A pid that changes between two runs means a crash loop.
+The files `logs/agent-server.log` and `logs/agent-streams/` hold the last output.
+From the host, `docker compose -f config/docker-compose.yml --env-file config/.env exec karakos ps -eo pid,etime,cmd` gives the same list.
+Conversation transcripts are in `~/.claude/projects/` on the host.
+Do not delete them when a session is locked. The lock is the problem, and the transcripts are the agent's memory.
+
 ## Next
 
 - [DISCORD_SETUP.md](DISCORD_SETUP.md) — the bot, in detail
