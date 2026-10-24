@@ -38,6 +38,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import ask_handler  # noqa: E402
 import cross_send  # noqa: E402
+import identity  # noqa: E402
 import discord_ux  # noqa: E402
 import hive as hive_lib  # noqa: E402
 import msgqueue  # noqa: E402
@@ -298,6 +299,8 @@ async def init_db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     db = await aiosqlite.connect(str(DB_PATH))
     db.row_factory = aiosqlite.Row
+
+    await db.execute(identity.PEOPLE_SCHEMA)  # who an id goes by (lib/identity.py)
 
     # Message queue table
     await db.execute("""
@@ -3005,6 +3008,12 @@ async def handle_message(request):
         row = await cursor.fetchone()
         if row["count"] >= QUEUE_DEPTH_LIMIT:
             return web.json_response({"error": "Queue full"}, status=503)
+
+    # Identity is the Discord id; the name is a label (people table, lib/identity.py).
+    if not is_bot:
+        _old_name = await identity.record_person(db, author_id, data.get("guild_id"), author)
+        if _old_name:
+            author = identity.compose_author(author, _old_name)
 
     # Insert message
     try:
