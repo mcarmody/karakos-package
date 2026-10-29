@@ -41,6 +41,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import ask_handler  # noqa: E402
 import cross_send  # noqa: E402
+import identity  # noqa: E402
 import discord_ux  # noqa: E402
 import hive as hive_lib  # noqa: E402
 import msgqueue  # noqa: E402
@@ -301,6 +302,8 @@ async def init_db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     db = await aiosqlite.connect(str(DB_PATH))
     db.row_factory = aiosqlite.Row
+
+    await db.execute(identity.PEOPLE_SCHEMA)  # who an id goes by (lib/identity.py)
 
     # Message queue table
     await db.execute("""
@@ -2846,7 +2849,7 @@ async def crash_recovery():
             channel_id = msg["channel_id"]
             agent = msg["agent"]
             if channel_id != "0":
-                crash_msg = f"⚠️ {agent} crashed while processing message from {msg['author']}"
+                crash_msg = f"⚠️ {agent} crashed while processing message from {identity.display_name(msg['author'])}"
                 await post_to_discord(agent, channel_id, crash_msg)
 
         await db.commit()
@@ -3009,6 +3012,12 @@ async def handle_message(request):
         if row["count"] >= QUEUE_DEPTH_LIMIT:
             return web.json_response({"error": "Queue full"}, status=503)
 
+    # Identity is the Discord id; the name is a label (people table, lib/identity.py).
+    if not is_bot:
+        _old_name = await identity.record_person(db, author_id, data.get("guild_id"), author)
+        if _old_name:
+            author = identity.compose_author(author, _old_name)
+
     # Insert message
     try:
         await db.execute(
@@ -3101,7 +3110,7 @@ async def handle_message_edit(request):
 
     if decision.action in ("followup", "update_followup"):
         text = discord_ux.edit_followup_text(
-            row["author"], row["content"], content, decision.phase)
+            identity.display_name(row["author"]), row["content"], content, decision.phase)
         if decision.action == "update_followup":
             cur = await db.execute(
                 "UPDATE message_queue SET content = ? WHERE message_id = ? AND processed = 0",
@@ -3804,7 +3813,7 @@ async def handle_agent_queue(request):
             "id": row["id"],
             "agent": row["agent"],
             "channel": row["channel"],
-            "author": row["author"],
+            "author": identity.display_name(row["author"]),
             "content": content[:QUEUE_PREVIEW_CHARS],
             "content_full_length": len(content),
             "created_at": row["created_at"],
