@@ -14,8 +14,14 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [2.5.0] - 2026-10-29
+
 ### Added
 
+- Touch-file heartbeats (#311, contract 07, heartbeat and friction fields). `lib/heartbeats.py` accepts `<heartbeat_dir>/<job>` as the required signal; its mtime is the last success. `heartbeat_dir` is `$KARAKOS_HEARTBEAT_DIR`, default `~/.karakos/heartbeats`. The JSON file stays as optional detail; when both exist the newer timestamp wins. Readers never create the touch file.
+- Friction sensor transcript sources (#312, contract 07). `KARAKOS_TRANSCRIPT_GLOBS` (`os.pathsep`-separated globs of directories holding `*.jsonl`) adds Claude Code session transcripts beside the stream logs. Every friction row carries both the package field names (`kind`, `detail`, `agent`) and the workspace names (`category`, `evidence`, `source`); readers accept either and keep unknown fields.
+- Friction sensor redaction, repetition and notes (#313, contract 07). `redact_detail` masks credentials, `NAME_TOKEN=value` assignments and URL userinfo in every detail and window signature; Bash commands repeated across sessions over a rolling 7 days emit a `(cross-session)` `repeat` row at each multiple of 5; `bin/friction-sensor.py --note TEXT [--tag TAG]` hand-logs a `note` row.
+- `lib/cron_drift.py` (#314, contract 07): crontab coverage, paused-job and drift checks for installs that keep cron instead of `bin/scheduler.py`. `heartbeat_jobs_in_text`, `paused_and_live_names`, `paused_jobs`, `unmonitored`, `read_crontab` (local or over ssh; `None` when unreadable) and `drift`.
 - Gateway outage alert. The relay posts off Discord when the gateway stays down past `OUTAGE_ALERT_AFTER_S` (default 300 s) or when the outbox dead-letter count rises, one message per outage plus one line on recovery, to `OUTAGE_ALERT_WEBHOOK_URL` (text POST; unset means log only). `lib/gateway_watch.py` holds the logic; `bin/relay.py` feeds it gateway events.
 - Native mode, part 3 (#303). `install.sh --native` and `./setup.sh --native` install without Docker: `bin/native-install.sh` creates `.venv`, builds the dashboard, runs `bin/native-bootstrap.sh` (the setup the container entrypoint does) and starts the `systemd --user` units. `make upgrade-native` (`bin/native-upgrade.sh`) fast-forwards or checks out `KARAKOS_REF`, refreshes the venv and dashboard and restarts the units. The Docker path is unchanged.
 - Native-mode install root (#303, part 1). One resolver decides where the install lives: `lib/paths.py` (`workspace_root()`) for Python and `bin/lib/paths.sh` for shell. Order: `KARAKOS_HOME`, then `WORKSPACE_ROOT`, then the checkout the file sits in, so nothing defaults to `/workspace` any more. The container is unchanged: it sets `WORKSPACE_ROOT`, and the scripts sit at `/workspace`. Safety hooks under `system/` stay import-free and read `WORKSPACE_ROOT` only (the native units set both). A test fails on any new hardcoded `/workspace` default or inline root lookup.
@@ -315,7 +321,8 @@ Initial release: an installable multi-agent household system — Discord
 integration, local dashboard, episodic memory, session persistence, cost
 tracking, and builder/reviewer agents behind guardrails.
 
-[Unreleased]: https://github.com/mcarmody/karakos-package/compare/v2.4.0...develop
+[Unreleased]: https://github.com/mcarmody/karakos-package/compare/v2.5.0...develop
+[2.5.0]: https://github.com/mcarmody/karakos-package/compare/v2.4.0...v2.5.0
 [2.4.0]: https://github.com/mcarmody/karakos-package/compare/v2.3.1...v2.4.0
 [2.3.1]: https://github.com/mcarmody/karakos-package/compare/v2.3.0...v2.3.1
 [2.3.0]: https://github.com/mcarmody/karakos-package/compare/v2.2.0...v2.3.0
