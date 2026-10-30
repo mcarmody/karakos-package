@@ -44,7 +44,9 @@ def _job_line_names(body: str, heartbeat_dir: str | os.PathLike) -> set[str]:
     return names
 
 
-def paused_and_live_names(text: str, heartbeat_dir: str | os.PathLike) -> tuple[set[str], set[str]]:
+def paused_and_live_names(
+    text: str, heartbeat_dir: str | os.PathLike
+) -> tuple[set[str], set[str]]:
     """Return (paused, live) heartbeat names found in one crontab text.
 
     A commented job line is paused when it carries a PAUSED/DISABLED marker on its
@@ -71,13 +73,15 @@ def paused_and_live_names(text: str, heartbeat_dir: str | os.PathLike) -> tuple[
     return paused, live
 
 
-def paused_jobs(texts: Iterable[str], jobs: Iterable[str], heartbeat_dir: str | os.PathLike) -> set[str]:
+def paused_jobs(
+    texts: Iterable[str], jobs: Iterable[str], heartbeat_dir: str | os.PathLike
+) -> set[str]:
     paused: set[str] = set()
     live: set[str] = set()
     for text in texts:
-        p, l = paused_and_live_names(text, heartbeat_dir)
-        paused |= p
-        live |= l
+        text_paused, text_live = paused_and_live_names(text, heartbeat_dir)
+        paused |= text_paused
+        live |= text_live
     return (paused - live) & set(jobs)
 
 
