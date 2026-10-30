@@ -7,6 +7,11 @@ kept in data/friction-sensor-state.json (byte offset per stream), so a rerun
 only reads new lines. Nothing here edits a prompt, persona or config.
 Transcripts named by KARAKOS_TRANSCRIPT_GLOBS are scanned beside the stream logs.
 Rows carry both the package and the workspace field names (contract 07).
+
+Repetition is counted two ways: REPEAT_AT (3) identical Bash commands in one
+stream emit a `repeat` row; REPEAT_AT_WINDOW (5) across all streams within
+WINDOW_DAYS (7) emit a `(cross-session)` `repeat` row, again at each further
+multiple of 5. A hand-written `note` row is added by `note()` (bin/friction-sensor.py --note).
 """
 from __future__ import annotations
 
@@ -18,6 +23,7 @@ import re
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Optional
 
 from lib.redact import redact_text
 
@@ -25,8 +31,13 @@ LOG_NAME = "friction-log.jsonl"
 STATE_NAME = "friction-sensor-state.json"
 SUMMARY_REL = Path("friction") / "weekly.md"
 REPEAT_AT = 3            # same Bash command this many times in one stream
+WINDOW_DAYS = 7          # cross-session repetition window
+REPEAT_AT_WINDOW = 5     # same Bash command this many times across streams in the window
 RATE_HIGH = 0.9          # five-hour or weekly utilisation worth noting
 DETAIL_MAX = 200
+NOTE_MAX = 1000
+_SECRET_ASSIGN_RE = re.compile(r"\b(\w*(?:TOK|TOKEN|KEY|SECRET|PASS|PWD|CRED)\w*)=\S+", re.I)
+_URL_CRED_RE = re.compile(r"https?://[^/\s@]+@")
 PENDING_MAX = 200
 DENIED_MARKERS = ("Blocked:", "permission denied", "was denied", "not allowed", "requires approval")
 TRANSCRIPT_GLOBS_ENV = "KARAKOS_TRANSCRIPT_GLOBS"
@@ -59,9 +70,20 @@ def _agent_of(path: Path, transcript: bool = False) -> str:
     return path.name.rsplit("_", 1)[0]
 
 
+def redact_detail(text: str) -> str:
+    """redact_text, then mask `NAME_TOKEN=value` assignments and URL userinfo."""
+    out = _SECRET_ASSIGN_RE.sub(r"\1=[redacted]", redact_text(text))
+    return _URL_CRED_RE.sub("https://[redacted]@", out)
+
+
 def _clip(text) -> str:
     one = " ".join(str(text or "").split())
-    return redact_text(one)[:DETAIL_MAX]
+    return redact_detail(one)[:DETAIL_MAX]
+
+
+def _window_sig(cmd: str) -> str:
+    """Readable, redacted, bounded form of a Bash command, used as the cross-session key."""
+    return redact_detail(" ".join(cmd.split()))[:DETAIL_MAX]
 
 
 def _result_text(block) -> str:
@@ -99,8 +121,11 @@ def both_names(row: dict) -> dict:
     return row
 
 
-def _scan_file(path: Path, st: dict, transcript: bool = False) -> list:
-    """New friction events from `path`; updates `st` (offset, pending, counts, rl)."""
+def _scan_file(path: Path, st: dict, transcript: bool = False, window: Optional[list] = None) -> list:
+    """New friction events from `path`; updates `st` (offset, pending, counts, rl).
+    Bash commands are also appended to `window` as [ts, signature] pairs."""
+    if window is None:
+        window = []
     try:
         size = path.stat().st_size
     except OSError:
@@ -140,6 +165,7 @@ def _scan_file(path: Path, st: dict, transcript: bool = False) -> list:
                         counts[s] = counts.get(s, 0) + 1
                         if counts[s] == REPEAT_AT:
                             add("repeat", "Bash", f"x{REPEAT_AT}: {cmd}")
+                        window.append([d_ts or _now(), _window_sig(cmd)])
         elif t == "user":
             for b in blocks:
                 if not (isinstance(b, dict) and b.get("type") == "tool_result"):
@@ -176,13 +202,23 @@ def scan(workspace) -> dict:
     state_path = ws / "data" / STATE_NAME
     state = _load(state_path, {})
     streams = state.setdefault("streams", {})
+    window = state.setdefault("cmd_window", [])
+    emitted = state.setdefault("emitted", {})
     out, scanned = [], 0
     for p in sorted((ws / "logs" / "agent-streams").glob("*.jsonl")):
         scanned += 1
-        out += _scan_file(p, streams.setdefault(p.name, {}))
+        out += _scan_file(p, streams.setdefault(p.name, {}), window=window)
     for p in transcript_files():
         scanned += 1
-        out += _scan_file(p, streams.setdefault(str(p), {}), transcript=True)
+        out += _scan_file(p, streams.setdefault(str(p), {}), transcript=True, window=window)
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=WINDOW_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    window[:] = [w for w in window if w[0] >= cutoff]
+    for sig, n in Counter(w[1] for w in window).items():
+        step = (n // REPEAT_AT_WINDOW) * REPEAT_AT_WINDOW
+        if step >= REPEAT_AT_WINDOW and step > emitted.get(sig, 0):
+            out.append({"agent": "(cross-session)", "stream": "", "kind": "repeat", "tool": "Bash",
+                        "detail": f"'{sig}' ran {n}x in {WINDOW_DAYS}d", "signature": sig, "count": n})
+            emitted[sig] = step
     stamp = _now()
     if out:
         log = ws / "data" / LOG_NAME
@@ -198,6 +234,21 @@ def scan(workspace) -> dict:
     tmp.write_text(json.dumps(state))
     os.replace(tmp, state_path)
     return {"scanned": scanned, "events": len(out)}
+
+
+def note(workspace, text: str, tag: Optional[str] = None, agent: Optional[str] = None) -> dict:
+    """Hand-logged `note` row (kind note, category note) appended to the friction log."""
+    row = {"ts": _now(), "agent": agent or os.environ.get("KARAKOS_AGENT") or "(hand-logged)",
+           "kind": "note", "tool": "friction",
+           "detail": redact_detail(" ".join(text.split()))[:NOTE_MAX]}
+    if tag:
+        row["signature"] = tag
+    row = both_names(row)
+    log = Path(workspace) / "data" / LOG_NAME
+    log.parent.mkdir(parents=True, exist_ok=True)
+    with open(log, "a") as fh:
+        fh.write(json.dumps(row) + "\n")
+    return row
 
 
 def read_log(workspace, days=7, stats=None) -> list:
