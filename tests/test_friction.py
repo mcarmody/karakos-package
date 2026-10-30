@@ -1,6 +1,7 @@
 """Friction sensor (#237 build A): stream scan, state, summary, job registration."""
 import json
 import sys
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -88,7 +89,7 @@ def test_repeated_command_reported_once_at_threshold(ws):
     write(ws, [use(str(i), "Bash", command="ls  -la") for i in range(5)]
           + [use("x", "Bash", command="ls -la")])
     friction.scan(ws)
-    rep = [e for e in events(ws) if e["kind"] == "repeat"]
+    rep = [e for e in events(ws) if e["kind"] == "repeat" and e["agent"] == "marvin"]
     assert len(rep) == 1 and "x3" in rep[0]["detail"]
 
 
@@ -141,3 +142,96 @@ def test_registered_as_an_hourly_job():
         assert job_registry.resolve_callable(j.run)
     finally:
         sys.path.remove(str(PACKAGE_ROOT / "lib"))
+
+
+TS = "2026-01-01T00:00:00.000Z"
+
+
+def test_transcript_glob_source(ws, tmp_path, monkeypatch):
+    d = tmp_path / "projects" / "x-agents-helper"
+    d.mkdir(parents=True)
+    lines = [dict(use("1", "Bash", command="false"), timestamp=TS),
+             dict(res("1", "Exit code 1"), timestamp=TS)]
+    with open(d / "session.jsonl", "w") as f:
+        for x in lines:
+            f.write(json.dumps(x) + "\n")
+    monkeypatch.setenv("KARAKOS_TRANSCRIPT_GLOBS", str(tmp_path / "projects" / "*"))
+    assert friction.scan(ws) == {"scanned": 1, "events": 1}
+    (e,) = events(ws)
+    assert e["agent"] == "helper" and e["kind"] == "bash_exit"
+    assert e["category"] == "command_error" and e["evidence"] == e["detail"]
+    assert e["session"] == "helper" and e["ts"] == TS
+    assert friction.scan(ws)["events"] == 0  # offset kept
+
+
+def test_both_names_on_stream_rows(ws):
+    write(ws, [use("a", "Bash", command="false"), res("a", "Exit code 1")])
+    friction.scan(ws)
+    (e,) = events(ws)
+    assert e["category"] == "command_error" and e["evidence"] == e["detail"]
+    assert e["session"] == e["agent"] == "marvin"
+
+
+def test_read_log_accepts_workspace_rows_and_counts_malformed(ws):
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    row = {"ts": now, "session": "amos", "category": "command_error", "tool": "Bash", "evidence": "x"}
+    (ws / "data" / "friction-log.jsonl").write_text(json.dumps(row) + "\n{not json\n")
+    stats = {}
+    rows = friction.read_log(ws, 7, stats)
+    assert rows[0]["kind"] == "bash_exit" and rows[0]["detail"] == "x"
+    assert rows[0]["agent"] == "amos" and stats["skipped"] == 1
+    assert friction.summary_text(rows).startswith("# Friction summary")
+
+
+def test_redaction_on_detail(ws):
+    write(ws, [use("1", "Bash", command="curl https://example.invalid/x"),
+               res("1", "Exit code 1: TOKEN=hunter2 failed https://user:pw@host/x")])
+    friction.scan(ws)
+    (e,) = events(ws)
+    assert "TOKEN=[redacted]" in e["detail"] and "https://[redacted]@host/x" in e["detail"]
+    assert "hunter2" not in e["detail"] and "user:pw" not in e["detail"]
+    assert e["evidence"] == e["detail"]
+
+
+def test_cross_session_repetition(ws):
+    for s in "abcde":
+        write(ws, [use("1", "Bash", command="git status")], name=f"{s}_1.jsonl")
+    friction.scan(ws)
+    rep = [e for e in events(ws) if e["kind"] == "repeat"]
+    assert len(rep) == 1
+    e = rep[0]
+    assert e["agent"] == "(cross-session)" and e["count"] == 5
+    assert e["category"] == "repetition" and e["signature"] == "git status"
+    write(ws, [use("1", "Bash", command="git status")], name="f_1.jsonl")
+    friction.scan(ws)
+    assert len([e for e in events(ws) if e["kind"] == "repeat"]) == 1  # step still 5
+    for s in "ghij":
+        write(ws, [use("1", "Bash", command="git status")], name=f"{s}_1.jsonl")
+    friction.scan(ws)
+    rep = [e for e in events(ws) if e["kind"] == "repeat"]
+    assert len(rep) == 2 and rep[-1]["count"] == 10
+
+
+def test_window_prunes_old(ws):
+    old = (datetime.now(timezone.utc) - timedelta(days=8)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    state_path = ws / "data" / "friction-sensor-state.json"
+    state_path.write_text(json.dumps({"cmd_window": [[old, "x"]] * 5}))
+    friction.scan(ws)
+    assert not [e for e in events(ws) if e["kind"] == "repeat"]
+    assert json.loads(state_path.read_text())["cmd_window"] == []
+
+
+def test_note(ws, monkeypatch):
+    monkeypatch.delenv("KARAKOS_AGENT", raising=False)
+    friction.note(ws, "typecheck needs the right tsconfig KEY=abc", tag="tsc")
+    e = events(ws)[-1]
+    assert e["kind"] == "note" and e["category"] == "note" and e["signature"] == "tsc"
+    assert e["detail"].endswith("KEY=[redacted]") and e["evidence"] == e["detail"]
+    assert e["session"] == e["agent"] == "(hand-logged)"
+
+
+def test_cli_note(ws):
+    cli = import_script("friction-sensor")
+    assert cli.main(["--workspace", str(ws), "--note", "hello"]) == 0
+    rows = events(ws)
+    assert len(rows) == 1 and rows[0]["kind"] == "note"

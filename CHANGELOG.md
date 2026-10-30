@@ -14,6 +14,38 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [2.5.0] - 2026-10-29
+
+### Added
+
+- Touch-file heartbeats (#311, contract 07, heartbeat and friction fields). `lib/heartbeats.py` accepts `<heartbeat_dir>/<job>` as the required signal; its mtime is the last success. `heartbeat_dir` is `$KARAKOS_HEARTBEAT_DIR`, default `~/.karakos/heartbeats`. The JSON file stays as optional detail; when both exist the newer timestamp wins. Readers never create the touch file.
+- Friction sensor transcript sources (#312, contract 07). `KARAKOS_TRANSCRIPT_GLOBS` (`os.pathsep`-separated globs of directories holding `*.jsonl`) adds Claude Code session transcripts beside the stream logs. Every friction row carries both the package field names (`kind`, `detail`, `agent`) and the workspace names (`category`, `evidence`, `source`); readers accept either and keep unknown fields.
+- Friction sensor redaction, repetition and notes (#313, contract 07). `redact_detail` masks credentials, `NAME_TOKEN=value` assignments and URL userinfo in every detail and window signature; Bash commands repeated across sessions over a rolling 7 days emit a `(cross-session)` `repeat` row at each multiple of 5; `bin/friction-sensor.py --note TEXT [--tag TAG]` hand-logs a `note` row.
+- `lib/cron_drift.py` (#314, contract 07): crontab coverage, paused-job and drift checks for installs that keep cron instead of `bin/scheduler.py`. `heartbeat_jobs_in_text`, `paused_and_live_names`, `paused_jobs`, `unmonitored`, `read_crontab` (local or over ssh; `None` when unreadable) and `drift`.
+- Gateway outage alert. The relay posts off Discord when the gateway stays down past `OUTAGE_ALERT_AFTER_S` (default 300 s) or when the outbox dead-letter count rises, one message per outage plus one line on recovery, to `OUTAGE_ALERT_WEBHOOK_URL` (text POST; unset means log only). `lib/gateway_watch.py` holds the logic; `bin/relay.py` feeds it gateway events.
+- Native mode, part 3 (#303). `install.sh --native` and `./setup.sh --native` install without Docker: `bin/native-install.sh` creates `.venv`, builds the dashboard, runs `bin/native-bootstrap.sh` (the setup the container entrypoint does) and starts the `systemd --user` units. `make upgrade-native` (`bin/native-upgrade.sh`) fast-forwards or checks out `KARAKOS_REF`, refreshes the venv and dashboard and restarts the units. The Docker path is unchanged.
+- Native-mode install root (#303, part 1). One resolver decides where the install lives: `lib/paths.py` (`workspace_root()`) for Python and `bin/lib/paths.sh` for shell. Order: `KARAKOS_HOME`, then `WORKSPACE_ROOT`, then the checkout the file sits in, so nothing defaults to `/workspace` any more. The container is unchanged: it sets `WORKSPACE_ROOT`, and the scripts sit at `/workspace`. Safety hooks under `system/` stay import-free and read `WORKSPACE_ROOT` only (the native units set both). A test fails on any new hardcoded `/workspace` default or inline root lookup.
+- Native mode, part 2 (#303). `lib/native_units.py` generates `systemd --user` units for agent-server, relay, dashboard and scheduler from one template, with the restart policy and stop timeouts of `config/supervisord.conf` (a test keeps them in step), plus a `karakos.target` to start them together.
+- `discord.role_id_env` may name an env var that holds several role ids, comma-separated, so one agent can answer to more than one Discord role. A single id and an unset variable behave as before. A non-numeric part is skipped with a warning. A role id belongs to one agent: if two agents list the same role, the first one loaded keeps it and the relay logs a warning (a message to a shared role is not fanned out to both). New `routing.parse_role_ids`.
+- Messages are identified by Discord user id, with the display name as a label. Each sender in a turn reads `Name (id 123…)` in the batch lines, the `[context]` lines and the reply context; routing and trust already went by id. A new `people` table in the agent-server database learns each display name per id and server (first and last seen), so a nickname that differs between servers is kept apart. A name new to an id is shown with the one it replaces: `Name (id 123…) (previously Old)`. A display name cannot fake an id: parentheses in names become brackets. Local and hive callers (id `0`) are unchanged. New `lib/identity.py`.
+- Agent process health (karakos-128). `/health` and `/agents` report each shard's `pid`, `uptime_seconds` and `last_turn_at`, and `/health` reads `degraded` when a shard's process is dead. The dashboard shows the new fields.
+- Message Content intent check (karakos-130). The relay logs one loud error per process when a message that mentions someone else arrives with empty text, the sign that the Discord Message Content intent is off. `docs/` explains how to tell and how to turn it on.
+- Startup dirty-tree report (karakos-132). When the workspace is a git repo with uncommitted files, the agent server logs a WARNING at startup naming up to 20 of them, and says a crash is likely when `crash_recovery` found stuck messages. Skipped silently without a `.git` directory; never blocks startup. New `lib/workspace_dirty.py`. `crash_recovery()` now returns the stuck-message count.
+- `send.unlimited_channels` (agents.yaml): channels from `send.channels` that skip the per-agent send rate limit. Empty by default; an id not also in `send.channels` fails at config load; exempt sends still log an audit line, marked `exempt=1`.
+
+### Changed
+
+- The reply gate is now on by default for channels served by two or more agents
+  (or with `guest_agents`), and a leading name engages an agent only when it is
+  a vocative (`amos, ...`, `hey amos!`, or the name alone), not "amos's reply
+  is slow" (#131). `"reply_gate": false` opts a channel out;
+  `KARAKOS_REPLY_GATE_DEFAULT=off` restores opt-in for the relay.
+  Upgrade: channels served by two or more agents (or with `guest_agents`) now run the reply gate with no config change. Messages that previously reached the channel's agent unaddressed now need an @mention, a reply to the agent, or a leading name. To keep the old behavior set `"reply_gate": false` on that channel, or set `KARAKOS_REPLY_GATE_DEFAULT=off` for the relay. Single-agent channels are unaffected.
+
+### Fixed
+
+- Resume crash-loop (karakos-127). After three fast deaths of a resumed spawn the agent server drops the stored session id and cold-starts the shard instead of crash-looping on a refused session. The streak resets on a slow death, a non-resume spawn, or clear_session.
+
 ## [2.4.0] - 2026-10-23
 
 ### Fixed
@@ -289,7 +321,8 @@ Initial release: an installable multi-agent household system — Discord
 integration, local dashboard, episodic memory, session persistence, cost
 tracking, and builder/reviewer agents behind guardrails.
 
-[Unreleased]: https://github.com/mcarmody/karakos-package/compare/v2.4.0...develop
+[Unreleased]: https://github.com/mcarmody/karakos-package/compare/v2.5.0...develop
+[2.5.0]: https://github.com/mcarmody/karakos-package/compare/v2.4.0...v2.5.0
 [2.4.0]: https://github.com/mcarmody/karakos-package/compare/v2.3.1...v2.4.0
 [2.3.1]: https://github.com/mcarmody/karakos-package/compare/v2.3.0...v2.3.1
 [2.3.0]: https://github.com/mcarmody/karakos-package/compare/v2.2.0...v2.3.0

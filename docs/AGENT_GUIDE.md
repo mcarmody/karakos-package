@@ -67,7 +67,9 @@ curl -fsS -o /dev/null -w '%{http_code}\n' "http://localhost:$DASHBOARD_PORT/log
 docker compose -f config/docker-compose.yml --env-file config/.env exec karakos cat data/.schema-version
 ```
 
-Healthy means: `/health` reports `"status": "healthy"` with `outbox.pending` 0;
+Healthy means: `/health` reports `"status": "healthy"` with `outbox.pending` 0
+(`"degraded"` means a shard's process is dead and no pause explains it; each shard
+row has `pid`, `uptime_seconds` and `last_turn_at`);
 `/agents` lists the primary and monitor agents with `alive: true`; the login page
 answers `200`; the stamp names schema 2. Then say hello in the general channel (the
 primary should answer within a minute) or use the dashboard's `/chat`. The same
@@ -101,6 +103,10 @@ destroying data (`down -v`, `reset`) is not: ask first. Run the API calls with
 | Scheduler not firing | `data/health/scheduler.json` (fresh within a minute or two); `logs/scheduler.log`; `data/health/heartbeats/`; `logs/health-alerts.log`; *in container* `ls data/oneshot-spool/` | The scheduler is a supervised process that restarts itself; if the beacon is stale after that, restart the container. There is no host-side watchdog for it (a known gap in [ARCHITECTURE.md](ARCHITECTURE.md#known-gaps)). Times are in the container `TZ` (default UTC). Heartbeats and other machine-started work yield above the thresholds in `config/governor.yaml`. Task cadence: [ARCHITECTURE.md](ARCHITECTURE.md#scheduler-binschedulerpy). Run a task by hand to see whether it works, e.g. `bin/heartbeat.sh <agent-id>` (queues a heartbeat message to that agent). |
 | Memory recall empty | *in container* `python3 -m lib.graph status`; `GET /graph/status`; `config/recall-source` and `KARAKOS_RECALL_SOURCE`; `python3 bin/graph-consolidate.py --dry-run` | Check the graph exists and has observations. A `config/recall-source` file or `KARAKOS_RECALL_SOURCE` **replaces** the graph as the source, so a stale one yields nothing: remove it. No embeddings or no `fastembed` degrades to keyword recall (`mode: "keyword"`), which is thinner, not empty. Automated prompts (heartbeats, pokes) skip the per-prompt injection by design. After a 1.x upgrade, confirm the memory step ran (`data/migration-reports/migration-report.md`). Details: [ARCHITECTURE.md](ARCHITECTURE.md#memory). |
 | `karakos migrate` failed | The output (it prints the backup path and the restore command); `data/migration-reports/migration-report.md`; the container exits 78 until the stamp exists | A failed step leaves the stamp absent. Fix the cause and run `bin/karakos migrate` again: it restores the backup first (if under 24 hours old), then migrates from the original. To go back: `bin/karakos migrate --restore backups/<dir>`. Rehearse with `bin/karakos migrate --dry-run`. `KARAKOS_VERSION` picks the image the migrator runs. `logs/` and `inbox/` are not in the backup. Full procedure: [UPGRADING.md](UPGRADING.md#the-real-run). |
+
+Read the error before you restart. A restart rotates the log that holds the cause.
+After a crash, the agent server logs any uncommitted workspace files at startup.
+A half-written file from the crash can make the next error look unrelated.
 
 If none of these fit, read `make logs`, then `logs/agent-server.log`, and write
 down what you saw before changing anything. If the cause is a platform bug,

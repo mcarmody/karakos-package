@@ -13,6 +13,9 @@ import errno
 import json
 import logging
 import os
+import sys as _sys
+_sys.path.insert(0, os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../lib")))
+from paths import workspace_root  # noqa: E402
 import re
 import signal
 import subprocess
@@ -21,7 +24,7 @@ import time
 import uuid
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List, Any, Tuple
 from logging.handlers import RotatingFileHandler
 
 import aiohttp
@@ -38,6 +41,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import ask_handler  # noqa: E402
 import cross_send  # noqa: E402
+import identity  # noqa: E402
 import discord_ux  # noqa: E402
 import hive as hive_lib  # noqa: E402
 import msgqueue  # noqa: E402
@@ -62,7 +66,7 @@ from lib.migrate.guard import require_stamp  # noqa: E402
 # Configuration
 # =============================================================================
 
-WORKSPACE_ROOT = Path(os.environ.get("WORKSPACE_ROOT", "/workspace"))
+WORKSPACE_ROOT = Path(workspace_root())
 PORT = int(os.environ.get("AGENT_SERVER_PORT", "18791"))
 DB_PATH = WORKSPACE_ROOT / "data" / "memory" / "agent-server.db"
 AGENTS_CONFIG_PATH = WORKSPACE_ROOT / "config" / "agents.yaml"
@@ -210,6 +214,10 @@ agent_states: Dict[str, str] = {}
 response_buffers: Dict[str, str] = {}
 agent_last_cost: Dict[str, float] = {}
 agent_sessions: Dict[str, str] = {}
+# Wall-clock spawn time of each shard's current subprocess, and the last turn
+# that ended without is_error. In memory only; read by /health and /agents.
+agent_spawn_ts: Dict[str, float] = {}
+agent_last_turn_ts: Dict[str, float] = {}
 stderr_reader_tasks: Dict[str, asyncio.Task] = {}
 # One task per agent awaiting its subprocess's exit (#90). Fires a respawn and
 # a channel notice when the process dies on its own.
@@ -219,6 +227,13 @@ respawn_watcher_tasks: Dict[str, asyncio.Task] = {}
 respawn_history: Dict[str, List[float]] = {}
 RESPAWN_WINDOW_SECONDS = 300
 RESPAWN_MAX_IN_WINDOW = 3
+# A resumed spawn that dies this fast, this many times in a row, means the CLI
+# refuses its session id: start a fresh session instead of crash-looping on it.
+RESUME_FAIL_GIVEUP = 3
+RESUME_FAST_DEATH_SECONDS = 120.0
+# shard -> (session_id, time.monotonic() at spawn) for a spawn that used --resume.
+resume_spawn_info: Dict[str, Tuple[str, float]] = {}
+resume_fail_streak: Dict[str, int] = {}
 # Agents whose subprocess is being ended on purpose — restart, reload,
 # interrupt, shutdown, or POST /kill. Lets the respawn watcher tell an
 # intentional kill from a crash. Set by kill_agent_subprocess before it
@@ -287,6 +302,8 @@ async def init_db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     db = await aiosqlite.connect(str(DB_PATH))
     db.row_factory = aiosqlite.Row
+
+    await db.execute(identity.PEOPLE_SCHEMA)  # who an id goes by (lib/identity.py)
 
     # Message queue table
     await db.execute("""
@@ -622,6 +639,8 @@ async def clear_session(agent: str):
     )
     await db.commit()
     agent_last_cost.pop(agent, None)
+    resume_fail_streak.pop(agent, None)
+    resume_spawn_info.pop(agent, None)
     log.info(f"Cleared session for {agent}, new ID: {session_id}")
 
 async def update_session_tokens(agent: str, input_tokens: int):
@@ -956,6 +975,11 @@ async def start_agent_subprocess(shard: str):
         agent_processes[shard] = proc
         agent_states[shard] = "IDLE"
         agent_sessions[shard] = session_id
+        agent_spawn_ts[shard] = time.time()
+        if resume_session:
+            resume_spawn_info[shard] = (session_id, time.monotonic())
+        else:
+            resume_spawn_info.pop(shard, None)
         # A live process is by definition no longer deliberately dead. Clearing
         # here rather than in the kill paths keeps the flag correct for the one
         # kill that is *not* followed by a spawn — POST /kill, which is meant
@@ -1143,6 +1167,24 @@ async def respawn_watcher(shard: str, proc: asyncio.subprocess.Process):
         except Exception as e:
             log.warning(f"hive crash mark for {shard} failed: {e}")
 
+        # Resume fallback. A resumed spawn that dies fast, repeatedly, is being
+        # refused its session id; after RESUME_FAIL_GIVEUP of those in a row,
+        # pin a fresh session rather than respawn into the same refusal. The
+        # crashloop brake below still bounds everything else.
+        info = resume_spawn_info.pop(shard, None)
+        if info and (time.monotonic() - info[1]) < RESUME_FAST_DEATH_SECONDS:
+            resume_fail_streak[shard] = resume_fail_streak.get(shard, 0) + 1
+        else:
+            resume_fail_streak.pop(shard, None)
+        if resume_fail_streak.get(shard, 0) >= RESUME_FAIL_GIVEUP:
+            stale_sid = info[0] if info else "unknown"
+            log.error(
+                f"resume of {stale_sid} refused {RESUME_FAIL_GIVEUP}x - starting a fresh session; "
+                f"prior transcript retained at ~/.claude/projects/*/{stale_sid}.jsonl")
+            await clear_session(shard)
+            resume_fail_streak.pop(shard, None)
+            respawn_history[shard] = []
+
         # Crashloop brake. A subprocess that dies immediately on spawn — bad
         # model name, missing MCP binary, unreadable settings file — would
         # otherwise respawn and announce itself forever, turning one broken
@@ -1253,6 +1295,8 @@ async def flush_agent_queue(shard: str) -> int:
 
 async def post_cost_update(agent: str, metadata: Dict):
     """Post cost update to Discord and database"""
+    if not metadata.get("is_error"):
+        agent_last_turn_ts[agent] = time.time()
     session_total = metadata.get("total_cost_usd", 0.0)
     input_tokens = metadata.get("input_tokens", 0)
     output_tokens = metadata.get("output_tokens", 0)
@@ -2805,7 +2849,7 @@ async def crash_recovery():
             channel_id = msg["channel_id"]
             agent = msg["agent"]
             if channel_id != "0":
-                crash_msg = f"⚠️ {agent} crashed while processing message from {msg['author']}"
+                crash_msg = f"⚠️ {agent} crashed while processing message from {identity.display_name(msg['author'])}"
                 await post_to_discord(agent, channel_id, crash_msg)
 
         await db.commit()
@@ -2891,6 +2935,8 @@ async def crash_recovery():
                 )
                 await db.commit()
 
+    return len(stuck_messages)
+
 # =============================================================================
 # HTTP API
 # =============================================================================
@@ -2965,6 +3011,12 @@ async def handle_message(request):
         row = await cursor.fetchone()
         if row["count"] >= QUEUE_DEPTH_LIMIT:
             return web.json_response({"error": "Queue full"}, status=503)
+
+    # Identity is the Discord id; the name is a label (people table, lib/identity.py).
+    if not is_bot:
+        _old_name = await identity.record_person(db, author_id, data.get("guild_id"), author)
+        if _old_name:
+            author = identity.compose_author(author, _old_name)
 
     # Insert message
     try:
@@ -3058,7 +3110,7 @@ async def handle_message_edit(request):
 
     if decision.action in ("followup", "update_followup"):
         text = discord_ux.edit_followup_text(
-            row["author"], row["content"], content, decision.phase)
+            identity.display_name(row["author"]), row["content"], content, decision.phase)
         if decision.action == "update_followup":
             cur = await db.execute(
                 "UPDATE message_queue SET content = ? WHERE message_id = ? AND processed = 0",
@@ -3166,6 +3218,19 @@ async def handle_outbox_discard(request):
     return await _outbox_verb(request, outbox_lib.discard)
 
 
+def _process_view(shard):
+    """pid, uptime and last good turn for a shard's subprocess. pid and uptime
+    are null when the shard has no live process."""
+    proc = agent_processes.get(shard)
+    alive = proc is not None and proc.returncode is None
+    started = agent_spawn_ts.get(shard)
+    return {
+        "pid": proc.pid if alive else None,
+        "uptime_seconds": int(time.time() - started) if alive and started else None,
+        "last_turn_at": agent_last_turn_ts.get(shard),
+    }
+
+
 async def handle_health(request):
     """GET /health - Health check.
 
@@ -3197,6 +3262,7 @@ async def handle_health(request):
             # 0 = unknown.
             "context_tokens": ctx_by_shard.get(sp.id, 0),
             "stolen_total": STATE.stolen_total.get(sp.id, 0),
+            **_process_view(sp.id),
         }
 
     for agent in dict.fromkeys(sp.agent for sp in specs):
@@ -3217,7 +3283,11 @@ async def handle_health(request):
     undelivered = dead_letter_count()
 
     return web.json_response({
-        "status": "healthy",
+        # degraded: a shard's process is dead and no operator pause or usage
+        # gate explains it.
+        "status": ("degraded" if any(not shard_status[sp.id]["alive"]
+                                     and not _paused_entry(sp.id) for sp in specs)
+                   else "healthy"),
         # Both of these are read by the dashboard home page's summary cards,
         # which showed a hardcoded 0 for as long as nothing served them.
         # queue_depth is the sum of what the loop above already counted.
@@ -3273,7 +3343,7 @@ async def handle_agents(request):
                 "is_default": sp.is_default,
                 "state": agent_states.get(sp.id, "UNKNOWN"),
                 "alive": proc is not None and proc.returncode is None,
-                "pid": proc.pid if proc is not None else None,
+                **_process_view(sp.id),
                 "session_id": agent_sessions.get(sp.id, "")[:8],
                 "queue_depth": depth_by_shard.get(sp.id, 0),
                 "context_tokens": ctx_by_shard.get(sp.id, 0),
@@ -3743,7 +3813,7 @@ async def handle_agent_queue(request):
             "id": row["id"],
             "agent": row["agent"],
             "channel": row["channel"],
-            "author": row["author"],
+            "author": identity.display_name(row["author"]),
             "content": content[:QUEUE_PREVIEW_CHARS],
             "content_full_length": len(content),
             "created_at": row["created_at"],
@@ -4281,7 +4351,9 @@ async def handle_send(request):
     if not shard:
         return web.json_response({"error": "unknown agent"}, status=400)
     agent = spec_of(shard).agent
-    allowed, per_hour = cross_send.parse_config((agent_config.get(agent) or {}).get("send"))
+    send_cfg = (agent_config.get(agent) or {}).get("send")
+    allowed, per_hour = cross_send.parse_config(send_cfg)
+    unlimited = cross_send.parse_unlimited(send_cfg, allowed)
     names = {str(c.get("id")): n for n, c in (channels_config.get("channels") or {}).items()
              if isinstance(c, dict)}
     if data.get("action") == "channels":
@@ -4301,7 +4373,9 @@ async def handle_send(request):
     conn = _outbox_store()
     if conn is None:
         return web.json_response({"error": "outbox unavailable"}, status=503)
-    allowed_now, wait = _send_limiter.allow(agent, per_hour, time.monotonic())
+    exempt = channel_id in unlimited
+    allowed_now, wait = (True, 0.0) if exempt else _send_limiter.allow(
+        agent, per_hour, time.monotonic())
     if not allowed_now:
         return web.json_response(
             {"error": f"rate limit: {per_hour} sends per hour; next slot in {int(wait) + 1} s"},
@@ -4311,7 +4385,7 @@ async def handle_send(request):
         content_sha=outbox_lib.content_sha(text),
         allowed_mentions=cross_send.NO_MENTIONS)
     _outbox_notify()
-    log.info(cross_send.audit_line(shard, channel_id, len(text), rid))
+    log.info(cross_send.audit_line(shard, channel_id, len(text), rid, exempt))
     return web.json_response({"queued": True, "outbox_id": rid, "channel_id": channel_id}, status=202)
 
 
@@ -5195,7 +5269,14 @@ async def startup(app):
     _outbox_task = asyncio.create_task(outbox_loop())
 
     # Crash recovery
-    await crash_recovery()
+    stuck = await crash_recovery()
+    try:
+        import workspace_dirty
+        msg = workspace_dirty.describe(workspace_dirty.dirty_files(WORKSPACE_ROOT), bool(stuck))
+        if msg:
+            log.warning(msg)
+    except Exception as e:
+        log.debug(f"dirty-tree check skipped: {e}")
     await hive_startup_sweep()
 
     # Start shard subprocesses, one at a time in plan order.

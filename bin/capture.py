@@ -14,11 +14,15 @@ Usage:
 import argparse
 import json
 import os
+import sys as _sys
+_sys.path.insert(0, os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../lib")))
+from paths import workspace_root  # noqa: E402
+from identity import display_name  # noqa: E402
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-WORKSPACE = Path(os.environ.get("WORKSPACE_ROOT", "/workspace"))
+WORKSPACE = Path(workspace_root())
 MESSAGES_DIR = WORKSPACE / "data" / "messages"
 # Must match bin/agent-server.py:DB_PATH — that server is the only writer of
 # message_queue, and --backfill is a reader of it. tests/test_capture.py
@@ -86,7 +90,7 @@ def backfill(date_str: str) -> None:
                 "ts": row["created_at"],
                 "channel_name": row["channel"],
                 "channel_id": row["channel_id"],
-                "author_name": row["author"],
+                "author_name": display_name(row["author"]),
                 "author_id": row["author_id"],
                 "is_bot": bool(row["is_bot"]),
                 "content": row["content"],

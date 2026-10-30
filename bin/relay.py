@@ -14,6 +14,9 @@ import hashlib
 import json
 import logging
 import os
+import sys as _sys
+_sys.path.insert(0, os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../lib")))
+from paths import workspace_root  # noqa: E402
 import re
 import subprocess
 import sys
@@ -36,9 +39,11 @@ import build_dispatcher  # noqa: E402
 import build_hosts  # noqa: E402
 import channel_context  # noqa: E402
 import discord_ux  # noqa: E402
+import gateway_watch  # noqa: E402
 import registry as agent_registry  # noqa: E402
 import reply_classifier  # noqa: E402
 import reply_gate_config  # noqa: E402
+import identity  # noqa: E402
 import routing  # noqa: E402
 import tengwar  # noqa: E402
 
@@ -208,7 +213,7 @@ def format_reply_context(target, max_chars: int = REPLY_CONTEXT_MAX_CHARS) -> st
         text = ("[attachments: " + ", ".join(a.filename for a in atts) + "]") if atts else "[no text content]"
     if len(text) > max_chars:
         text = text[:max_chars].rstrip() + "… [truncated]"
-    return f"[In reply to {name}:\n{text}\n]"
+    return f"[In reply to {identity.label(name, getattr(author, 'id', None))}:\n{text}\n]"
 
 
 def parse_sys_command(content: str):
@@ -288,11 +293,13 @@ _NAME_OPENER_CACHE: Dict[str, "re.Pattern"] = {}
 
 
 def _name_opener(agent_name: str):
-    """`Amos, can you...` — a message that opens with the agent's name."""
+    """`Amos, can you...` — a message that opens by addressing the agent: the
+    name (optionally after hey/ok/okay) followed by `,` `:` `!` `?` or `-`, or
+    the name as the whole message. "amos's reply is slow" does not match."""
     key = (agent_name or "").lower()
     if key not in _NAME_OPENER_CACHE:
         _NAME_OPENER_CACHE[key] = re.compile(
-            r"^\s*(hey\s+|ok(?:ay)?\s+)?" + re.escape(key) + r"\b[\s,:!?]*", re.I
+            r"^\s*(hey\s+|ok(?:ay)?\s+)?" + re.escape(key) + r"(?:\s*[,:!?\-]|\s*$)", re.I
         )
     return _NAME_OPENER_CACHE[key]
 
@@ -300,16 +307,18 @@ def _name_opener(agent_name: str):
 class ReplyGate:
     """Decide whether a message in a shared human channel is addressed to us.
 
-    Only channels configured with `"reply_gate": true` are gated; everywhere
-    else behaviour is unchanged, so an install that never opts in sees exactly
-    what it saw before.
+    A channel is gated when `reply_gate` is set (true or an object), and by
+    default when the key is absent and the channel has two or more agents
+    (`"reply_gate": false` opts out; env KARAKOS_REPLY_GATE_DEFAULT=off turns
+    the default off). Single-agent channels are unchanged. See
+    lib/reply_gate_config.py `effective`.
 
     Two tiers, silence-biased:
 
       Tier 1, deterministic and always wins:
           @mention of one of our agents ....... ENGAGE
           reply to one of our agents' messages  ENGAGE
-          message opens with an agent's name .. ENGAGE
+          message addresses an agent by name .. ENGAGE (vocative only)
           reply to a different human .......... SILENT
 
       Volley: humans trading messages quickly are talking to each other, so
@@ -481,6 +490,11 @@ class ReplyGate:
 # human speaks in the channel again.
 GUEST_TURN_LIMIT = int(os.environ.get("GUEST_TURN_LIMIT", "12"))
 
+INTENT_ERROR = (
+    "Discord Message Content intent is OFF for this bot: messages arrive with empty text. "
+    "Enable it in the Discord Developer Portal: Bot -> Privileged Gateway Intents -> "
+    "Message Content Intent, save, then run 'make down && make up'.")
+
 
 class GuestBudget:
     """Bot-to-bot turns per channel since the last human message."""
@@ -517,7 +531,7 @@ class GuestBudget:
 # Configuration
 # =============================================================================
 
-WORKSPACE_ROOT = Path(os.environ.get("WORKSPACE_ROOT", "/workspace"))
+WORKSPACE_ROOT = Path(workspace_root())
 AGENTS_CONFIG_PATH = WORKSPACE_ROOT / "config" / "agents.yaml"
 CHANNELS_CONFIG_PATH = WORKSPACE_ROOT / "config" / "channels.json"
 MESSAGES_DIR = WORKSPACE_ROOT / "data" / "messages"
@@ -529,6 +543,15 @@ ATTACHMENTS_DIR = WORKSPACE_ROOT / "data" / "attachments"
 DEFERRED_MESSAGES_DIR = WORKSPACE_ROOT / "data" / "deferred-messages"
 HEALTH_FILE = WORKSPACE_ROOT / "data" / "health" / "relay.json"
 HEALTH_INTERVAL_S = 60
+
+# Off-Discord alert when the gateway stays down or posts keep dying (lib/gateway_watch.py).
+# OUTAGE_ALERT_WEBHOOK_URL is where it goes (a text POST: ntfy, Gotify, Slack-style);
+# unset means the relay only logs the message. OUTAGE_ALERT_AFTER_S is how long the
+# gateway may be down first.
+OUTAGE_ALERT_WEBHOOK_URL = os.environ.get("OUTAGE_ALERT_WEBHOOK_URL", "").strip()
+OUTAGE_ALERT_AFTER_S = float(os.environ.get("OUTAGE_ALERT_AFTER_S", str(gateway_watch.DEFAULT_THRESHOLD_S)))
+OUTAGE_CHECK_INTERVAL_S = 30
+OUTBOX_DB = WORKSPACE_ROOT / "data" / "outbox" / "outbox.db"
 
 # Attachments the relay will pull down before handing a message to an agent.
 # Discord's own ceiling is 25 MB on an unboosted server, so the default cap
@@ -637,14 +660,32 @@ def load_config():
                 discord_id_to_agent[int(bot_id)] = agent_name
         role_id_env = config.get("discord_role_id_env")
         if role_id_env:
-            role_id = os.environ.get(role_id_env)
-            if role_id:
-                discord_role_id_to_agent[int(role_id)] = agent_name
+            for role_id in routing.parse_role_ids(
+                    os.environ.get(role_id_env),
+                    on_invalid=lambda bad, _a=agent_name, _e=role_id_env: log.warning(
+                        "agent %s: %s holds a non-numeric role id %r; ignored", _a, _e, bad)):
+                owner = discord_role_id_to_agent.get(role_id)
+                if owner and owner != agent_name:
+                    # One role wakes one agent. The first agent loaded keeps it.
+                    log.warning("role %s is set for both %s and %s; only %s will wake on it",
+                                role_id, owner, agent_name, owner)
+                    continue
+                discord_role_id_to_agent[role_id] = agent_name
 
     for name, cfg in (channels_config.get("channels") or {}).items():
         if isinstance(cfg, dict) and cfg.get("mention_only") is True and cfg.get("reply_gate"):
             log.error(f"channel '{name}' sets both mention_only and reply_gate; "
                       f"treating it as mention_only (reply_gate ignored)")
+
+    if os.environ.get(reply_gate_config.DEFAULT_ENV, "").strip().lower() != "off":
+        default_gated = [
+            name for name, cfg in (channels_config.get("channels") or {}).items()
+            if isinstance(cfg, dict) and "reply_gate" not in cfg
+            and cfg.get("mention_only") is not True
+            and channel_agent_count(name, cfg) >= 2
+        ]
+        if default_gated:
+            log.info("reply gate on by default for channels: %s", ", ".join(default_gated))
 
     unlisted = channels_config.get("unlisted_channels")
     if unlisted is not None and unlisted not in ("ignore", "mention_only"):
@@ -729,6 +770,18 @@ def default_agent_for(channel_name) -> Optional[str]:
         return None
     shard = registry_obj.shard_for_channel(channel_name)
     return shard.agent if shard else None
+
+
+def channel_agent_count(channel_name, channel_config) -> int:
+    """Distinct agents serving a channel: registry shards listing it, plus one
+    when the channel allows guest agents."""
+    if not channel_name or registry_obj is None:
+        return 0
+    agents = {s.agent for s in registry_obj.shards() if channel_name in s.channels}
+    count = len(agents)
+    if isinstance(channel_config, dict) and channel_config.get("guest_agents") is True:
+        count += 1
+    return count
 
 
 def unlisted_mentions_enabled() -> bool:
@@ -859,6 +912,8 @@ def _own_bot_ids(agent, user=None) -> set:
 class DiscordAdapter(discord.Client):
     """Discord message routing to agent server"""
 
+    _intent_warned = False  # class level: adapters built without __init__ still work
+
     def __init__(self, *args, **kwargs):
         intents = discord.Intents.default()
         intents.message_content = True
@@ -874,12 +929,18 @@ class DiscordAdapter(discord.Client):
         self.presence = PresenceTracker()
         self._presence_task = None
         self._health_task = None
+        self._outage_task = None
+        self.gateway_watch = gateway_watch.GatewayWatch(
+            os.environ.get("SYSTEM_NAME", "Karakos"), OUTAGE_ALERT_AFTER_S, now=time.time())
 
     async def setup_hook(self):
         """Initialize HTTP session"""
         import aiohttp
         self.http_session = aiohttp.ClientSession()
         self.server_ids = load_server_ids(channels_config)
+        # Started here, not in on_ready: a relay that never logs in is the case to report.
+        if self._outage_task is None or self._outage_task.done():
+            self._outage_task = asyncio.create_task(self.outage_loop())
         log.info(
             "Discord adapter initialized (servers: %s)",
             ", ".join(sorted(self.server_ids)) or "none configured",
@@ -892,14 +953,48 @@ class DiscordAdapter(discord.Client):
         if self._health_task is None or self._health_task.done():
             self._health_task = asyncio.create_task(self.health_loop())
         self.start_presence_loop()
+        self.gateway_watch.up(time.time())
 
     async def on_resumed(self):
         """Gateway session resumed — presence may not have survived."""
         self.presence.reset()
+        self.gateway_watch.up(time.time())
 
     async def on_connect(self):
         """New gateway connection — Discord holds no presence for it yet."""
         self.presence.reset()
+        self.gateway_watch.up(time.time())
+
+    async def on_disconnect(self):
+        """Gateway connection lost; the outage watch starts its clock."""
+        self.gateway_watch.down(time.time())
+
+    def outage_send(self, text: str) -> bool:
+        """Deliver an outage message off Discord. No webhook: log it and call it sent."""
+        if not OUTAGE_ALERT_WEBHOOK_URL:
+            log.warning("outage alert (no OUTAGE_ALERT_WEBHOOK_URL set): %s", text)
+            return True
+        ok = gateway_watch.post_webhook(OUTAGE_ALERT_WEBHOOK_URL, text,
+                                        title=f"{self.gateway_watch.name} relay")
+        if not ok:
+            log.warning("outage alert not delivered, will retry: %s", text)
+        return ok
+
+    async def outage_tick(self):
+        """One watch pass; the webhook post runs in a thread so it never stalls the loop."""
+        dead = gateway_watch.dead_letter_count(OUTBOX_DB)
+        watch = self.gateway_watch
+        for alert in watch.tick(time.time(), dead):
+            if await asyncio.to_thread(self.outage_send, alert.text):
+                watch.delivered(alert)
+
+    async def outage_loop(self):
+        while True:
+            try:
+                await self.outage_tick()
+            except Exception as e:
+                log.warning("outage watch error: %s", e)
+            await asyncio.sleep(OUTAGE_CHECK_INTERVAL_S)
 
     def start_presence_loop(self):
         if not PRESENCE_ENABLED:
@@ -954,12 +1049,18 @@ class DiscordAdapter(discord.Client):
                                       message.content, author_id=message.author.id)
             self.reply_gate.note_agent_post(message.channel.id)
             own_name, _ = self.resolve_channel(message.channel)
-            if own_name and ((channels_config.get("channels", {}).get(own_name) or {})
-                             .get("reply_gate")):
+            own_cfg = (channels_config.get("channels", {}).get(own_name) or {}) if own_name else {}
+            if own_name and reply_gate_config.effective(
+                    own_cfg.get("reply_gate"), channel_agent_count(own_name, own_cfg)).enabled:
                 self.reply_gate.note_message(
                     message.channel.id, message.author.display_name,
                     message.content, is_agent=True)
             return
+
+        if (not self._intent_warned and not message.content and message.mentions
+                and not getattr(message, "attachments", None) and not getattr(message, "embeds", None)):
+            self._intent_warned = True
+            log.error(INTENT_ERROR)
 
         # Ignore messages from servers we aren't configured for
         if message.guild and str(message.guild.id) not in self.server_ids:
@@ -1031,9 +1132,10 @@ class DiscordAdapter(discord.Client):
             # A human spoke: the bot-to-bot budget refills.
             self.guest_budget.reset(message.channel.id)
 
-            raw_gate = channel_config.get("reply_gate")
-            if raw_gate and not mention_only:
-                gate_cfg = reply_gate_config.parse(raw_gate)
+            gate_cfg = reply_gate_config.effective(
+                channel_config.get("reply_gate"),
+                channel_agent_count(channel_name, channel_config))
+            if gate_cfg.enabled and not mention_only:
                 replied_to = None
                 ref = getattr(message, "reference", None)
                 resolved = getattr(ref, "resolved", None) if ref else None
@@ -2141,6 +2243,8 @@ class DiscordAdapter(discord.Client):
             self._health_task.cancel()
         if self._presence_task:
             self._presence_task.cancel()
+        if self._outage_task:
+            self._outage_task.cancel()
         if self.http_session:
             await self.http_session.close()
         await super().close()
@@ -2355,6 +2459,9 @@ async def main():
     try:
         # Run Discord bot (blocks until closed)
         await discord_client.start(token)
+    except discord.PrivilegedIntentsRequired:
+        log.error(INTENT_ERROR)
+        raise
     except KeyboardInterrupt:
         log.info("Shutdown signal received")
     finally:

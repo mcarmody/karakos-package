@@ -109,7 +109,7 @@ If you want each agent to post under its own identity:
    ```
 5. In `config/agents.yaml`, set each agent's `discord.token_env` and `discord.bot_id_env`
    (and `discord.role_id_env` if you want a Discord role to address the agent; see
-   `mention_only` below)
+   `mention_only` below). The variable it names may hold several role ids separated by commas
 
 Without multi-bot setup, all agents post through the primary bot.
 
@@ -130,12 +130,25 @@ also use to talk to other people. Two per-channel keys in
 }
 ```
 
-**`reply_gate`** — for channels shared with more than one human. The agent
-answers when it is @mentioned, when the message is a reply to something it
-said, or when the message opens with its name. It stays quiet otherwise,
+**`reply_gate`** — for channels shared with more than one human or agent. The
+agent answers when it is @mentioned, when the message is a reply to something
+it said, or when the message addresses it by name. It stays quiet otherwise,
 including when people are trading messages quickly. It is silence-biased on
 purpose: staying quiet costs you one word to recover from, and interrupting
-costs you the conversation. Omit the key and the channel behaves as before.
+costs you the conversation.
+
+*On by default.* A channel with no `reply_gate` key is gated when it has two or
+more agents (distinct agents whose shards list the channel, plus one if the
+channel sets `"guest_agents": true`). Set `"reply_gate": false` to opt a channel
+out, or `true` / an object to gate it regardless of agent count. Single-agent
+channels are not gated unless you ask. `"mention_only": true` wins over the gate.
+To restore opt-in behaviour for the whole relay, set
+`KARAKOS_REPLY_GATE_DEFAULT=off`.
+
+*A name is a hint, not a trigger.* A message engages the agent by name only when
+it is a vocative: the name (optionally after `hey`, `ok` or `okay`) followed by
+`,` `:` `!` `?` or `-`, or the name as the whole message. "amos, add milk" and
+"hey amos" engage; "amos's reply is slow" and "amos is investigating" do not.
 
 *Optional classifier tier (opt-in, silence on any doubt).* `"reply_gate": true`
 is heuristic only. Make it an object to let a small model (Haiku) decide the
@@ -179,7 +192,7 @@ only the message that woke it, so in a `mention_only` channel "take this feedbac
 has nothing to point at. With this key the relay prepends the messages that
 arrived in the channel since the agent last posted there (other agents' posts
 included, the triggering message excluded), oldest first, one line each:
-`[context] Author (HH:MM): text`, times in UTC. The default is 8, the range 0 to
+`[context] Author (id 123…) (HH:MM): text` (the Discord user id follows the name; the id is the identity, the name a label that can change, and the agent-server `people` table learns each name per id and server), times in UTC. The default is 8, the range 0 to
 20, and `0` delivers the bare message as before. Each message is cut to 300
 characters and the relay remembers the last 20 per channel, in memory only; when
 older messages were left out, the block ends its first line with a note telling
@@ -215,8 +228,10 @@ agents:
 ```
 
 and in `config/.env`, `DISCORD_ROLE_ID_MAIN=<role id>`. A mention of a mapped
-role routes to that agent the same way a mention of its bot does. A role mention
-with no mapped agent is ignored.
+role routes to that agent the same way a mention of its bot does. The variable
+may hold several role ids, separated by commas. A role mention with no mapped
+agent is ignored. One role wakes one agent: if two agents list the same role id,
+the first loaded keeps it and the relay logs a warning.
 
 ```json
 "front-desk": { "id": "...", "default_agent": "main", "mention_only": true }
@@ -323,6 +338,8 @@ picker itself is unavailable.
 **Bot can't read messages:**
 - Ensure **Message Content Intent** is enabled in the developer portal
 - Check the bot has Read Messages permission in the channel
+- Test it with an @mention. A mention still reaches the bot without the intent. If the bot answers tags but ignores everything else, the intent is off. If it ignores tags too, the connection is dead or the code threw.
+- The intent must be on in two places: the portal toggle (Bot -> Privileged Gateway Intents -> Message Content Intent) and in code. The code part is already set in `bin/relay.py`.
 
 **"Missing Access" error:**
 - The bot isn't in the server or doesn't have channel permissions

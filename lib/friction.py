@@ -5,15 +5,25 @@ non-zero Bash exits, denied tools, rate-limit pressure and repeated Bash
 commands, and appends one line per event to data/friction-log.jsonl. Progress is
 kept in data/friction-sensor-state.json (byte offset per stream), so a rerun
 only reads new lines. Nothing here edits a prompt, persona or config.
+Transcripts named by KARAKOS_TRANSCRIPT_GLOBS are scanned beside the stream logs.
+Rows carry both the package and the workspace field names (contract 07).
+
+Repetition is counted two ways: REPEAT_AT (3) identical Bash commands in one
+stream emit a `repeat` row; REPEAT_AT_WINDOW (5) across all streams within
+WINDOW_DAYS (7) emit a `(cross-session)` `repeat` row, again at each further
+multiple of 5. A hand-written `note` row is added by `note()` (bin/friction-sensor.py --note).
 """
 from __future__ import annotations
 
+import glob
 import hashlib
 import json
 import os
+import re
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Optional
 
 from lib.redact import redact_text
 
@@ -21,23 +31,59 @@ LOG_NAME = "friction-log.jsonl"
 STATE_NAME = "friction-sensor-state.json"
 SUMMARY_REL = Path("friction") / "weekly.md"
 REPEAT_AT = 3            # same Bash command this many times in one stream
+WINDOW_DAYS = 7          # cross-session repetition window
+REPEAT_AT_WINDOW = 5     # same Bash command this many times across streams in the window
 RATE_HIGH = 0.9          # five-hour or weekly utilisation worth noting
 DETAIL_MAX = 200
+NOTE_MAX = 1000
+_SECRET_ASSIGN_RE = re.compile(r"\b(\w*(?:TOK|TOKEN|KEY|SECRET|PASS|PWD|CRED)\w*)=\S+", re.I)
+_URL_CRED_RE = re.compile(r"https?://[^/\s@]+@")
 PENDING_MAX = 200
 DENIED_MARKERS = ("Blocked:", "permission denied", "was denied", "not allowed", "requires approval")
+TRANSCRIPT_GLOBS_ENV = "KARAKOS_TRANSCRIPT_GLOBS"
+KIND_TO_CATEGORY = {"repeat": "repetition", "bash_exit": "command_error", "denied": "permission",
+                    "tool_error": "tool_error", "rate_limit": "rate_limit", "note": "note"}
+CATEGORY_TO_KIND = {v: k for k, v in KIND_TO_CATEGORY.items()}
+_AGENT_DIR_RE = re.compile(r"agents-([a-z0-9-]+)")
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _agent_of(path: Path) -> str:
+def transcript_files() -> list[Path]:
+    """*.jsonl files in the directories matched by KARAKOS_TRANSCRIPT_GLOBS (os.pathsep-separated)."""
+    found = set()
+    for pattern in os.environ.get(TRANSCRIPT_GLOBS_ENV, "").split(os.pathsep):
+        if not pattern.strip():
+            continue
+        for d in glob.glob(pattern.strip()):
+            if os.path.isdir(d):
+                found.update(Path(f).absolute() for f in glob.glob(os.path.join(d, "*.jsonl")))
+    return sorted(found)
+
+
+def _agent_of(path: Path, transcript: bool = False) -> str:
+    if transcript:
+        m = _AGENT_DIR_RE.search(str(path.parent))
+        return m.group(1) if m else path.parent.name
     return path.name.rsplit("_", 1)[0]
+
+
+def redact_detail(text: str) -> str:
+    """redact_text, then mask `NAME_TOKEN=value` assignments and URL userinfo."""
+    out = _SECRET_ASSIGN_RE.sub(r"\1=[redacted]", redact_text(text))
+    return _URL_CRED_RE.sub("https://[redacted]@", out)
 
 
 def _clip(text) -> str:
     one = " ".join(str(text or "").split())
-    return redact_text(one)[:DETAIL_MAX]
+    return redact_detail(one)[:DETAIL_MAX]
+
+
+def _window_sig(cmd: str) -> str:
+    """Readable, redacted, bounded form of a Bash command, used as the cross-session key."""
+    return redact_detail(" ".join(cmd.split()))[:DETAIL_MAX]
 
 
 def _result_text(block) -> str:
@@ -58,8 +104,28 @@ def _load(path: Path, default):
         return default
 
 
-def _scan_file(path: Path, st: dict) -> list:
-    """New friction events from `path`; updates `st` (offset, pending, counts, rl)."""
+def both_names(row: dict) -> dict:
+    """Fill the package and workspace field names from each other (contract 07). Never overwrites."""
+    if "category" not in row and "kind" in row:
+        row["category"] = KIND_TO_CATEGORY.get(row["kind"], row["kind"])
+    if "kind" not in row and "category" in row:
+        row["kind"] = CATEGORY_TO_KIND.get(row["category"], row["category"])
+    if "evidence" not in row and "detail" in row:
+        row["evidence"] = row["detail"]
+    if "detail" not in row and "evidence" in row:
+        row["detail"] = row["evidence"]
+    if "session" not in row and "agent" in row:
+        row["session"] = row["agent"]
+    if "agent" not in row and "session" in row:
+        row["agent"] = row["session"]
+    return row
+
+
+def _scan_file(path: Path, st: dict, transcript: bool = False, window: Optional[list] = None) -> list:
+    """New friction events from `path`; updates `st` (offset, pending, counts, rl).
+    Bash commands are also appended to `window` as [ts, signature] pairs."""
+    if window is None:
+        window = []
     try:
         size = path.stat().st_size
     except OSError:
@@ -73,17 +139,18 @@ def _scan_file(path: Path, st: dict) -> list:
     st["offset"] = st.get("offset", 0) + end
     pending = st.setdefault("pending", {})
     counts = st.setdefault("counts", {})
-    agent, events = _agent_of(path), []
+    agent, events = _agent_of(path, transcript), []
 
     def add(kind, tool, detail):
         events.append({"agent": agent, "stream": path.name, "kind": kind,
-                       "tool": tool, "detail": _clip(detail)})
+                       "tool": tool, "detail": _clip(detail), "ts": d_ts})
 
     for raw in data[:end].splitlines():
         try:
             d = json.loads(raw)
         except ValueError:
             continue
+        d_ts = d.get("timestamp") if isinstance(d.get("timestamp"), str) else None
         t = d.get("type")
         msg = d.get("message") if isinstance(d.get("message"), dict) else {}
         blocks = msg.get("content") if isinstance(msg.get("content"), list) else []
@@ -98,6 +165,7 @@ def _scan_file(path: Path, st: dict) -> list:
                         counts[s] = counts.get(s, 0) + 1
                         if counts[s] == REPEAT_AT:
                             add("repeat", "Bash", f"x{REPEAT_AT}: {cmd}")
+                        window.append([d_ts or _now(), _window_sig(cmd)])
         elif t == "user":
             for b in blocks:
                 if not (isinstance(b, dict) and b.get("type") == "tool_result"):
@@ -134,17 +202,33 @@ def scan(workspace) -> dict:
     state_path = ws / "data" / STATE_NAME
     state = _load(state_path, {})
     streams = state.setdefault("streams", {})
+    window = state.setdefault("cmd_window", [])
+    emitted = state.setdefault("emitted", {})
     out, scanned = [], 0
     for p in sorted((ws / "logs" / "agent-streams").glob("*.jsonl")):
         scanned += 1
-        out += _scan_file(p, streams.setdefault(p.name, {}))
+        out += _scan_file(p, streams.setdefault(p.name, {}), window=window)
+    for p in transcript_files():
+        scanned += 1
+        out += _scan_file(p, streams.setdefault(str(p), {}), transcript=True, window=window)
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=WINDOW_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    window[:] = [w for w in window if w[0] >= cutoff]
+    for sig, n in Counter(w[1] for w in window).items():
+        step = (n // REPEAT_AT_WINDOW) * REPEAT_AT_WINDOW
+        if step >= REPEAT_AT_WINDOW and step > emitted.get(sig, 0):
+            out.append({"agent": "(cross-session)", "stream": "", "kind": "repeat", "tool": "Bash",
+                        "detail": f"'{sig}' ran {n}x in {WINDOW_DAYS}d", "signature": sig, "count": n})
+            emitted[sig] = step
     stamp = _now()
     if out:
         log = ws / "data" / LOG_NAME
         log.parent.mkdir(parents=True, exist_ok=True)
         with open(log, "a") as fh:
             for e in out:
-                fh.write(json.dumps({"ts": stamp, **e}) + "\n")
+                ts = e.pop("ts", None) or stamp
+                if ts.endswith("+00:00"):
+                    ts = ts[:-len("+00:00")] + "Z"
+                fh.write(json.dumps(both_names({"ts": ts, **e})) + "\n")
     state_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = state_path.with_name(state_path.name + ".tmp")
     tmp.write_text(json.dumps(state))
@@ -152,7 +236,22 @@ def scan(workspace) -> dict:
     return {"scanned": scanned, "events": len(out)}
 
 
-def read_log(workspace, days=7) -> list:
+def note(workspace, text: str, tag: Optional[str] = None, agent: Optional[str] = None) -> dict:
+    """Hand-logged `note` row (kind note, category note) appended to the friction log."""
+    row = {"ts": _now(), "agent": agent or os.environ.get("KARAKOS_AGENT") or "(hand-logged)",
+           "kind": "note", "tool": "friction",
+           "detail": redact_detail(" ".join(text.split()))[:NOTE_MAX]}
+    if tag:
+        row["signature"] = tag
+    row = both_names(row)
+    log = Path(workspace) / "data" / LOG_NAME
+    log.parent.mkdir(parents=True, exist_ok=True)
+    with open(log, "a") as fh:
+        fh.write(json.dumps(row) + "\n")
+    return row
+
+
+def read_log(workspace, days=7, stats=None) -> list:
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
     rows = []
     try:
@@ -160,9 +259,13 @@ def read_log(workspace, days=7) -> list:
             try:
                 r = json.loads(line)
             except ValueError:
+                r = None
+            if not isinstance(r, dict):
+                if isinstance(stats, dict):
+                    stats["skipped"] = stats.get("skipped", 0) + 1
                 continue
             if r.get("ts", "") >= cutoff:
-                rows.append(r)
+                rows.append(both_names(r))
     except OSError:
         pass
     return rows

@@ -18,6 +18,9 @@ never mutates 1.x data.
 
 import json
 import os
+import sys as _sys
+_sys.path.insert(0, os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".")))
+from paths import workspace_root  # noqa: E402
 import re
 import sys
 from dataclasses import dataclass, field
@@ -58,7 +61,7 @@ _DEFAULTS = {
     "label": None,
     "work_stealing": {"enabled": False, "after_s": 5, "max_rows": 5},
     "steering": {"enabled": True, "coalesce_ms": 300, "max_lines_per_turn": 8},
-    "send": {"channels": [], "per_hour": 20},   # cross-channel send (#278): off until channels are listed
+    "send": {"channels": [], "per_hour": 20, "unlimited_channels": []},   # cross-channel send (#278): off until channels are listed
 }
 _KNOWN_KEYS = {"name", "role", "shards", "discord"} | set(_DEFAULTS)
 
@@ -188,7 +191,7 @@ def _check_type(aid, key, val, errors, warnings=None):
                         warnings.append(f"agent '{aid}': unknown key 'steering.{k}'")
     elif key == "send":
         if not isinstance(val, dict):
-            errors.append(f"{p} must be a mapping (channels, per_hour)")
+            errors.append(f"{p} must be a mapping (channels, per_hour, unlimited_channels)")
         else:
             for k, v in val.items():
                 if k == "channels":
@@ -202,6 +205,16 @@ def _check_type(aid, key, val, errors, warnings=None):
                 elif k == "per_hour":
                     if not (_is_int(v) and 1 <= v <= 200):
                         errors.append(f"{p}.per_hour must be an integer from 1 to 200")
+                elif k == "unlimited_channels":
+                    ids = [str(x).strip() for x in v] if isinstance(v, list) else None
+                    chans = val.get("channels")
+                    listed = ([str(x).strip() for x in chans]
+                              if isinstance(chans, list) else [])
+                    if ids is None or any(isinstance(x, bool) for x in v):
+                        errors.append(f"{p}.unlimited_channels must be a list of channel ids")
+                    elif any(i not in listed for i in ids):
+                        errors.append(f"{p}.unlimited_channels may only list ids that are "
+                                      f"also in {p}.channels")
                 elif warnings is not None:
                     warnings.append(f"agent '{aid}': unknown key 'send.{k}'")
     elif key in ("allowed_tools", "disallowed_tools") and not _is_str_list(val):
@@ -762,7 +775,7 @@ def _init_main(ws, args):
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
-    ws = os.environ.get("WORKSPACE_ROOT") or str(Path(__file__).resolve().parent.parent)
+    ws = workspace_root()
     if argv[:1] == ["--workspace"] and len(argv) >= 2:
         ws, argv = argv[1], argv[2:]
     usage = "usage: registry.py [--workspace DIR] ids | field <id> <key> | role <role> | legacy | validate"

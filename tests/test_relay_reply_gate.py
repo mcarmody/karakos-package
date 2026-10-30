@@ -129,6 +129,9 @@ class FakeMessage:
 
 MENTION_ONLY_CHANNEL = 8000
 BOTH_KEYS_CHANNEL = 8100
+DUO_CHANNEL = 9000       # amos + guest_agents (2 agents), no reply_gate key -> gated by default
+DUO_OFF = 9100           # 2 agents, "reply_gate": false
+DUO_MENTION_ONLY = 9200  # 2 agents, mention_only, no reply_gate key
 ROLE_ID = 777          # maps to amos
 UNMAPPED_ROLE_ID = 778
 
@@ -144,6 +147,11 @@ CHANNELS = {
                        "mention_only": True},
         "both-keys": {"id": str(BOTH_KEYS_CHANNEL), "default_agent": "amos",
                       "reply_gate": True, "mention_only": True},
+        "duo": {"id": str(DUO_CHANNEL), "default_agent": "amos", "guest_agents": True},
+        "duo-off": {"id": str(DUO_OFF), "default_agent": "amos", "guest_agents": True,
+                    "reply_gate": False},
+        "duo-mention": {"id": str(DUO_MENTION_ONLY), "default_agent": "amos",
+                        "guest_agents": True, "mention_only": True},
     },
 }
 
@@ -158,7 +166,8 @@ def adapter(relay, monkeypatch):
         "version": 2, "agents": {
             "amos": {"name": "amos", "role": "primary", "shards": [
                 {"id": "amos", "channels": ["kitchen", "general", "agent-chat",
-                                            "front-desk", "both-keys"]}]},
+                                            "front-desk", "both-keys", "duo", "duo-off",
+                                            "duo-mention"]}]},
             "kothar": {"name": "kothar", "role": "monitor"}}}))
     monkeypatch.setattr(relay, "discord_id_to_agent",
                         {AMOS_BOT_ID: "amos", KOTHAR_BOT_ID: "kothar"})
@@ -530,3 +539,157 @@ def test_role_id_env_is_read_from_the_registry_into_the_relay_map(relay, monkeyp
     relay.load_config()
 
     assert relay.discord_role_id_to_agent == {ROLE_ID: "amos"}
+
+
+def test_role_id_env_accepts_several_ids_and_ignores_bad_parts(relay, monkeypatch, tmp_path):
+    import registry
+    monkeypatch.setenv("DISCORD_ROLE_ID_AMOS", f"{ROLE_ID}, {ROLE_ID + 1} nope,{ROLE_ID}")
+    monkeypatch.setattr(relay.agent_registry, "load_registry", lambda ws: registry.parse_registry({
+        "version": 2, "agents": {
+            "amos": {"name": "amos", "role": "primary",
+                     "discord": {"role_id_env": "DISCORD_ROLE_ID_AMOS"},
+                     "shards": [{"id": "amos", "channels": []}]},
+            "kothar": {"name": "kothar", "role": "monitor"}}}))
+    monkeypatch.setattr(relay, "discord_id_to_agent", {})
+    monkeypatch.setattr(relay, "discord_role_id_to_agent", {})
+    monkeypatch.setattr(relay, "CHANNELS_CONFIG_PATH", tmp_path / "channels.json")
+
+    relay.load_config()
+
+    assert relay.discord_role_id_to_agent == {ROLE_ID: "amos", ROLE_ID + 1: "amos"}
+
+
+def _two_agent_registry(registry):
+    def agent(n):
+        return {"name": n, "role": "primary" if n == "amos" else "custom",
+                "discord": {"role_id_env": "DISCORD_ROLE_ID_" + n.upper()},
+                "shards": [{"id": n, "channels": []}]}
+    return registry.parse_registry({"version": 2, "agents": {
+        "amos": agent("amos"), "kothar": agent("kothar"), "mon": {"name": "mon", "role": "monitor"}}})
+
+
+def test_shared_role_warns_and_first_agent_keeps_it(relay, monkeypatch, tmp_path, caplog):
+    import logging
+    import registry
+    monkeypatch.setenv("DISCORD_ROLE_ID_AMOS", str(ROLE_ID))
+    monkeypatch.setenv("DISCORD_ROLE_ID_KOTHAR", f"{ROLE_ID},{ROLE_ID + 1}")
+    reg = _two_agent_registry(registry)
+    monkeypatch.setattr(relay.agent_registry, "load_registry", lambda ws: reg)
+    monkeypatch.setattr(relay, "discord_id_to_agent", {})
+    monkeypatch.setattr(relay, "discord_role_id_to_agent", {})
+    monkeypatch.setattr(relay, "CHANNELS_CONFIG_PATH", tmp_path / "channels.json")
+    with caplog.at_level(logging.WARNING, logger="relay"):
+        relay.load_config()
+    assert relay.discord_role_id_to_agent == {ROLE_ID: "amos", ROLE_ID + 1: "kothar"}
+    assert any("set for both amos and kothar" in r.message for r in caplog.records)
+
+
+def test_non_numeric_role_id_is_warned_not_silent(relay, monkeypatch, tmp_path, caplog):
+    import logging
+    import registry
+    monkeypatch.setenv("DISCORD_ROLE_ID_AMOS", f"{ROLE_ID},oops")
+    monkeypatch.setenv("DISCORD_ROLE_ID_KOTHAR", "")
+    reg = _two_agent_registry(registry)
+    monkeypatch.setattr(relay.agent_registry, "load_registry", lambda ws: reg)
+    monkeypatch.setattr(relay, "discord_id_to_agent", {})
+    monkeypatch.setattr(relay, "discord_role_id_to_agent", {})
+    monkeypatch.setattr(relay, "CHANNELS_CONFIG_PATH", tmp_path / "channels.json")
+    with caplog.at_level(logging.WARNING, logger="relay"):
+        relay.load_config()
+    assert relay.discord_role_id_to_agent == {ROLE_ID: "amos"}
+    assert any("non-numeric role id 'oops'" in r.message for r in caplog.records)
+
+
+def test_parse_role_ids():
+    import routing
+    assert routing.parse_role_ids("123") == [123]
+    seen = []
+    assert routing.parse_role_ids("1,2 3,,x", on_invalid=seen.append) == [1, 2, 3]
+    assert seen == ["x"]
+    assert routing.parse_role_ids("") == [] and routing.parse_role_ids(None) == []
+
+
+def test_reply_context_names_the_replied_to_author_by_id(relay):
+    import types
+    author = types.SimpleNamespace(id=800000000000000001, display_name="Alice B", name="x")
+    target = types.SimpleNamespace(author=author, content="hello", attachments=[])
+    assert relay.format_reply_context(target).startswith(
+        "[In reply to Alice B (id 800000000000000001):")
+
+
+# ---------------------------------------------------------------------------
+# #131 — the gate is on by default for channels with two or more agents
+# ---------------------------------------------------------------------------
+
+def test_two_agent_channel_is_gated_by_default(adapter):
+    deliver(adapter, FakeMessage(MIKE, "did you feed the cat", channel_id=DUO_CHANNEL))
+    deliver(adapter, FakeMessage(ALEX, "yeah this morning", channel_id=DUO_CHANNEL))
+    assert adapter.routed == []
+
+
+def test_two_agent_channel_mention_still_routes(adapter):
+    deliver(adapter, FakeMessage(MIKE, "<@111> what's on the calendar",
+                                 channel_id=DUO_CHANNEL, mentions=mention_amos()))
+    assert adapter.routed == [("amos", "<@111> what's on the calendar")]
+
+
+def test_explicit_false_opts_out(adapter):
+    deliver(adapter, FakeMessage(MIKE, "did you feed the cat", channel_id=DUO_OFF))
+    assert adapter.routed == [("amos", "did you feed the cat")]
+
+
+def test_single_agent_channel_not_gated_by_default(adapter):
+    deliver(adapter, FakeMessage(MIKE, "did you feed the cat", channel_id=PLAIN_CHANNEL))
+    assert adapter.routed == [("amos", "did you feed the cat")]
+
+
+def test_guest_agents_channel_counts_the_guest(relay, adapter):
+    cfg = CHANNELS["channels"]["agent-chat"]
+    assert relay.channel_agent_count("agent-chat", cfg) == 2
+    assert relay.channel_agent_count("general", CHANNELS["channels"]["general"]) == 1
+    assert relay.channel_agent_count(None, cfg) == 0
+
+
+def test_env_switch_restores_opt_in(adapter, monkeypatch):
+    monkeypatch.setenv("KARAKOS_REPLY_GATE_DEFAULT", "off")
+    deliver(adapter, FakeMessage(MIKE, "did you feed the cat", channel_id=DUO_CHANNEL))
+    assert adapter.routed == [("amos", "did you feed the cat")]
+
+
+def test_env_switch_leaves_explicit_true_alone(adapter, monkeypatch):
+    monkeypatch.setenv("KARAKOS_REPLY_GATE_DEFAULT", "off")
+    deliver(adapter, FakeMessage(MIKE, "did you feed the cat"))   # kitchen: reply_gate true
+    assert adapter.routed == []
+
+
+def test_possessive_name_is_not_a_trigger(adapter):
+    deliver(adapter, FakeMessage(MIKE, "amos's reply is slow", channel_id=DUO_CHANNEL))
+    deliver(adapter, FakeMessage(MIKE, "amos is investigating", channel_id=DUO_CHANNEL))
+    deliver(adapter, FakeMessage(MIKE, "amos already did that", channel_id=DUO_CHANNEL))
+    assert adapter.routed == []
+
+
+def test_vocative_name_engages(adapter):
+    deliver(adapter, FakeMessage(MIKE, "hey amos, add milk", channel_id=DUO_CHANNEL))
+    deliver(adapter, FakeMessage(MIKE, "amos", channel_id=DUO_CHANNEL))
+    assert adapter.routed == [("amos", "hey amos, add milk"), ("amos", "amos")]
+
+
+def test_mention_only_beats_default_gate(adapter, relay, monkeypatch):
+    errors = []
+
+    class Recorder:
+        def error(self, msg, *a, **k):
+            errors.append(msg % a if a else msg)
+
+        def __getattr__(self, name):
+            return lambda *a, **k: None
+
+    monkeypatch.setattr(relay, "log", Recorder())
+    deliver(adapter, FakeMessage(MIKE, "amos, add milk", channel_id=DUO_MENTION_ONLY))
+    deliver(adapter, FakeMessage(MIKE, "anyone want lunch", channel_id=DUO_MENTION_ONLY))
+    assert adapter.routed == []
+    deliver(adapter, FakeMessage(MIKE, "<@111> lunch?", channel_id=DUO_MENTION_ONLY,
+                                 mentions=mention_amos()))
+    assert adapter.routed == [("amos", "<@111> lunch?")]
+    assert errors == []

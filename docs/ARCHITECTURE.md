@@ -268,6 +268,18 @@ gates:
 - **`GuestBudget`** — caps how many turns a *bot* author can consume, 12 by
   default, refilled when a human speaks.
 
+**Gateway outage alert** (`lib/gateway_watch.py`). The relay is the one process
+that can tell Discord is unreachable; an agent behind a dead link just stops
+getting turns. The relay posts a message *off Discord* when the gateway has been
+down past `OUTAGE_ALERT_AFTER_S` (default 300) or when the outbox's dead-letter
+count rises. It sends one message per outage and one line on recovery. It goes
+to `OUTAGE_ALERT_WEBHOOK_URL`, a plain-text HTTP POST that ntfy, Gotify and
+Slack-style endpoints accept; with it unset the relay only logs the message. A
+failed delivery is retried on the next 30-second pass and never repeated once it
+lands. A relay that boots and never logs in counts as down from process start.
+Limit: a webhook cannot get out when the whole uplink is dead, so point it at a
+route that does not share that uplink.
+
 ## Scheduler (`bin/scheduler.py`)
 
 Replaces cron, with the container's full environment. The loop ticks every
@@ -281,7 +293,7 @@ Replaces cron, with the container's full environment. The loop ticks every
 | Flush deferred messages | every 5 min | `bin/flush-deferred-messages.py` |
 | Claude CLI rollback guard | at startup, then hourly | `bin/cli-upgrade-watchdog.sh` |
 | Memory consolidation | daily 03:00 | `lib/monitor_jobs/memory_consolidate.py` (also `bin/graph-consolidate.py [--dry-run]`) |
-| Friction sensor | hourly, offset :10 | `lib/monitor_jobs/friction_sensor.py` (also `bin/friction-sensor.py [--summary]`): scans `logs/agent-streams/` for tool errors, non-zero Bash exits, denials, rate-limit pressure and repeated commands; appends to `data/friction-log.jsonl`, refreshes `data/friction/weekly.md`. No LLM, read-only on the logs |
+| Friction sensor | hourly, offset :10 | `lib/monitor_jobs/friction_sensor.py` (also `bin/friction-sensor.py [--summary]`): scans `logs/agent-streams/` for tool errors, non-zero Bash exits, denials, rate-limit pressure and repeated commands; appends to `data/friction-log.jsonl`, refreshes `data/friction/weekly.md`. No LLM, read-only on the logs. Rows carry both `kind`/`category` and `detail`/`evidence` (contract 07). `bin/friction-sensor.py --note TEXT [--tag TAG]` hand-logs a `note` row; repeated commands are also counted across sessions over 7 days. |
 | Friction review | daily 03:30 | `lib/monitor_jobs/friction_review.py` (also `bin/friction-review.py`): groups `data/friction-log.jsonl` into recurring causes, writes `data/friction/YYYY-MM-DD.md` with a drafted issue and proposed fix per cause. Report only; filing upstream needs `--file --yes` from a person and only covers causes seen on two separate days. The `friction` tool (`recent`, `propose_issue`) lets an agent read the log and, after a yes through `ask_user`, file one cause |
 | Health monitor | daily 04:00 | `bin/health-monitor.py` |
 | Data purge | daily 04:30 | `bin/purge-data.py` |
@@ -691,7 +703,7 @@ tools; `MONITOR_DISALLOWED_TOOLS` in `lib/registry.py`). Around it, plain code
 does the detecting: scheduled jobs touch **heartbeats** (`lib/heartbeats.py`),
 **drift** compares the job table with the live schedule (`lib/drift.py`),
 **stall diagnosis** says why a shard is silent (`lib/stall.py`), and
-`lib/monitor_tick.py` runs once a minute and turns findings into alerts.
+`lib/monitor_tick.py` runs once a minute and turns findings into alerts. A cron-driven install touches `$KARAKOS_HEARTBEAT_DIR/<job>` instead; the monitor reads either, newest wins.
 **Alerts** (`lib/alerts.py`, `config/monitor.yaml`) post straight to Discord
 through `bin/discord-notify.sh`, never through the agent poke path, because a
 wedged agent never reads its queue. `lib/outbox_audit.py` audits message
@@ -867,7 +879,7 @@ One row per step; every path exists in the checkout (`tests/test_docs.py` checks
 | 2.6 | Context handoff | `lib/session_policy.py`, `bin/agent-server.py` |
 | 2.7 | Rate-limit breaker, budget, governor | `lib/rate_limits.py`, `lib/token_budget.py`, `lib/usage_gate.py`, `lib/usage_governor.py`, `config/governor.yaml`, `lib/migrate/steps/35_rate_limit.py` |
 | 3.1 | Primary template | `agents/templates/primary.md`, `bin/create-agent.sh` |
-| 3.2 | Monitor agent | `agents/templates/monitor.md`, `lib/monitor_tick.py`, `lib/drift.py`, `lib/stall.py`, `lib/alerts.py`, `lib/heartbeats.py`, `lib/outbox_audit.py`, `lib/migrate/steps/12_monitor.py` |
+| 3.2 | Monitor agent | `agents/templates/monitor.md`, `lib/monitor_tick.py`, `lib/drift.py`, `lib/cron_drift.py` (crontab coverage and drift for cron-driven installs), `lib/stall.py`, `lib/alerts.py`, `lib/heartbeats.py`, `lib/outbox_audit.py`, `lib/migrate/steps/12_monitor.py` |
 | 3.3 | Build queue | `lib/buildq.py`, `lib/build_dispatcher.py`, `lib/build_hosts.py`, `lib/build_run.py`, `bin/buildq`, `bin/build-runner.sh`, `lib/migrate/steps/50_build_queue.py` |
 | 4.1 | Graph store | `lib/graph/store.py`, `lib/graph/schema.py`, `lib/graph/embed.py` |
 | 4.2 / 4.2b | Memory tools, rewired consumers | `lib/graph/tools.py`, `lib/graph/recall.py`, `mcp/tools-server.py`, `system/hooks/inject-recall.py` |
