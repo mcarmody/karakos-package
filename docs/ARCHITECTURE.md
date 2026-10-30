@@ -879,7 +879,7 @@ One row per step; every path exists in the checkout (`tests/test_docs.py` checks
 | 2.6 | Context handoff | `lib/session_policy.py`, `bin/agent-server.py` |
 | 2.7 | Rate-limit breaker, budget, governor | `lib/rate_limits.py`, `lib/token_budget.py`, `lib/usage_gate.py`, `lib/usage_governor.py`, `config/governor.yaml`, `lib/migrate/steps/35_rate_limit.py` |
 | 3.1 | Primary template | `agents/templates/primary.md`, `bin/create-agent.sh` |
-| 3.2 | Monitor agent | `agents/templates/monitor.md`, `lib/monitor_tick.py`, `lib/drift.py`, `lib/stall.py`, `lib/alerts.py`, `lib/heartbeats.py`, `lib/outbox_audit.py`, `lib/migrate/steps/12_monitor.py` |
+| 3.2 | Monitor agent | `agents/templates/monitor.md`, `lib/monitor_tick.py`, `lib/drift.py`, `lib/cron_drift.py` (crontab coverage and drift for cron-driven installs), `lib/stall.py`, `lib/alerts.py`, `lib/heartbeats.py`, `lib/outbox_audit.py`, `lib/migrate/steps/12_monitor.py` |
 | 3.3 | Build queue | `lib/buildq.py`, `lib/build_dispatcher.py`, `lib/build_hosts.py`, `lib/build_run.py`, `bin/buildq`, `bin/build-runner.sh`, `lib/migrate/steps/50_build_queue.py` |
 | 4.1 | Graph store | `lib/graph/store.py`, `lib/graph/schema.py`, `lib/graph/embed.py` |
 | 4.2 / 4.2b | Memory tools, rewired consumers | `lib/graph/tools.py`, `lib/graph/recall.py`, `mcp/tools-server.py`, `system/hooks/inject-recall.py` |
