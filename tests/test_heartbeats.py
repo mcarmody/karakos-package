@@ -1,4 +1,5 @@
 import json
+import os
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -53,3 +54,55 @@ def test_corrupt_file_is_stale_not_exception(tmp_path):
     rec = hb.read(tmp_path, "j")
     assert hb.status(JOB, rec, NOW, NOW) == "stale"
     assert hb.touch(tmp_path, "j", now=NOW)["previous_timestamp"] is None
+
+
+def _touch_file(root, name, at):
+    d = root / "hb"
+    d.mkdir(exist_ok=True)
+    f = d / name
+    f.write_text("")
+    stamp = at.timestamp()
+    os.utime(f, (stamp, stamp))
+    return f
+
+
+def test_touch_file_alone_is_ok(tmp_path, monkeypatch):
+    monkeypatch.setenv("KARAKOS_HEARTBEAT_DIR", str(tmp_path / "hb"))
+    _touch_file(tmp_path, "j", NOW - timedelta(seconds=10))
+    rec = hb.read(tmp_path, "j")
+    assert rec["source"] == "touch"
+    assert hb.status(JOB, rec, None, NOW) == "ok"
+
+
+def test_newer_record_wins_both_ways(tmp_path, monkeypatch):
+    monkeypatch.setenv("KARAKOS_HEARTBEAT_DIR", str(tmp_path / "hb"))
+    hb.touch(tmp_path, "j", now=NOW - timedelta(seconds=60))
+    f = _touch_file(tmp_path, "j", NOW - timedelta(seconds=10))
+    assert hb.read(tmp_path, "j")["source"] == "touch"
+    stamp = (NOW - timedelta(seconds=120)).timestamp()
+    os.utime(f, (stamp, stamp))
+    rec = hb.read(tmp_path, "j")
+    assert "source" not in rec and "pid" in rec
+
+
+def test_corrupt_json_falls_back_to_touch(tmp_path, monkeypatch):
+    monkeypatch.setenv("KARAKOS_HEARTBEAT_DIR", str(tmp_path / "hb"))
+    (tmp_path / "data/health/heartbeats").mkdir(parents=True)
+    (tmp_path / "data/health/heartbeats/j.json").write_text("not json")
+    _touch_file(tmp_path, "j", NOW - timedelta(seconds=10))
+    rec = hb.read(tmp_path, "j")
+    assert rec["source"] == "touch"
+    assert hb.status(JOB, rec, None, NOW) == "ok"
+
+
+def test_bad_name_and_missing_are_none(tmp_path, monkeypatch):
+    monkeypatch.setenv("KARAKOS_HEARTBEAT_DIR", str(tmp_path / "hb"))
+    assert hb.read_touch("../x") is None
+    assert hb.read_touch("nope") is None
+    assert not (tmp_path / "hb").exists()
+
+
+def test_default_dir_is_home_karakos(tmp_path, monkeypatch):
+    monkeypatch.delenv("KARAKOS_HEARTBEAT_DIR", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert hb.touch_dir() == tmp_path / ".karakos" / "heartbeats"

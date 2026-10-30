@@ -1,5 +1,10 @@
 """Job heartbeats: each scheduled run touches data/health/heartbeats/<name>.json.
 
+The touch file `<heartbeat_dir>/<job>` is the required signal (contract 07); its mtime is the last success.
+`heartbeat_dir` is `$KARAKOS_HEARTBEAT_DIR`, default `~/.karakos/heartbeats`.
+The JSON file `data/health/heartbeats/<job>.json` is optional detail; when both exist, the newer timestamp wins.
+Readers never create or write the touch file.
+
 Components (another process writes data/health/<name>.json) are read with the
 same timestamp rules the 1.x health monitor used: a naive stamp is local time,
 aware and `Z` stamps are honoured.
@@ -8,13 +13,22 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import stat
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+TOUCH_DIR_ENV = "KARAKOS_HEARTBEAT_DIR"
+NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
 
 def _dir(workspace) -> Path:
     return Path(workspace) / "data" / "health" / "heartbeats"
+
+
+def touch_dir() -> Path:
+    return Path(os.environ.get(TOUCH_DIR_ENV) or Path.home() / ".karakos" / "heartbeats")
 
 
 def utcnow() -> datetime:
@@ -34,7 +48,24 @@ def parse_ts(value) -> Optional[datetime]:
     return ts
 
 
-def read(workspace, name: str) -> Optional[dict]:
+def read_touch(name: str) -> Optional[dict]:
+    """Record from the touch file's mtime; None when absent; {"corrupt": True} when unreadable. Never writes."""
+    if not NAME_RE.fullmatch(name):
+        return None
+    p = touch_dir() / name
+    try:
+        st = p.stat()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return {"corrupt": True}
+    if not stat.S_ISREG(st.st_mode):
+        return {"corrupt": True}
+    return {"name": name, "timestamp": datetime.fromtimestamp(st.st_mtime, timezone.utc).isoformat(),
+            "ok": True, "detail": "", "source": "touch"}
+
+
+def read_json(workspace, name: str) -> Optional[dict]:
     """None when absent; {"corrupt": True} when unreadable."""
     try:
         data = json.loads((_dir(workspace) / f"{name}.json").read_text())
@@ -43,6 +74,26 @@ def read(workspace, name: str) -> Optional[dict]:
     except (OSError, ValueError):
         return {"corrupt": True}
     return data if isinstance(data, dict) else {"corrupt": True}
+
+
+def read(workspace, name: str) -> Optional[dict]:
+    """Newest of the touch file and the JSON file; see the module docstring."""
+    j = read_json(workspace, name)
+    t = read_touch(name)
+    if j is None:
+        return t
+    if t is None:
+        return j
+    if j.get("corrupt"):
+        return {"corrupt": True} if t.get("corrupt") else t
+    if t.get("corrupt"):
+        return j
+    tj, tt = parse_ts(j.get("timestamp")), parse_ts(t.get("timestamp"))
+    if tt is None:
+        return j
+    if tj is None:
+        return t
+    return t if tt > tj else j
 
 
 def touch(workspace, name: str, ok: bool = True, detail: str = "", now: Optional[datetime] = None) -> dict:
