@@ -433,6 +433,7 @@ want to edit:
 | `KARAKOS_ENV_PASSTHROUGH` | `1` lets agent subprocesses inherit the server environment (debugging only) |
 | `KARAKOS_SKIP_STAMP_CHECK` | `1` skips the schema-stamp check (tests only) |
 | `KARAKOS_HEARTBEAT_DIR` | Directory of touch-file heartbeats (mtime is the last success); default `~/.karakos/heartbeats`. |
+| `KARAKOS_TRANSCRIPT_GLOBS` | Extra friction-sensor sources: `os.pathsep`-separated globs of directories holding Claude Code `*.jsonl` transcripts. Unset by default |
 | `KARAKOS_COOKIE_SECURE` / `SESSION_MAX_AGE_SECONDS` | Read by the pinned dashboard, not by this repository: `Secure` session cookie and session lifetime ([UPGRADING.md](UPGRADING.md#auth-and-env-changes)) |
 
 **Cost and capacity:**

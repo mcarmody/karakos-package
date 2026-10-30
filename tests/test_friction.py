@@ -1,6 +1,7 @@
 """Friction sensor (#237 build A): stream scan, state, summary, job registration."""
 import json
 import sys
+from datetime import datetime, timezone
 
 import pytest
 
@@ -141,3 +142,42 @@ def test_registered_as_an_hourly_job():
         assert job_registry.resolve_callable(j.run)
     finally:
         sys.path.remove(str(PACKAGE_ROOT / "lib"))
+
+
+TS = "2026-01-01T00:00:00.000Z"
+
+
+def test_transcript_glob_source(ws, tmp_path, monkeypatch):
+    d = tmp_path / "projects" / "x-agents-helper"
+    d.mkdir(parents=True)
+    lines = [dict(use("1", "Bash", command="false"), timestamp=TS),
+             dict(res("1", "Exit code 1"), timestamp=TS)]
+    with open(d / "session.jsonl", "w") as f:
+        for x in lines:
+            f.write(json.dumps(x) + "\n")
+    monkeypatch.setenv("KARAKOS_TRANSCRIPT_GLOBS", str(tmp_path / "projects" / "*"))
+    assert friction.scan(ws) == {"scanned": 1, "events": 1}
+    (e,) = events(ws)
+    assert e["agent"] == "helper" and e["kind"] == "bash_exit"
+    assert e["category"] == "command_error" and e["evidence"] == e["detail"]
+    assert e["session"] == "helper" and e["ts"] == TS
+    assert friction.scan(ws)["events"] == 0  # offset kept
+
+
+def test_both_names_on_stream_rows(ws):
+    write(ws, [use("a", "Bash", command="false"), res("a", "Exit code 1")])
+    friction.scan(ws)
+    (e,) = events(ws)
+    assert e["category"] == "command_error" and e["evidence"] == e["detail"]
+    assert e["session"] == e["agent"] == "marvin"
+
+
+def test_read_log_accepts_workspace_rows_and_counts_malformed(ws):
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    row = {"ts": now, "session": "amos", "category": "command_error", "tool": "Bash", "evidence": "x"}
+    (ws / "data" / "friction-log.jsonl").write_text(json.dumps(row) + "\n{not json\n")
+    stats = {}
+    rows = friction.read_log(ws, 7, stats)
+    assert rows[0]["kind"] == "bash_exit" and rows[0]["detail"] == "x"
+    assert rows[0]["agent"] == "amos" and stats["skipped"] == 1
+    assert friction.summary_text(rows).startswith("# Friction summary")
