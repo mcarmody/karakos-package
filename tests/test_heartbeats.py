@@ -1,6 +1,8 @@
 import json
 import os
 import sys
+
+import pytest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -54,6 +56,12 @@ def test_corrupt_file_is_stale_not_exception(tmp_path):
     rec = hb.read(tmp_path, "j")
     assert hb.status(JOB, rec, NOW, NOW) == "stale"
     assert hb.touch(tmp_path, "j", now=NOW)["previous_timestamp"] is None
+
+
+@pytest.fixture(autouse=True)
+def _isolated_touch_dir(tmp_path, monkeypatch):
+    """Keep every test off the real ~/.karakos/heartbeats."""
+    monkeypatch.setenv("KARAKOS_HEARTBEAT_DIR", str(tmp_path / "hb"))
 
 
 def _touch_file(root, name, at):
