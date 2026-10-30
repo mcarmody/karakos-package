@@ -703,7 +703,7 @@ tools; `MONITOR_DISALLOWED_TOOLS` in `lib/registry.py`). Around it, plain code
 does the detecting: scheduled jobs touch **heartbeats** (`lib/heartbeats.py`),
 **drift** compares the job table with the live schedule (`lib/drift.py`),
 **stall diagnosis** says why a shard is silent (`lib/stall.py`), and
-`lib/monitor_tick.py` runs once a minute and turns findings into alerts.
+`lib/monitor_tick.py` runs once a minute and turns findings into alerts. A cron-driven install touches `$KARAKOS_HEARTBEAT_DIR/<job>` instead; the monitor reads either, newest wins.
 **Alerts** (`lib/alerts.py`, `config/monitor.yaml`) post straight to Discord
 through `bin/discord-notify.sh`, never through the agent poke path, because a
 wedged agent never reads its queue. `lib/outbox_audit.py` audits message
