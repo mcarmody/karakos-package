@@ -1,7 +1,8 @@
 """ITHILIEN phase 1: the programmatic checks named in tests/capabilities/manifest.yaml.
 
 Each check is `fn(workspace) -> (ok, detail)`. `workspace` is the install's root
-(`paths.workspace_path()`). A check never raises: `_safe` turns an exception into
+(`paths.workspace_path()`). `ok` is True (pass), False (fail) or None (skipped: the
+check had nothing to test). A check never raises: `_safe` turns an exception into
 `(False, "<Type>: <message>")`. Every write goes to a temp directory, and nothing
 calls a model. The one HTTP call that looks like Discord goes to a local stub.
 
@@ -54,7 +55,7 @@ def _safe(fn):
     def wrapper(workspace):
         try:
             ok, detail = fn(workspace)
-            return bool(ok), str(detail)
+            return (None if ok is None else bool(ok)), str(detail)
         except Exception as e:  # noqa: BLE001 - a check reports, it does not raise
             return False, f"{type(e).__name__}: {e}"
     return wrapper
@@ -91,11 +92,24 @@ def _expected_tools() -> list:
     return json.loads(EXPECTED_TOOLS.read_text())["tools"]
 
 
+_TOOLS_CACHE = None
+
+
+def reset_run_cache() -> None:
+    """Forget the tool listing. bin/agent-check.py calls this at the start of each run."""
+    global _TOOLS_CACHE
+    _TOOLS_CACHE = None
+
+
 def _list_tools() -> dict:
     """{server_script: {tool_name: tool_dict}} from a live tools/list on each server.
 
+    Cached for one run (see reset_run_cache), so both MCP checks start each server once.
     The servers start in a temp workspace: listing tools must not write health files
     or audit rows into the install."""
+    global _TOOLS_CACHE
+    if _TOOLS_CACHE is not None:
+        return _TOOLS_CACHE
     self_test = _load_script("self_test", "bin/self-test.py")
     out = {}
     with tempfile.TemporaryDirectory() as td, _sandbox_env(KARAKOS_HOME=td, WORKSPACE_ROOT=td):
@@ -107,6 +121,7 @@ def _list_tools() -> dict:
                 out[script] = {t["name"]: t for t in srv.call("tools/list").get("tools", [])}
             finally:
                 srv.close()
+    _TOOLS_CACHE = out
     return out
 
 
@@ -155,15 +170,21 @@ def hooks_installed(workspace):
     creates it when absent)."""
     hs = _load_script("hooks_sync", "bin/hooks-sync.py")
     cfg = dict(hs.DEFAULTS)
-    cfg_path = ROOT / "config" / "hooks.json"
+    cfg_path = Path(workspace) / "config" / "hooks.json"
     if cfg_path.is_file():
         cfg.update(json.loads(cfg_path.read_text()))
     names = set()
+    outside = []
     for groups in hs.desired(cfg).values():
         for group in groups:
             for hook in group["hooks"]:
                 cmd = hook["command"]
+                if "system/hooks/" not in cmd:
+                    outside.append(cmd)
+                    continue
                 names.add(cmd.split("system/hooks/", 1)[1])
+    if outside:
+        return False, "command outside system/hooks/: " + ", ".join(sorted(outside))
     hooks_dir = ROOT / "system" / "hooks"
     missing = [n for n in sorted(names) if not (hooks_dir / n).is_file()]
     not_exec = [n for n in sorted(names) if (hooks_dir / n).is_file()
@@ -235,12 +256,13 @@ def outbox_roundtrip(workspace):
             rid, _ = outbox.enqueue(conn, "agent-check", STUB_CHANNEL_ID, "agent-check ping")
             before = outbox.get(conn, rid)["status"]
             claimed = [r["id"] for r in outbox.claim_due(conn)]
+            during = outbox.get(conn, rid)["status"]
             outbox.mark_delivered(conn, rid)
             after = outbox.get(conn, rid)["status"]
         finally:
             conn.close()
-    if before != "pending" or claimed != [rid] or after != "delivered":
-        return False, f"{rid}: {before} -> claimed {claimed} -> {after}"
+    if before != "pending" or claimed != [rid] or during != "sending" or after != "delivered":
+        return False, f"{rid}: {before} -> claimed {claimed} -> {during} -> {after}"
     return True, f"{rid}: pending -> sending -> delivered"
 
 
@@ -387,7 +409,7 @@ def session_finalize_endpoint(workspace):
     token = os.environ.get("AGENT_SERVER_TOKEN", "")
     health = _probe(base + "/health", token)
     if health is None:
-        return True, "no live server; skipped"
+        return None, "no live server; skipped"
     status, body = health
     body = body if isinstance(body, dict) else {}
     if status == 401:

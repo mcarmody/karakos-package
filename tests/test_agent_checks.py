@@ -9,10 +9,12 @@ import socket
 import subprocess
 import sys
 import time
+import types
 
 import pytest
 
 from conftest import PACKAGE_ROOT, import_script
+from lib.graph.store import graph_path
 
 MANIFEST = PACKAGE_ROOT / "tests" / "capabilities" / "manifest.yaml"
 EXPECTED = PACKAGE_ROOT / "tests" / "capabilities" / "expected_tools.json"
@@ -75,10 +77,21 @@ def test_every_expected_tool_has_a_manifest_entry(runner):
 def test_run_one_reports_agentic_as_skip_and_bad_check_as_fail(runner, ws):
     skip = runner.run_one({"id": "later", "layer": "agentic", "check": "none",
                            "desc": "", "since": "x"}, ws)
-    assert skip["status"] == "SKIP" and skip["detail"] == "skipped: phase 2"
+    assert skip["status"] == "skip" and skip["detail"] == "skipped: phase 2"
     bad = runner.run_one({"id": "typo", "layer": "programmatic", "check": "no_such_check",
                           "desc": "", "since": "x"}, ws)
     assert bad["status"] == "FAIL" and "no_such_check" in bad["detail"]
+
+
+def test_none_from_a_check_is_a_skip_and_never_fails_the_run(runner, ws, monkeypatch, capsys):
+    monkeypatch.setattr(runner.agent_checks, "outbox_roundtrip",
+                        lambda workspace: (None, "nothing to test here"))
+    rc = runner.main(["--only", "outbox-roundtrip", "--json"])
+    r = json.loads(capsys.readouterr().out)["results"][0]
+    assert rc == 0
+    assert r["status"] == "skip" and r["detail"] == "nothing to test here"
+    rc = runner.main(["--only", "outbox-roundtrip"])
+    assert rc == 0 and capsys.readouterr().out.startswith("SKIP")
 
 
 def test_clean_temp_install_exits_zero_with_documented_keys(runner, ws):
@@ -95,9 +108,9 @@ def test_clean_temp_install_exits_zero_with_documented_keys(runner, ws):
     assert ids == {e["id"] for e in _entries(runner)}
     for r in doc["results"]:
         assert set(r) == {"id", "layer", "status", "detail", "ms"}
-        assert r["status"] in ("PASS", "FAIL", "SKIP")
+        assert r["status"] in ("PASS", "FAIL", "skip")
     session = next(r for r in doc["results"] if r["id"] == "session-finalize-endpoint")
-    assert session["status"] == "PASS" and session["detail"] == "no live server; skipped"
+    assert session["status"] == "skip" and session["detail"] == "no live server; skipped"
     lines = (ws / "data" / "agent-checks" / "results.jsonl").read_text().splitlines()
     assert len(lines) == 1 and json.loads(lines[0])["results"] == doc["results"]
 
@@ -162,11 +175,66 @@ def test_roundtrip_checks_pass_in_temp_dirs(checks, ws):
     # Nothing a roundtrip writes lands in the install.
     assert not (ws / "data" / "outbox").exists()
     assert not (ws / "data" / "asks").exists()
+    assert not graph_path(ws / "data").exists()
 
 
-def test_hooks_installed_matches_the_checkout(checks, ws):
-    ok, detail = checks.hooks_installed(ws)
+def test_hooks_installed_matches_the_checkout(checks):
+    ok, detail = checks.hooks_installed(PACKAGE_ROOT)
     assert ok, detail
+
+
+def _fake_hooks_sync(monkeypatch, checks, desired):
+    """Swap bin/hooks-sync.py for a stub with the given desired(); other modules load as usual."""
+    fake = types.SimpleNamespace(DEFAULTS={"heavy_build_block": False}, desired=desired)
+    real = checks._load_script
+    monkeypatch.setattr(checks, "_load_script",
+                        lambda mod, rel: fake if mod == "hooks_sync" else real(mod, rel))
+
+
+def test_hooks_installed_reads_config_from_the_workspace(checks, ws, monkeypatch):
+    (ws / "config").mkdir()
+    (ws / "config" / "hooks.json").write_text(json.dumps({"heavy_build_block": True}))
+    seen = []
+
+    def desired(cfg):
+        seen.append(dict(cfg))
+        return {}
+    _fake_hooks_sync(monkeypatch, checks, desired)
+    ok, _ = checks.hooks_installed(ws)
+    assert ok and len(seen) == 1 and seen[0]["heavy_build_block"] is True
+
+
+def test_hooks_installed_fails_naming_a_command_outside_system_hooks(checks, ws, monkeypatch):
+    cmd = "$WORKSPACE_ROOT/bin/rogue-hook.sh"
+    _fake_hooks_sync(monkeypatch, checks,
+                     lambda cfg: {"PreToolUse": [{"hooks": [{"command": cmd}]}]})
+    ok, detail = checks.hooks_installed(ws)
+    assert not ok and cmd in detail
+    assert "IndexError" not in detail
+
+
+def test_mcp_checks_start_each_server_once_per_run(runner, checks, ws, monkeypatch):
+    starts = []
+    real = checks._load_script
+
+    def counting(mod, rel):
+        m = real(mod, rel)
+        if mod == "self_test":
+            base = m.Server
+
+            class Counted(base):
+                def __init__(self, script, *a, **k):
+                    starts.append(script)
+                    super().__init__(script, *a, **k)
+            m.Server = Counted
+        return m
+    monkeypatch.setattr(checks, "_load_script", counting)
+    n = len({t["server"] for t in checks._expected_tools()})
+
+    assert runner.main(["--only", "mcp-tools-present,mcp-tool-schemas"]) == 0
+    assert len(starts) == n, "both checks should share one listing"
+    assert runner.main(["--only", "mcp-tools-present,mcp-tool-schemas"]) == 0
+    assert len(starts) == 2 * n, "each run starts the servers again"
 
 
 def test_scheduler_jobs_registers_every_job(checks, ws):
@@ -177,4 +245,4 @@ def test_scheduler_jobs_registers_every_job(checks, ws):
 
 def test_session_finalize_skips_without_a_server(checks, ws, monkeypatch):
     monkeypatch.setenv("AGENT_SERVER_URL", f"http://127.0.0.1:{_free_port()}")
-    assert checks.session_finalize_endpoint(ws) == (True, "no live server; skipped")
+    assert checks.session_finalize_endpoint(ws) == (None, "no live server; skipped")

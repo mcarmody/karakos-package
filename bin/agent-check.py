@@ -53,14 +53,14 @@ def run_one(entry: dict, workspace: Path) -> dict:
     cid, layer = entry["id"], entry["layer"]
     t0 = time.monotonic()
     if layer == "agentic":
-        status, detail = "SKIP", "skipped: phase 2"
+        status, detail = "skip", "skipped: phase 2"
     elif layer == "programmatic":
         fn = getattr(agent_checks, str(entry["check"]), None)
         if not callable(fn):
             status, detail = "FAIL", f"no check function {entry['check']!r} in lib/agent_checks.py"
         else:
             ok, detail = fn(workspace)
-            status = "PASS" if ok else "FAIL"
+            status = "skip" if ok is None else ("PASS" if ok else "FAIL")
     else:
         status, detail = "FAIL", f"unknown layer {layer!r}"
     return {"id": cid, "layer": layer, "status": status, "detail": detail,
@@ -108,6 +108,7 @@ def main(argv=None) -> int:
     only = [x.strip() for x in a.only.split(",") if x.strip()] or None
     chosen = select(entries, only, a.layer)
     workspace = paths.workspace_path(ROOT)
+    agent_checks.reset_run_cache()
 
     results = []
     for entry in chosen:
@@ -126,7 +127,7 @@ def main(argv=None) -> int:
         print(json.dumps(doc))
     else:
         for r in results:
-            print(f"{r['status']:<4} {r['id']:<26} {r['detail']} ({r['ms']} ms)")
+            print(f"{r['status'].upper():<4} {r['id']:<26} {r['detail']} ({r['ms']} ms)")
     failed = [r for r in results if r["status"] == "FAIL"]
     return 1 if failed else 0
 
