@@ -11,8 +11,9 @@ python3 bin/agent-check.py --layer programmatic --json
 ```
 
 Each line is `PASS`, `FAIL` or `SKIP`, the capability id, the detail, and the time
-taken. The exit code is 0 when nothing FAILs and 1 otherwise. `--json` prints
-`{version, ran_at, results: [{id, layer, status, detail, ms}]}`. Every run appends
+taken. The exit code is 0 when nothing FAILs and 1 otherwise. A skip never fails the
+run. `--json` prints `{version, ran_at, results: [{id, layer, status, detail, ms}]}`,
+where `status` is `PASS`, `FAIL`, or `skip` (lowercase, for a skipped entry). Every run appends
 that document as one line to `data/agent-checks/results.jsonl` under the install's
 data directory.
 
@@ -29,14 +30,12 @@ Entries for MCP tools also carry `covers:`, a list of tool names from
   and the schema stamp.
 - **agentic** (phase 2, planned). Model-driven checks. Entries in this layer are
   reported as `SKIP` with `skipped: phase 2` until phase 2 lands.
-- **layer 3** (phase 3, planned). Scope is set in the internal ITHILIEN design
-  note. It is not described in this repository yet.
 
 ## Adding a capability
 
 1. Write the check in `lib/agent_checks.py`. Take the workspace path, return
-   `(ok, detail)`, and decorate it with `@_safe`. Do every write in a temp
-   directory.
+   `(ok, detail)`, and decorate it with `@_safe`. Return `ok=None` to report a skip
+   (nothing to test here). Do every write in a temp directory.
 2. Add an entry to `tests/capabilities/manifest.yaml` with `layer: programmatic`,
    `since` set to the version it ships in, and `check` set to the function name.
 3. If the entry verifies MCP tools, list them under `covers:`. When a tool's name or
@@ -57,7 +56,8 @@ Entries for MCP tools also carry `covers:`, a list of tool names from
 - The ask check sends its Discord REST calls to a local stub on `127.0.0.1`. No real
   Discord call is made.
 - A check that talks to a live agent server only sends `GET` requests to `/health` and
-  `/agents`. With no server answering, it reports `PASS` with `no live server; skipped`.
+  `/agents`. With no server answering, it reports `SKIP` with `no live server; skipped`.
+  A skip is not a failure.
 - `bin/self-test.py` and `bin/self-diagnose.py` are imported as they are. They are not
   changed.
 
