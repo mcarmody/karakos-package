@@ -164,3 +164,43 @@ def test_workspace_status_reads_schema_version_stamp(tools_server, tmp_path):
     result = tools_server.handle_core_tool("workspace", {"action": "status"})
 
     assert result["schema_version"] == 5
+
+
+def _write_messages(path, rows):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+
+
+def test_discord_history_matches_channel_id_name_and_recent_days(tools_server, tmp_path):
+    """discord(action='history') accepts channel IDs, <#id>, #name, and spans daily files."""
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "channels.json").write_text(json.dumps({
+        "channels": {"huddle": {"id": "1000000001"}}
+    }))
+
+    msgs_dir = tmp_path / "data" / "messages"
+    _write_messages(msgs_dir / "messages-2026-11-13.jsonl", [
+        {"ts": "2026-11-13T23:55:00", "channel_id": "1000000001", "channel_name": "huddle",
+         "author_name": "Alice", "content": "yesterday", "is_bot": False},
+        {"ts": "2026-11-13T23:56:00", "channel_id": "1000000002", "channel_name": "other",
+         "author_name": "Bob", "content": "wrong channel", "is_bot": False},
+    ])
+    _write_messages(msgs_dir / "messages-2026-11-14.jsonl", [
+        {"ts": "2026-11-14T00:01:00", "channel_id": "1000000001", "channel_name": "unknown",
+         "author_name": "Helper", "content": "today by id", "is_bot": True},
+    ])
+
+    by_id = tools_server.handle_core_tool("discord", {
+        "action": "history", "channel": "1000000001", "limit": 10,
+    })
+    assert [m["content"] for m in by_id["messages"]] == ["yesterday", "today by id"]
+
+    by_mention = tools_server.handle_core_tool("discord", {
+        "action": "history", "channel": "<#1000000001>", "limit": 1,
+    })
+    assert [m["content"] for m in by_mention["messages"]] == ["today by id"]
+
+    by_hash_name = tools_server.handle_core_tool("discord", {
+        "action": "history", "channel": "#huddle", "limit": 10,
+    })
+    assert [m["content"] for m in by_hash_name["messages"]] == ["yesterday", "today by id"]

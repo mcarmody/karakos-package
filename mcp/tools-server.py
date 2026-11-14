@@ -958,6 +958,31 @@ def _schema_version():
         return None
 
 
+def _normalize_channel_ref(channel: str) -> str:
+    """Strip Discord `<#...>` wrappers or leading `#` from a channel name or ID."""
+    ref = channel.strip()
+    if ref.startswith("<#") and ref.endswith(">"):
+        return ref[2:-1].strip()
+    return ref.lstrip("#")
+
+
+def _resolve_channel_id(channel: str):
+    """Resolve a channel name or ID to its Discord numeric channel ID, or None."""
+    ref = _normalize_channel_ref(channel)
+    if not ref:
+        return None
+    if ref.isdigit():
+        return ref
+    cfg_path = WORKSPACE / "config" / "channels.json"
+    try:
+        entry = (json.loads(cfg_path.read_text()).get("channels") or {}).get(ref)
+    except (OSError, ValueError):
+        return None
+    if isinstance(entry, dict) and entry.get("id"):
+        return str(entry["id"])
+    return None
+
+
 def handle_core_tool(tool_name: str, args: dict) -> dict:
     """Handle built-in core tools."""
 
@@ -1105,16 +1130,9 @@ def handle_core_tool(tool_name: str, args: dict) -> dict:
             channel = args.get("channel")
             channel_id = None
             if channel:
-                channel_id = str(channel)
-                if not channel_id.isdigit():
-                    cfg_path = WORKSPACE / "config" / "channels.json"
-                    try:
-                        entry = (json.loads(cfg_path.read_text()).get("channels") or {}).get(channel_id)
-                    except (OSError, ValueError):
-                        entry = None
-                    channel_id = str(entry.get("id")) if isinstance(entry, dict) and entry.get("id") else None
-                    if channel_id is None:
-                        return {"error": f"Unknown channel: {channel}"}
+                channel_id = _resolve_channel_id(str(channel))
+                if channel_id is None:
+                    return {"error": f"Unknown channel: {channel}"}
             status, body = agent_server_request("POST", "/react", {
                 "agent": KARAKOS_AGENT, "emoji": args.get("emoji"),
                 "channel_id": channel_id, "message_id": args.get("message_id")})
@@ -1122,27 +1140,45 @@ def handle_core_tool(tool_name: str, args: dict) -> dict:
                 return body
             return {"error": body.get("error") or f"react failed (HTTP {status})"}
         elif action == "history":
-            channel = args.get("channel", "general")
-            limit = min(args.get("limit", 20), 50)
-            # Read from JSONL capture
-            today = datetime.now().strftime("%Y-%m-%d")
-            log_path = WORKSPACE / "data" / "messages" / f"messages-{today}.jsonl"
-            if not log_path.exists():
+            channel = str(args.get("channel") or "general")
+            target = _normalize_channel_ref(channel)
+            resolved_id = _resolve_channel_id(target)
+            raw_limit = args.get("limit")
+            limit = min(raw_limit if isinstance(raw_limit, int) and raw_limit > 0 else 20, 50)
+            messages_dir = WORKSPACE / "data" / "messages"
+            log_files = sorted(messages_dir.glob("messages-*.jsonl"), reverse=True)[:7]
+            if not log_files:
                 return {"messages": [], "channel": channel}
-            messages = []
-            for line in log_path.read_text().strip().split("\n"):
+            collected = []
+            for log_path in log_files:
+                day_msgs = []
                 try:
-                    msg = json.loads(line)
-                    if msg.get("channel_name") == channel:
-                        messages.append({
+                    lines = log_path.read_text().splitlines()
+                except OSError:
+                    continue
+                for line in lines:
+                    if not line.strip():
+                        continue
+                    try:
+                        msg = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    msg_cid = str(msg.get("channel_id") or "")
+                    if (
+                        msg_cid == target
+                        or msg.get("channel_name") == target
+                        or (resolved_id is not None and msg_cid == resolved_id)
+                    ):
+                        day_msgs.append({
                             "ts": msg.get("ts", ""),
                             "author": msg.get("author_name", ""),
                             "content": msg.get("content", "")[:500],
                             "is_bot": msg.get("is_bot", False),
                         })
-                except json.JSONDecodeError:
-                    continue
-            return {"messages": messages[-limit:], "channel": channel}
+                collected = day_msgs + collected
+                if len(collected) >= limit:
+                    break
+            return {"messages": collected[-limit:], "channel": channel}
 
     elif tool_name == "send":
         action = args.get("action")
