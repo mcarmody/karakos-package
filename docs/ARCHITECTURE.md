@@ -89,7 +89,7 @@ The Dockerfile declares no `EXPOSE`; `config/docker-compose.yml` publishes two:
 | Port | Published as | Notes |
 |---|---|---|
 | `${DASHBOARD_PORT:-3000}` | all host interfaces | The web UI |
-| `${AGENT_SERVER_PORT:-18791}` | `127.0.0.1` only | The HTTP API. It binds `0.0.0.0` *inside* the container; the port map is what keeps it off your LAN |
+| `${AGENT_SERVER_PORT:-18791}` | `127.0.0.1` only | The HTTP API. Inside the container it listens on `0.0.0.0` (`AGENT_SERVER_BIND` in `config/supervisord.conf`); the port map is what keeps it off your LAN. A native install listens on `127.0.0.1` unless `AGENT_SERVER_BIND` is set |
 
 Every agent-server endpoint requires `Authorization: Bearer $AGENT_SERVER_TOKEN`.
 
@@ -297,6 +297,7 @@ Replaces cron, with the container's full environment. The loop ticks every
 | Friction review | daily 03:30 | `lib/monitor_jobs/friction_review.py` (also `bin/friction-review.py`): groups `data/friction-log.jsonl` into recurring causes, writes `data/friction/YYYY-MM-DD.md` with a drafted issue and proposed fix per cause. Report only; filing upstream needs `--file --yes` from a person and only covers causes seen on two separate days. The `friction` tool (`recent`, `propose_issue`) lets an agent read the log and, after a yes through `ask_user`, file one cause |
 | Health monitor | daily 04:00 | `bin/health-monitor.py` |
 | Data purge | daily 04:30 | `bin/purge-data.py` |
+| Database backup | daily 02:30 | `bin/backup-databases.py`: online copy of every SQLite database under `data/` to `.karakos/backups/databases/YYYY-MM-DD/` (host-visible in Docker), newest 7 days kept. `--list`, `--restore DATE`. See [UPGRADING.md](UPGRADING.md#restoring-a-database-backup) |
 | Update check | Mondays 05:00 | `bin/check-updates.sh` — pokes signals on a new release |
 | Due one-off work | every tick | `bin/oneshot.py` |
 
@@ -738,7 +739,7 @@ residual.** The agent's MCP servers call back into the server with it, so any
 tool the agent runs can use it against every authenticated route (`/message`,
 `/agents/...`, `/outbox/...`, `/hive/...`, the graph routes). What limits it: the
 server is published on `127.0.0.1` only (`config/docker-compose.yml`), the
-monitor agent's deny list removes its shell, write and web tools, and the
+shared deny list in `config/claude-settings.json` blocks the Read and Edit tools on `.env` files and the Claude login files, the monitor agent's own deny list removes its shell, write and web tools, and the
 allowlist keeps every other secret out. A scoped per-shard credential, after
 which the token would be dropped from the subprocess environment, is a post-2.0
 item.

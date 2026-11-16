@@ -1,6 +1,8 @@
 # Environment and credentials
 config/.env
 .env
+# Local database backups (per install)
+.karakos/backups/
 
 # Python
 __pycache__/

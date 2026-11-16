@@ -10,6 +10,7 @@ Port: 18791 (configurable via AGENT_SERVER_PORT env var)
 
 import asyncio
 import errno
+import hmac
 import json
 import logging
 import os
@@ -85,6 +86,22 @@ OUTBOX_PATH = WORKSPACE_ROOT / "data" / "outbox" / "outbox.db"
 STREAM_LOG_MAX_BYTES = int(os.environ.get("STREAM_LOG_MAX_BYTES", str(16 * 1024 * 1024)))
 AGENT_SERVER_TOKEN = os.environ.get("AGENT_SERVER_TOKEN", "")
 OWNER_DISCORD_ID = os.environ.get("OWNER_DISCORD_ID", "0")
+
+
+def bind_host() -> str:
+    """Interface the HTTP API listens on: loopback unless AGENT_SERVER_BIND says otherwise.
+
+    The container sets 0.0.0.0 in config/supervisord.conf (its port map keeps the
+    host side on 127.0.0.1); a native install has no port map, so it stays on loopback.
+    """
+    return os.environ.get("AGENT_SERVER_BIND", "").strip() or "127.0.0.1"
+
+
+def _token_matches(auth_header: str) -> bool:
+    """True when `auth_header` is `Bearer <AGENT_SERVER_TOKEN>`, compared in constant time."""
+    if not auth_header.startswith("Bearer "):
+        return False
+    return hmac.compare_digest(auth_header[7:].encode("utf-8"), AGENT_SERVER_TOKEN.encode("utf-8"))
 
 # Attempts per chunk on the direct (non-durable) path: tool lines, notices, and
 # the fallback when the outbox store is unusable. Durable replies use the
@@ -2984,7 +3001,7 @@ async def handle_message(request):
     """POST /message - Queue message for agent"""
     # Check bearer token
     auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer ") or auth_header[7:] != AGENT_SERVER_TOKEN:
+    if not _token_matches(auth_header):
         return web.json_response({"error": "Unauthorized"}, status=401)
 
     data = await request.json()
@@ -3199,7 +3216,7 @@ def outbox_health() -> Dict[str, Any]:
 
 def _authorized(request) -> bool:
     auth_header = request.headers.get("Authorization", "")
-    return auth_header.startswith("Bearer ") and auth_header[7:] == AGENT_SERVER_TOKEN
+    return _token_matches(auth_header)
 
 
 async def handle_outbox_list(request):
@@ -3278,7 +3295,7 @@ async def handle_health(request):
     """
     # Check bearer token
     auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer ") or auth_header[7:] != AGENT_SERVER_TOKEN:
+    if not _token_matches(auth_header):
         return web.json_response({"error": "Unauthorized"}, status=401)
 
     agent_status = {}
@@ -3360,7 +3377,7 @@ async def handle_agents(request):
     """GET /agents - List agents"""
     # Check bearer token
     auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer ") or auth_header[7:] != AGENT_SERVER_TOKEN:
+    if not _token_matches(auth_header):
         return web.json_response({"error": "Unauthorized"}, status=401)
 
     agents_list = []
@@ -3493,7 +3510,7 @@ async def handle_agent_reset(request):
     """POST /agents/{name}/reset - Reset agent session"""
     # Check bearer token
     auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer ") or auth_header[7:] != AGENT_SERVER_TOKEN:
+    if not _token_matches(auth_header):
         return web.json_response({"error": "Unauthorized"}, status=401)
 
     targets = _resolve_request_targets(request)
@@ -3536,7 +3553,7 @@ async def handle_agent_reload(request):
     """POST /agents/{name}/reload - Bounce subprocess, preserve session."""
     global agent_config
     auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer ") or auth_header[7:] != AGENT_SERVER_TOKEN:
+    if not _token_matches(auth_header):
         return web.json_response({"error": "Unauthorized"}, status=401)
 
     targets = _resolve_request_targets(request)
@@ -3570,7 +3587,7 @@ async def handle_agent_reload(request):
 async def handle_agent_interrupt(request):
     """POST /agents/{name}/interrupt - Stop the current generation."""
     auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer ") or auth_header[7:] != AGENT_SERVER_TOKEN:
+    if not _token_matches(auth_header):
         return web.json_response({"error": "Unauthorized"}, status=401)
 
     targets = _resolve_request_targets(request)
@@ -3648,7 +3665,7 @@ async def handle_agent_effort(request):
     """POST /agents/{name}/effort {"level": low|medium|high|xhigh|max|default}.
     Agent-level: the owning agent of {name} (every shard) takes the level."""
     auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer ") or auth_header[7:] != AGENT_SERVER_TOKEN:
+    if not _token_matches(auth_header):
         return web.json_response({"error": "Unauthorized"}, status=401)
     targets = _resolve_request_targets(request)
     if not targets:
@@ -3691,7 +3708,7 @@ async def handle_agent_model(request):
     Agent-level like effort: every shard takes it, at once when idle, after the
     turn in flight otherwise. Allowed ids come from config/models.yaml."""
     auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer ") or auth_header[7:] != AGENT_SERVER_TOKEN:
+    if not _token_matches(auth_header):
         return web.json_response({"error": "Unauthorized"}, status=401)
     targets = _resolve_request_targets(request)
     if not targets:
@@ -3731,7 +3748,7 @@ async def handle_agent_pause(request):
     """POST /agents/{name}/pause - hold the queue; the turn in progress finishes.
     Body {"minutes": 1..1440|null, "by": str|null}."""
     auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer ") or auth_header[7:] != AGENT_SERVER_TOKEN:
+    if not _token_matches(auth_header):
         return web.json_response({"error": "Unauthorized"}, status=401)
     targets = _resolve_request_targets(request)
     if not targets:
@@ -3759,7 +3776,7 @@ async def handle_agent_pause(request):
 async def handle_agent_resume(request):
     """POST /agents/{name}/resume - release an operator pause and drain."""
     auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer ") or auth_header[7:] != AGENT_SERVER_TOKEN:
+    if not _token_matches(auth_header):
         return web.json_response({"error": "Unauthorized"}, status=401)
     targets = _resolve_request_targets(request)
     if not targets:
@@ -3771,7 +3788,7 @@ async def handle_agent_resume(request):
 async def handle_agent_kill(request):
     """POST /agents/{name}/kill - Kill the subprocess without respawning it."""
     auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer ") or auth_header[7:] != AGENT_SERVER_TOKEN:
+    if not _token_matches(auth_header):
         return web.json_response({"error": "Unauthorized"}, status=401)
 
     targets = _resolve_request_targets(request)
@@ -3788,7 +3805,7 @@ async def handle_agent_kill(request):
 async def handle_agent_flush(request):
     """POST /agents/{name}/flush - Drop the agent's pending message queue."""
     auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer ") or auth_header[7:] != AGENT_SERVER_TOKEN:
+    if not _token_matches(auth_header):
         return web.json_response({"error": "Unauthorized"}, status=401)
 
     targets = _resolve_request_targets(request)
@@ -3820,7 +3837,7 @@ async def handle_agent_queue(request):
     message would make an agent mid-turn look idle.
     """
     auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer ") or auth_header[7:] != AGENT_SERVER_TOKEN:
+    if not _token_matches(auth_header):
         return web.json_response({"error": "Unauthorized"}, status=401)
 
     agent = request.match_info.get("name")
@@ -3881,7 +3898,7 @@ async def handle_agent_queue_delete(request):
     record without stopping the work. Interrupt is the tool for that.
     """
     auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer ") or auth_header[7:] != AGENT_SERVER_TOKEN:
+    if not _token_matches(auth_header):
         return web.json_response({"error": "Unauthorized"}, status=401)
 
     agent = request.match_info.get("name")
@@ -3934,7 +3951,7 @@ async def handle_agent_register(request):
     if the agent is already running.
     """
     auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer ") or auth_header[7:] != AGENT_SERVER_TOKEN:
+    if not _token_matches(auth_header):
         return web.json_response({"error": "Unauthorized"}, status=401)
 
     agent = request.match_info.get("name")
@@ -3992,7 +4009,7 @@ async def handle_cost(request):
     """POST /cost - Record external cost event"""
     # Check bearer token
     auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer ") or auth_header[7:] != AGENT_SERVER_TOKEN:
+    if not _token_matches(auth_header):
         return web.json_response({"error": "Unauthorized"}, status=401)
 
     data = await request.json()
@@ -4023,7 +4040,7 @@ async def handle_usage(request):
     actually stops a turn mid-sentence.
     """
     auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer ") or auth_header[7:] != AGENT_SERVER_TOKEN:
+    if not _token_matches(auth_header):
         return web.json_response({"error": "Unauthorized"}, status=401)
 
     report = await usage_gate.usage_report(STATE)
@@ -4077,7 +4094,7 @@ async def handle_cost_get_all(request):
     "Unable to fetch cost data" on every install.
     """
     auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer ") or auth_header[7:] != AGENT_SERVER_TOKEN:
+    if not _token_matches(auth_header):
         return web.json_response({"error": "Unauthorized"}, status=401)
 
     daily: Dict[str, float] = {}
@@ -4124,7 +4141,7 @@ async def handle_cost_get(request):
     """GET /cost/{agent} - Get cost summary"""
     # Check bearer token
     auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer ") or auth_header[7:] != AGENT_SERVER_TOKEN:
+    if not _token_matches(auth_header):
         return web.json_response({"error": "Unauthorized"}, status=401)
 
     agent = request.match_info.get("agent")
@@ -4165,7 +4182,7 @@ async def handle_cost_conversations(request):
     to callers as "unknown" rather than silently dropped.
     """
     auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer ") or auth_header[7:] != AGENT_SERVER_TOKEN:
+    if not _token_matches(auth_header):
         return web.json_response({"error": "Unauthorized"}, status=401)
 
     agent_filter = request.rel_url.query.get("agent")
@@ -5046,7 +5063,7 @@ async def do_reset(shard):
 
 def _bearer_ok(request) -> bool:
     auth_header = request.headers.get("Authorization", "")
-    return auth_header.startswith("Bearer ") and auth_header[7:] == AGENT_SERVER_TOKEN
+    return _token_matches(auth_header)
 
 
 async def handle_ask_create(request):
@@ -5449,7 +5466,7 @@ def main():
     require_stamp(WORKSPACE_ROOT / "data")
     # Signal handlers will be registered after event loop starts (in startup)
     # For now, just set flag to handle in asyncio context
-    web.run_app(create_app(), host="0.0.0.0", port=PORT, access_log=None)
+    web.run_app(create_app(), host=bind_host(), port=PORT, access_log=None)
 
 if __name__ == "__main__":
     main()

@@ -425,6 +425,7 @@ want to edit:
 | `DASHBOARD_USER` / `DASHBOARD_PASSWORD` | Dashboard login, user defaults to `admin` |
 | `SESSION_SECRET` | HMAC key for the dashboard session cookie |
 | `AGENT_SERVER_PORT` | API port, default 18791, loopback-only on the host |
+| `AGENT_SERVER_BIND` | Interface the API listens on, default `127.0.0.1`. The container sets `0.0.0.0` itself in `config/supervisord.conf`; do not set it in `config/.env` for a Docker install. On a native install set it only to put the API behind a firewalled private network or a TLS proxy: the API speaks plain HTTP and one bearer token guards it |
 | `WORKSPACE_ROOT` | `/workspace` in the container |
 | `KARAKOS_VERSION` | Image tag to run, default `latest` |
 | `TZ` | Container timezone — the scheduler's clock times are in it |
@@ -433,6 +434,7 @@ want to edit:
 | `KARAKOS_ENV_PASSTHROUGH` | `1` lets agent subprocesses inherit the server environment (debugging only) |
 | `KARAKOS_SKIP_STAMP_CHECK` | `1` skips the schema-stamp check (tests only) |
 | `KARAKOS_HEARTBEAT_DIR` | Directory of touch-file heartbeats (mtime is the last success); default `~/.karakos/heartbeats`. |
+| `KARAKOS_BACKUP_DIR` / `KARAKOS_BACKUP_KEEP` | Where `bin/backup-databases.py` writes (default `<install>/.karakos/backups/databases`) and how many dated copies it keeps (default 7) |
 | `KARAKOS_TRANSCRIPT_GLOBS` | Extra friction-sensor sources: `os.pathsep`-separated globs of directories holding Claude Code `*.jsonl` transcripts. Unset by default |
 | `KARAKOS_COOKIE_SECURE` / `SESSION_MAX_AGE_SECONDS` | Read by the pinned dashboard, not by this repository: `Secure` session cookie and session lifetime ([UPGRADING.md](UPGRADING.md#auth-and-env-changes)) |
 
