@@ -62,6 +62,12 @@ Units set `KARAKOS_HOME` and `WORKSPACE_ROOT` to the checkout and read
   and a port sweep before start stop a restart crash-looping on `EADDRINUSE`.
 - **No PTY needed.** The agent server talks to the Claude CLI over stdin/stdout
   pipes (stream-json), not a terminal.
+- **Network exposure.** The agent server listens on `127.0.0.1` only (`AGENT_SERVER_BIND`, default
+  loopback). Leave it that way. The API starts agent sessions that can run shell commands and is
+  guarded by one bearer token over plain HTTP, so if you must reach it from another machine, set
+  `AGENT_SERVER_BIND` to a private-network address and firewall the port to that network, or front it
+  with a TLS proxy. The dashboard unit (`next start`) listens on all interfaces: firewall its port
+  (`DASHBOARD_PORT`) to the machines that should reach it.
 - **Logs** go to the journal, one `SyslogIdentifier` per program
   (`journalctl --user -u karakos-relay`).
 - **Reload-on-commit.** Do not port auto-restart-on-commit as is. The agent server

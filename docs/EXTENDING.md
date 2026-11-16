@@ -425,6 +425,7 @@ want to edit:
 | `DASHBOARD_USER` / `DASHBOARD_PASSWORD` | Dashboard login, user defaults to `admin` |
 | `SESSION_SECRET` | HMAC key for the dashboard session cookie |
 | `AGENT_SERVER_PORT` | API port, default 18791, loopback-only on the host |
+| `AGENT_SERVER_BIND` | Interface the API listens on, default `127.0.0.1`. The container sets `0.0.0.0` itself in `config/supervisord.conf`; do not set it in `config/.env` for a Docker install. On a native install set it only to put the API behind a firewalled private network or a TLS proxy: the API speaks plain HTTP and one bearer token guards it |
 | `WORKSPACE_ROOT` | `/workspace` in the container |
 | `KARAKOS_VERSION` | Image tag to run, default `latest` |
 | `TZ` | Container timezone — the scheduler's clock times are in it |
