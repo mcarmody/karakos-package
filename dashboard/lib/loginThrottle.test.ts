@@ -37,7 +37,7 @@ describe("loginThrottle", () => {
   });
 
   it("reads the client address from forwarding headers", () => {
-    expect(clientIp(new Headers({ "x-forwarded-for": "1.2.3.4, 10.0.0.1" }))).toBe("1.2.3.4");
+    expect(clientIp(new Headers({ "x-forwarded-for": "1.2.3.4, 203.0.113.9" }))).toBe("1.2.3.4");
     expect(clientIp(new Headers({ "x-real-ip": "5.6.7.8" }))).toBe("5.6.7.8");
     expect(clientIp(new Headers())).toBe("local");
   });
