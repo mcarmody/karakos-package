@@ -437,7 +437,8 @@ def test_steering_into_one_shard_leaves_others_alone(harness):
 def test_agent_level_disable_is_per_agent(harness):
     h = harness(agents={"a": {}, "b": {"steering": {"enabled": False}}},
                 shards=SHARDS)
-    h.script(rules=[{"match": "A-msg", "step": {"text": "r-A", "delay_ms": 800}}])
+    # A 3 s model delay keeps B-msg queued even if the runner resumes this test late.
+    h.script(rules=[{"match": "A-msg", "step": {"text": "r-A", "delay_ms": 3000}}])
 
     async def scenario():
         async with h:
