@@ -738,7 +738,7 @@ residual.** The agent's MCP servers call back into the server with it, so any
 tool the agent runs can use it against every authenticated route (`/message`,
 `/agents/...`, `/outbox/...`, `/hive/...`, the graph routes). What limits it: the
 server is published on `127.0.0.1` only (`config/docker-compose.yml`), the
-monitor agent's deny list removes its shell, write and web tools, and the
+shared deny list in `config/claude-settings.json` blocks the Read and Edit tools on `.env` files and the Claude login files, the monitor agent's own deny list removes its shell, write and web tools, and the
 allowlist keeps every other secret out. A scoped per-shard credential, after
 which the token would be dropped from the subprocess environment, is a post-2.0
 item.
