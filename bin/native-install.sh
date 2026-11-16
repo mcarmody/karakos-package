@@ -20,9 +20,13 @@ die() { echo "native-install: $*" >&2; exit 1; }
 
 # --- prerequisites ---
 PY="${KARAKOS_PYTHON:-python3}"
-command -v "$PY" >/dev/null || die "python3 not found (3.11 or newer needed)"
-"$PY" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' \
-    || die "$("$PY" --version) is too old; 3.11 or newer is needed (set KARAKOS_PYTHON to another interpreter)"
+command -v "$PY" >/dev/null || die "python3 not found (3.11 or 3.12 needed)"
+PYVER=$("$PY" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null) \
+    || die "could not run $PY to read its version"
+case "$PYVER" in
+    3.11|3.12) ;;
+    *) die "Python $PYVER is not supported; native mode needs Python 3.11 or 3.12 (a pinned dependency, fastembed 0.3.6, does not support 3.13). Install 3.12 and set KARAKOS_PYTHON=/path/to/python3.12" ;;
+esac
 command -v git >/dev/null || die "git not found"
 command -v claude >/dev/null || die "the Claude CLI is not on PATH (npm install -g @anthropic-ai/claude-code)"
 if [ "$SKIP_DASH" = 0 ]; then

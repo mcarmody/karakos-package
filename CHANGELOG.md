@@ -36,6 +36,7 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - `bin/native-upgrade.sh` no longer refuses to run because `.karakos/config.json` is modified. Setup rewrites that tracked file with the install's own name and owner, so the check failed on every native upgrade. Other tracked changes still block it.
+- `bin/native-install.sh` now accepts only Python 3.11 and 3.12 and says why. It accepted "3.11 or newer", but a pinned dependency (fastembed 0.3.6) does not support 3.13, so a 3.13 host got a long pip failure after the venv was created. Docker installs are unaffected.
 
 ## [2.5.0] - 2026-10-29
 
