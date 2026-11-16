@@ -59,6 +59,39 @@ def test_install_without_config_fails_before_touching_anything(tmp_path):
     assert not (ws / ".venv").exists()
 
 
+def _fake_python(tmp_path, version):
+    fake = tmp_path / "fakebin" / f"python-{version}"
+    fake.parent.mkdir(exist_ok=True)
+    fake.write_text(f'#!/bin/sh\necho "{version}"\n')
+    fake.chmod(0o755)
+    return fake
+
+
+def _run_install(ws, python):
+    return subprocess.run(["bash", str(ws / "bin" / "native-install.sh"), "--skip-dashboard"],
+                          capture_output=True, text=True,
+                          env={"PATH": "/usr/bin:/bin", "KARAKOS_HOME": str(ws), "HOME": str(ws),
+                               "KARAKOS_PYTHON": str(python)})
+
+
+@pytest.mark.parametrize("version", ["3.13", "3.10", "3.14"])
+def test_unsupported_python_stops_with_a_clear_message(tmp_path, version):
+    ws = _ws(tmp_path)
+    r = _run_install(ws, _fake_python(tmp_path, version))
+    assert r.returncode == 1
+    assert f"Python {version} is not supported" in r.stderr
+    assert "3.11 or 3.12" in r.stderr and "KARAKOS_PYTHON" in r.stderr
+    assert not (ws / ".venv").exists()
+
+
+@pytest.mark.parametrize("version", ["3.11", "3.12"])
+def test_supported_python_passes_the_version_check(tmp_path, version):
+    ws = _ws(tmp_path)
+    r = _run_install(ws, _fake_python(tmp_path, version))
+    assert "is not supported" not in r.stderr
+    assert not (ws / ".venv").exists()
+
+
 def test_upgrade_refuses_outside_a_git_checkout(tmp_path):
     ws = _ws(tmp_path)
     r = subprocess.run(["bash", str(ws / "bin" / "native-upgrade.sh")], capture_output=True, text=True,
