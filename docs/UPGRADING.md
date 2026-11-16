@@ -333,6 +333,9 @@ read by that code, not by the Python side; the authoritative table is in
 - **Plain-http installs now log in.** The cookie is `Secure` only when
   `KARAKOS_COOKIE_SECURE` is `1`, `true` or `yes`. Leave it unset for
   `http://localhost` and LAN installs; set it behind an HTTPS proxy or tunnel.
+- **The dashboard is published on `127.0.0.1` by default.** An install that was reached from another
+  device now needs `DASHBOARD_BIND=0.0.0.0` in `config/.env` (then `docker compose ... up -d`). Failed
+  logins are throttled per address (5 in 15 minutes) with a 429 and `Retry-After`.
 - **Session lifetime** is 30 days unless `SESSION_MAX_AGE_SECONDS` is set
   (`86400` restores the old 24 hours). The cookie is `SameSite=Lax`.
 - **Passkeys are not in the package profile.**

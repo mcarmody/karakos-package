@@ -88,7 +88,7 @@ The Dockerfile declares no `EXPOSE`; `config/docker-compose.yml` publishes two:
 
 | Port | Published as | Notes |
 |---|---|---|
-| `${DASHBOARD_PORT:-3000}` | all host interfaces | The web UI |
+| `${DASHBOARD_PORT:-3000}` | `127.0.0.1` only (`DASHBOARD_BIND` opens it) | The web UI. Plain HTTP: set `DASHBOARD_BIND=0.0.0.0` in `config/.env` only behind an HTTPS proxy or on a network you trust |
 | `${AGENT_SERVER_PORT:-18791}` | `127.0.0.1` only | The HTTP API. Inside the container it listens on `0.0.0.0` (`AGENT_SERVER_BIND` in `config/supervisord.conf`); the port map is what keeps it off your LAN. A native install listens on `127.0.0.1` unless `AGENT_SERVER_BIND` is set |
 
 Every agent-server endpoint requires `Authorization: Bearer $AGENT_SERVER_TOKEN`.

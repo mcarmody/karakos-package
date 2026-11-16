@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { generateSessionToken, sessionCookieOptions, homeForUser } from "@/lib/api";
+import { clientIp, recordFailure, recordSuccess, retryAfterSeconds } from "@/lib/loginThrottle";
 
 const DASHBOARD_USER = process.env.DASHBOARD_USER || "admin";
 const DASHBOARD_PASSWORD = process.env.DASHBOARD_PASSWORD || "";
@@ -46,6 +47,14 @@ function authenticate(username: string, password: string): string | null {
 }
 
 export async function POST(request: NextRequest) {
+  const ip = clientIp(request.headers);
+  const wait = retryAfterSeconds(ip);
+  if (wait > 0) {
+    return NextResponse.json(
+      { error: "Too many login attempts. Try again later." },
+      { status: 429, headers: { "Retry-After": String(wait) } }
+    );
+  }
   try {
     const body = await request.json();
     const { username, password } = body;
@@ -59,6 +68,7 @@ export async function POST(request: NextRequest) {
 
     const resolved = authenticate(username, password);
     if (resolved) {
+      recordSuccess(ip);
       // The server owns the confined-account list; the client just follows
       // `home` rather than keeping its own copy that can drift.
       const home = homeForUser(resolved);
@@ -73,6 +83,7 @@ export async function POST(request: NextRequest) {
       return response;
     }
 
+    recordFailure(ip);
     return NextResponse.json(
       { error: "Invalid credentials" },
       { status: 401 }

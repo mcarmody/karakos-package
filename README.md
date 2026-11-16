@@ -43,7 +43,7 @@ share a workspace on disk.
         You                          You
      (Discord)                    (browser)
          │                            │
-         │  message                   │  https :3000
+         │  message                   │   http :3000
          ▼                            ▼
   ┌─────────────┐              ┌─────────────┐
   │   relay.py  │              │  dashboard  │
@@ -107,6 +107,11 @@ local build) and starting the container.
 
 When it's done, open **http://localhost:3000** and log in as `admin` with the
 password the wizard printed.
+
+The dashboard listens on `127.0.0.1` only and serves plain HTTP. To reach it from another device, set
+`DASHBOARD_BIND=0.0.0.0` in `config/.env` and restart, and put an HTTPS proxy in front of it
+(set `KARAKOS_COOKIE_SECURE=1` when you do). Failed logins are throttled: five wrong passwords from one
+address lock that address out for up to 15 minutes.
 
 Prefer to drive it yourself, or already have the repo?
 

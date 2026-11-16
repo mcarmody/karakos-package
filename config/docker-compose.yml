@@ -33,7 +33,9 @@ services:
       # Map host:port -> container:port using the same env-defined value on
       # both sides. The agent-server and dashboard read these env vars to
       # decide what port to bind, so inside and outside must agree.
-      - "${DASHBOARD_PORT:-3000}:${DASHBOARD_PORT:-3000}"
+      # The dashboard is published on 127.0.0.1 unless DASHBOARD_BIND (config/.env)
+      # says otherwise: it serves plain HTTP, so opening it to a network is opt-in.
+      - "${DASHBOARD_BIND:-127.0.0.1}:${DASHBOARD_PORT:-3000}:${DASHBOARD_PORT:-3000}"
       - "127.0.0.1:${AGENT_SERVER_PORT:-18791}:${AGENT_SERVER_PORT:-18791}"
     restart: unless-stopped
     environment:
