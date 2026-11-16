@@ -297,6 +297,7 @@ Replaces cron, with the container's full environment. The loop ticks every
 | Friction review | daily 03:30 | `lib/monitor_jobs/friction_review.py` (also `bin/friction-review.py`): groups `data/friction-log.jsonl` into recurring causes, writes `data/friction/YYYY-MM-DD.md` with a drafted issue and proposed fix per cause. Report only; filing upstream needs `--file --yes` from a person and only covers causes seen on two separate days. The `friction` tool (`recent`, `propose_issue`) lets an agent read the log and, after a yes through `ask_user`, file one cause |
 | Health monitor | daily 04:00 | `bin/health-monitor.py` |
 | Data purge | daily 04:30 | `bin/purge-data.py` |
+| Database backup | daily 02:30 | `bin/backup-databases.py`: online copy of every SQLite database under `data/` to `.karakos/backups/databases/YYYY-MM-DD/` (host-visible in Docker), newest 7 days kept. `--list`, `--restore DATE`. See [UPGRADING.md](UPGRADING.md#restoring-a-database-backup) |
 | Update check | Mondays 05:00 | `bin/check-updates.sh` — pokes signals on a new release |
 | Due one-off work | every tick | `bin/oneshot.py` |
 

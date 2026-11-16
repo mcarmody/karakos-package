@@ -68,6 +68,7 @@ BUILTIN = [
     Job("cli-watchdog", "job", Every(3600), "scheduler:run_cli_upgrade_watchdog", 2 * H),
     Job("flush-deferred", "job", Every(300), "scheduler:run_flush_deferred_messages", 900),
     Job("purge", "job", Daily("04:30"), "scheduler:purge_old_data", 48 * H),
+    Job("db-backup", "job", Daily("02:30"), ["python3", "bin/backup-databases.py"], 48 * H),
     Job("update-check", "job", Weekly("mon", "05:00"), "scheduler:check_updates", 14 * 24 * H),
     Job("monitor-tick", "job", Every(60), "monitor_tick:run", 300),
     Job("friction-sensor", "job", Every(3600, 600),
