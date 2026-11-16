@@ -373,6 +373,15 @@ def test_release_build_push_needs_the_gate():
     assert "gate" in ([needs] if isinstance(needs, str) else needs)
 
 
+def test_release_publishes_patch_tag_and_creates_the_github_release():
+    text = (WORKFLOWS / "release.yml").read_text()
+    assert "type=semver,pattern=v{{version}}" in text
+    jobs = load("release.yml")["jobs"]
+    assert "github-release" not in jobs, "releases are created by the maintainer, not by a workflow"
+    assert "contents: write" not in text
+    assert jobs["build-push"]["outputs"]["version"] == "${{ steps.version.outputs.value }}"
+
+
 def test_ci_real_cli_job_is_gated_and_there_is_one_schedule():
     ci = load("ci.yml")
     cond = ci["jobs"]["real-cli-smoke"]["if"]

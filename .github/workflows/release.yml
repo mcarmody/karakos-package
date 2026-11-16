@@ -31,6 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       image_digest: ${{ steps.build.outputs.digest }}
+      version: ${{ steps.version.outputs.value }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -88,6 +89,7 @@ jobs:
           images: ghcr.io/mcarmody/karakos
           tags: |
             type=semver,pattern=v{{major}}.{{minor}},value=${{ steps.version.outputs.value }}
+            type=semver,pattern=v{{version}},value=${{ steps.version.outputs.value }}
             type=semver,pattern=v{{major}},value=${{ steps.version.outputs.value }}
             type=raw,value=latest
 
