@@ -181,6 +181,24 @@ if ! step "rollback tag" docker image tag "$IMAGE:$version_from" "$IMAGE:rollbac
     finish failed "could not tag $IMAGE:$version_from as rollback; nothing was changed"
     exit 0
 fi
+
+# A request for vX.Y.Z needs a published patch tag. Releases before 2.5.0 were
+# only published as vX.Y and vX, so fall back to vX.Y; if neither exists (or the
+# registry cannot be reached) stop before anything is changed.
+if [[ "$version" != latest ]]; then
+    if ! step "check image tag" docker manifest inspect "$IMAGE:$version"; then
+        minor="${version%.*}"
+        if [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+           && step "check image tag" docker manifest inspect "$IMAGE:$minor"; then
+            log "image tag $version is not published; using $minor"
+            version="$minor"
+        else
+            finish failed "image tag $IMAGE:$version is not published (or the registry is unreachable); nothing was changed"
+            exit 0
+        fi
+    fi
+fi
+
 if ! step "git pull" git pull --ff-only origin main; then
     finish failed "git pull --ff-only failed (dirty tree or non-fast-forward); nothing was changed"
     exit 0

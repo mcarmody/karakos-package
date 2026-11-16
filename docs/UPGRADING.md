@@ -546,6 +546,8 @@ bind-mounted `.karakos/` directory. It refuses (exit 3) while a request is
 pending or running, and exits 4 with a warning if the host agent has not run in
 the last 10 minutes (the request stays queued).
 
+Images are published as `vX.Y.Z`, `vX.Y`, `vX` and `latest` from 2.5.0 on; earlier releases exist only as `vX.Y` and `vX`. A `vX.Y.Z` request whose patch tag is not published is retried as `vX.Y`; if neither exists the upgrade fails before anything is changed and `status` says the tag is not published.
+
 Each minute the host agent touches `.karakos/upgrade/host-agent.seen`, takes a
 lock, and, if a request is pending:
 

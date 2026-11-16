@@ -283,6 +283,7 @@ class Host:
             "#!/usr/bin/env bash\n" + record.replace("NAME", "docker")
             + '[[ "$1" == compose && " $* " == *" ps "* ]] && { cat "' + str(self.ps) + '"; exit 0; }\n'
             + '[[ "${STUB_FAIL:-}" == "docker image" && "$1" == image ]] && exit 1\n'
+            + '[[ "$1" == manifest && " ${STUB_MISSING_TAGS:-} " == *" $3 "* ]] && exit 1\n'
             + "exit 0\n",
         )
 
@@ -371,6 +372,31 @@ def test_success_pins_version_and_writes_done(host):
     assert cs.index("git pull --ff-only origin main") < cs.index("make pull")
     assert "git pull --ff-only origin main" in (host.upgrade / "host.log").read_text()
     assert (host.upgrade / "host.log").exists()
+
+
+def test_patch_request_falls_back_to_minor_tag_when_patch_tag_is_missing(host):
+    host.request("v2.4.0")
+    r = host.run(STUB_MISSING_TAGS="ghcr.io/mcarmody/karakos:v2.4.0")
+    assert r.returncode == 0, r.stderr
+    st = host.status
+    assert st["state"] == "done"
+    assert st["version_to"] == "v2.4"
+    assert host.pin == ["KARAKOS_VERSION=v2.4"]
+    assert "docker manifest inspect ghcr.io/mcarmody/karakos:v2.4" in host.all_calls()
+    assert "using v2.4" in (host.upgrade / "host.log").read_text()
+
+
+def test_unpublished_tag_fails_before_anything_is_changed(host):
+    host.request("v2.9.0")
+    r = host.run(STUB_MISSING_TAGS="ghcr.io/mcarmody/karakos:v2.9.0 ghcr.io/mcarmody/karakos:v2.9")
+    assert r.returncode == 0, r.stderr
+    st = host.status
+    assert st["state"] == "failed"
+    assert "not published" in st["detail"]
+    assert host.pin == ["KARAKOS_VERSION=v2.4.0"]
+    assert host.make_calls() == []
+    assert "git pull --ff-only origin main" not in host.all_calls()
+    assert not (host.upgrade / "request.json").exists()
 
 
 def test_pin_is_appended_when_absent(host):
