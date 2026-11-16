@@ -11,6 +11,7 @@ bin/wait-for.sh (or breaking its argument handling) fails every test here
 with a nonzero/FileNotFoundError, not a mock mismatch.
 """
 
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -20,14 +21,17 @@ WAIT_FOR = PACKAGE_ROOT / "bin" / "wait-for.sh"
 
 MET = 0
 TIMED_OUT = 124
+USAGE = 2
+DUPLICATE = 3
 
 
-def run_wait(args, timeout_s=15):
+def run_wait(args, timeout_s=15, env=None):
     return subprocess.run(
         [str(WAIT_FOR), *args],
         capture_output=True,
         text=True,
         timeout=timeout_s,
+        env={**os.environ, **(env or {})},
     )
 
 
@@ -114,3 +118,66 @@ def test_pgrep_guard_still_sees_a_real_unrelated_process():
     finally:
         helper.kill()
         helper.wait(timeout=10)
+
+
+def test_default_timeout_is_inside_the_bash_tool_limit():
+    text = WAIT_FOR.read_text()
+    assert "\nTIMEOUT=105\n" in text
+    assert "TIMEOUT=300" not in text
+
+
+def test_timeout_above_the_cap_is_refused_without_long():
+    start = time.time()
+    result = run_wait(["test 1 -eq 2", "--timeout", "120"])
+    assert result.returncode == USAGE
+    assert "--long" in result.stderr
+    assert time.time() - start < 5
+
+
+def test_long_flag_accepts_a_timeout_above_the_cap():
+    result = run_wait(["test 1 -eq 1", "--timeout", "600", "--long"])
+    assert result.returncode == MET
+
+
+def test_options_may_come_before_the_condition():
+    result = run_wait(["--timeout", "5", "--interval", "1", "test 1 -eq 1"])
+    assert result.returncode == MET
+
+
+def test_help_exits_zero_and_does_not_run_it_as_a_condition():
+    result = run_wait(["--help"])
+    assert result.returncode == MET
+    assert "usage: wait-for.sh" in result.stdout
+
+
+def test_unknown_option_is_a_usage_error():
+    result = run_wait(["test 1 -eq 1", "--nonsense"])
+    assert result.returncode == USAGE
+
+
+def test_identical_wait_already_running_is_refused(tmp_path):
+    env = {"XDG_RUNTIME_DIR": str(tmp_path)}
+    condition = f"test -f {tmp_path}/never-created"
+    first = subprocess.Popen(
+        [str(WAIT_FOR), condition, "--timeout", "30", "--interval", "1"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env={**os.environ, **env},
+    )
+    try:
+        time.sleep(1.5)
+        second = run_wait([condition, "--timeout", "5"], env=env)
+        assert second.returncode == DUPLICATE
+        assert "already running" in second.stderr
+        allowed = run_wait([condition, "--timeout", "1", "--interval", "1", "--allow-duplicate"], env=env)
+        assert allowed.returncode == TIMED_OUT
+    finally:
+        first.terminate()
+        first.wait(timeout=10)
+
+
+def test_printed_condition_is_redacted():
+    result = run_wait(["test 1 -eq 1 # API_TOKEN=abcdef123456"])
+    assert result.returncode == MET
+    assert "abcdef123456" not in result.stdout
+    assert "<redacted>" in result.stdout
