@@ -377,11 +377,8 @@ def test_release_publishes_patch_tag_and_creates_the_github_release():
     text = (WORKFLOWS / "release.yml").read_text()
     assert "type=semver,pattern=v{{version}}" in text
     jobs = load("release.yml")["jobs"]
-    rel = jobs["github-release"]
-    needs = rel["needs"]
-    assert "build-push" in ([needs] if isinstance(needs, str) else needs)
-    assert rel["permissions"] == {"contents": "write"}
-    assert "gh release create" in json.dumps(rel)
+    assert "github-release" not in jobs, "releases are created by the maintainer, not by a workflow"
+    assert "contents: write" not in text
     assert jobs["build-push"]["outputs"]["version"] == "${{ steps.version.outputs.value }}"
 
 
