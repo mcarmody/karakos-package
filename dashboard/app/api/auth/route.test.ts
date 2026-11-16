@@ -61,4 +61,38 @@ describe("POST /api/auth", () => {
       expect(res.headers.get("set-cookie")).toBeNull();
     }
   });
+
+  const postFrom = (ip: string, body: unknown) =>
+    new NextRequest("http://localhost/api/auth", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-forwarded-for": ip },
+      body: JSON.stringify(body),
+    });
+
+  it("answers 429 with Retry-After after five wrong passwords, even for the right one", async () => {
+    const { POST } = await load(base);
+    for (let i = 0; i < 5; i++) {
+      expect((await POST(postFrom("9.9.9.9", { username: "admin", password: "nope" }))).status).toBe(401);
+    }
+    const blocked = await POST(postFrom("9.9.9.9", { username: "admin", password: "pw" }));
+    expect(blocked.status).toBe(429);
+    expect(Number(blocked.headers.get("retry-after"))).toBeGreaterThan(0);
+    expect(blocked.headers.get("set-cookie")).toBeNull();
+  });
+
+  it("does not throttle a different client address", async () => {
+    const { POST } = await load(base);
+    for (let i = 0; i < 5; i++) await POST(postFrom("9.9.9.9", { username: "admin", password: "nope" }));
+    const other = await POST(postFrom("8.8.8.8", { username: "admin", password: "pw" }));
+    expect(other.status).toBe(200);
+  });
+
+  it("a good login resets the failure count", async () => {
+    const { POST } = await load(base);
+    for (let i = 0; i < 4; i++) await POST(postFrom("7.7.7.7", { username: "admin", password: "nope" }));
+    expect((await POST(postFrom("7.7.7.7", { username: "admin", password: "pw" }))).status).toBe(200);
+    for (let i = 0; i < 4; i++) {
+      expect((await POST(postFrom("7.7.7.7", { username: "admin", password: "nope" }))).status).toBe(401);
+    }
+  });
 });
