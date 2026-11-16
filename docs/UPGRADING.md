@@ -425,6 +425,23 @@ per-shard credential is a post-2.0 item. See
   available; `reset_mode: compact` is inert until `/compact` over stream-json is
   verified against the real CLI, so leave it at `reset`.
 
+### Restoring a database backup
+
+The scheduler's `db-backup` job copies every SQLite database under `data/` each night at 02:30 into `.karakos/backups/databases/YYYY-MM-DD/` (on the host, next to `config/`), and keeps the newest 7 days. Each dated directory has the databases at their `data/`-relative paths and a `manifest.json`. The job's last run shows in the monitor like any other job. `KARAKOS_BACKUP_DIR` and `KARAKOS_BACKUP_KEEP` change the location and the count.
+
+List what exists, then restore a day with the stack stopped (a restore overwrites the live database files and removes stale `-wal` and `-shm` files):
+
+```bash
+make down
+docker compose -f config/docker-compose.yml --env-file config/.env run --rm --no-deps --entrypoint python3 karakos bin/backup-databases.py --list
+docker compose -f config/docker-compose.yml --env-file config/.env run --rm --no-deps --entrypoint python3 karakos bin/backup-databases.py --restore 2026-11-14
+make up
+```
+
+A native install runs the script directly after stopping the units: `systemctl --user stop karakos.target`, then `python3 bin/backup-databases.py --restore 2026-11-14`, then `systemctl --user start karakos.target`.
+
+These copies sit on the same machine as the install, so they protect against a bad upgrade, a deleted volume and a corrupted database, not against losing the disk. For a copy off the machine, point `KARAKOS_BACKUP_DIR` at a mounted external disk or network share, or copy `.karakos/backups/databases/` elsewhere on a schedule you choose (for example `rsync -a .karakos/backups/databases/ user@other-host:karakos-backups/` from the host's crontab). Nothing is sent off the machine by default.
+
 ## Rolling back
 
 Restore from the migrator's backup. Memory has no downgrade, so this is the only
