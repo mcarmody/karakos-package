@@ -36,6 +36,7 @@ big integration test:
 import asyncio
 import json
 import logging
+import re
 import shutil
 import subprocess
 
@@ -58,11 +59,24 @@ def test_settings_file_has_permissions_and_env_keys():
     assert "allow" in config["permissions"]
     assert "deny" in config["permissions"]
     assert "env" in config
-    # Shipped defaults are no-op — an install with no policy set behaves
-    # exactly as before.
     assert config["permissions"]["allow"] == []
-    assert config["permissions"]["deny"] == []
     assert config["env"] == {}
+
+
+def test_default_deny_list_protects_env_files_and_the_claude_login():
+    deny = json.loads(SETTINGS_PATH.read_text())["permissions"]["deny"]
+    assert len(deny) == len(set(deny)), "duplicate deny rules"
+    for rule in ("Read(**/.env)", "Edit(**/.env)", "Read(~/.claude/.credentials.json)",
+                 "Bash(cat *.env*)", "Bash(printenv:*)"):
+        assert rule in deny, rule
+    for rule in deny:
+        assert re.fullmatch(r"(Read|Edit|Bash)\(.+\)", rule), rule
+
+
+def test_default_deny_list_leaves_the_web_and_ordinary_shell_alone():
+    deny = json.loads(SETTINGS_PATH.read_text())["permissions"]["deny"]
+    for tool in ("WebFetch", "WebSearch", "Bash", "Bash(curl:*)", "Bash(wget:*)", "Read", "Write"):
+        assert tool not in deny, tool
 
 
 # ---------------------------------------------------------------------------

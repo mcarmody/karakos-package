@@ -28,6 +28,7 @@ orchestration — is the part this package is.
 - [Talking to it](#talking-to-it)
 - [What ships in the box](#what-ships-in-the-box)
 - [Requirements and cost](#requirements-and-cost)
+- [Security model](#security-model)
 - [Documentation](#documentation)
 
 ---
@@ -248,6 +249,21 @@ own skill convention, not Claude Code's `SKILL.md` frontmatter feature.
 are there so a surprise stays small.
 
 A Raspberry Pi 4 or 5, a mini PC, or a small VM all work.
+
+---
+
+## Security model
+
+Read this before you point the bot at a channel other people can write in.
+
+- **Agents run without permission prompts.** Each agent is a headless `claude -p` session started with `--dangerously-skip-permissions`; nobody is there to click "allow". What an agent may not do is set by `permissions.deny` in `config/claude-settings.json`.
+- **The default deny list is a guard rail, not a wall.** It stops the Read and Edit tools on `.env` files and on the Claude login files, and the common shell commands that print them (`cat`, `less`, `more`, `head`, `tail`, `printenv`, `env`). A determined prompt injection (a Discord message, a web page the agent reads) can still run another command that reads a mounted file. Assume anything the container can read, an injected agent can read.
+- **What the container can read.** `config/` (including `config/.env`: the Discord bot tokens, the dashboard password and, if you set it, the Claude OAuth token), `agents/`, the data volume, and your `~/.claude` login, all writable. `AGENT_SERVER_TOKEN` is also passed to every agent process; see [the credentials section of ARCHITECTURE.md](docs/ARCHITECTURE.md#credentials).
+- **Network egress is allowed by default**, because agents browse and call APIs. To turn it off for every agent, add `"WebFetch"`, `"Bash(curl:*)"` and `"Bash(wget:*)"` to `permissions.deny`. Individual agents can also be limited with `disallowed_tools` in `config/agents.yaml`.
+- **Practical limits.** Run Karakos on a machine or VM that holds nothing else you care about; use a bot account dedicated to it and invite it only to channels you trust; set `OWNER_DISCORD_ID` so only you can answer asks and approve actions; keep the cost caps (`COST_DAILY_LIMIT`, `COST_MONTHLY_LIMIT`) on.
+- **Known gap.** `config/.env` still sits inside the tree the agents can see. Moving it out of the agent-visible tree is planned work because it changes the mounts and the setup paths.
+
+To loosen or tighten the default list, edit `permissions.deny` in `config/claude-settings.json`; `bin/hooks-sync.py` rewrites only the `hooks` section and leaves `permissions` alone.
 
 ---
 
