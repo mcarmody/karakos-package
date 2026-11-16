@@ -10,12 +10,14 @@ bash install.sh --native
 ```
 
 This clones the release, runs the same wizard as the Docker path (`./setup.sh --native`,
-which skips the Docker checks) and then `bin/native-install.sh`, which needs Python 3.11
-or newer, git, node and npm, the Claude CLI and a systemd user session. It creates
+which skips the Docker checks) and then `bin/native-install.sh`, which needs Python 3.11 or 3.12
+(not 3.13 yet), git, node and npm, the Claude CLI and a systemd user session. It creates
 `.venv`, builds the dashboard, runs `bin/native-bootstrap.sh` (the setup the container's
 entrypoint also runs, through the same script: schema stamp, data and inbox directories, hooks, slash commands),
 writes the units, enables linger and starts `karakos.target`. Re-running is safe.
 `--skip-dashboard` and `--no-start` are available on `bin/native-install.sh`.
+
+A host whose default `python3` is 3.13 (for example Debian 13) needs a separate 3.12 interpreter: install one with pyenv, uv or your distribution, then run `KARAKOS_PYTHON=/path/to/python3.12 bin/native-install.sh`. The installer stops before creating `.venv` when the interpreter is outside 3.11 to 3.12.
 
 ## Upgrade
 
