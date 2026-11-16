@@ -109,7 +109,14 @@ if ! command -v docker &>/dev/null; then
     else
         curl -fsSL https://get.docker.com | sh
         sudo usermod -aG docker "$USER"
-        warn "You may need to log out and back in for Docker permissions to take effect."
+        # The new group is not visible to this shell, so `docker` is refused until the
+        # user logs in again. Stop here with a clear instruction instead of failing the
+        # daemon check below with a misleading hint.
+        if ! docker info &>/dev/null 2>&1; then
+            warn "Docker is installed, and $USER was added to the docker group."
+            warn "That takes effect at your next login. Log out and back in (or reboot), then run this installer again."
+            exit 0
+        fi
     fi
 else
     log "Docker found: $(docker --version)"
