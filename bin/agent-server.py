@@ -989,6 +989,10 @@ async def start_agent_subprocess(shard: str):
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=spawn_env,
+            # One stream-json line carries a whole tool result; a parallel
+            # mail/Drive search exceeds asyncio's 64 KiB default and aborts the
+            # reader mid-turn, so replies land on the wrong turn.
+            limit=64 * 1024 * 1024,
         )
         agent_processes[shard] = proc
         agent_states[shard] = "IDLE"

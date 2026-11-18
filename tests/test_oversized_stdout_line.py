@@ -4,8 +4,6 @@ the reply has to be posted for the turn that produced it."""
 
 import asyncio
 
-import pytest
-
 from harness import Harness  # noqa: F401  (fixture plumbing lives in conftest)
 
 BIG = 200 * 1024
@@ -15,9 +13,6 @@ def run(coro):
     return asyncio.run(coro)
 
 
-@pytest.mark.xfail(
-    reason="agent server spawns claude without a stdout `limit=`; remove this "
-           "marker with the fix", strict=False)
 def test_oversized_line_does_not_desync_reply(harness):
     h = harness(agents=["a"])
 
