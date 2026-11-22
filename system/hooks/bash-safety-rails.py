@@ -149,7 +149,12 @@ def _check_git_push(argv, cwd):
 
     def to_branch(ref):
         dst = ref.lstrip("+").split(":")[-1]
-        return re.sub(r"^refs/heads/", "", dst)
+        dst = re.sub(r"^refs/heads/", "", dst)
+        if dst == "HEAD":
+            # `git push --force origin HEAD` pushes the current branch under its own name.
+            # A detached HEAD resolves to the literal "HEAD", which is not protected.
+            return _current_branch(cwd) or dst
+        return dst
 
     if refspecs:
         hit = any(to_branch(r) in _PROTECTED_BRANCHES for r in refspecs)
