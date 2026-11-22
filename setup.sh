@@ -604,7 +604,11 @@ EOF
     echo "  Setup Complete"
     echo "================================"
     echo
-    echo "Dashboard password: $DASHBOARD_PASSWORD"
+    if [ -t 1 ]; then
+        echo "Dashboard password: $DASHBOARD_PASSWORD"
+    else
+        echo "Dashboard password: not printed because output is not a terminal. It is DASHBOARD_PASSWORD in config/.env."
+    fi
     echo
     warn "Save this password! It's stored in config/.env"
     warn "NEVER commit config/.env to git!"
