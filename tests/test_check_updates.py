@@ -93,6 +93,7 @@ exit "$(cat "{poke_rc}")"
                f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{notify_log}"\n')
 
     release = tmp_path / "release.json"
+    tags_file = tmp_path / "tags.json"
 
     class World:
         root = tmp_path
@@ -107,6 +108,9 @@ exit "$(cat "{poke_rc}")"
         def publish_raw(self, text):
             release.write_text(text)
 
+        def publish_tags(self, *names):
+            tags_file.write_text(json.dumps([{"name": n} for n in names]))
+
         def break_poke(self):
             poke_rc.write_text("1")
 
@@ -117,6 +121,7 @@ exit "$(cat "{poke_rc}")"
                 "KARAKOS_NOTIFY_BIN_DIR": str(notify_dir),
                 "KARAKOS_UPDATE_STATE_FILE": str(self.state_file),
                 "KARAKOS_RELEASES_URL": url or f"file://{release}",
+                "KARAKOS_TAGS_URL": f"file://{tags_file}",
             }
             env.pop("KARAKOS_VERSION", None)
             env.update(envextra)
@@ -510,3 +515,57 @@ def test_the_scheduler_logs_a_failed_update_check():
 def test_the_script_is_executable():
     assert CHECK_UPDATES.exists()
     assert CHECK_UPDATES.stat().st_mode & stat.S_IXUSR
+
+
+# =============================================================================
+# 5. Git tags count as releases when the Releases API lags behind them
+# =============================================================================
+
+def test_a_newer_tag_than_the_newest_release_is_announced(world):
+    """Release objects are not created for every tag, so the Releases API can
+    name an older version than the newest vX.Y.Z tag that installs pull.
+    """
+    world.publish("v2.0.0")
+    world.publish_tags("v2.5.0", "v2.4.0", "v2.0.0", "v2.5")
+    r = world.run()
+
+    assert r.returncode == CHECKED, r.stdout + r.stderr
+    assert world.announced == "v2.5.0"
+    assert len(world.pokes) == 1
+    assert "v2.5.0" in world.pokes[0]
+
+
+def test_a_pinned_install_behind_the_newest_tag_is_told(world):
+    world.publish("v2.0.0")
+    world.publish_tags("v2.5.0")
+    r = world.run(KARAKOS_VERSION="v2.3")
+
+    assert r.returncode == CHECKED, r.stdout + r.stderr
+    assert world.announced == "v2.5.0"
+
+
+def test_tags_older_than_the_release_change_nothing(world):
+    world.publish("v2.5.0")
+    world.publish_tags("v2.4.0", "v2.3.1")
+    world.run()
+
+    assert world.announced == "v2.5.0"
+
+
+def test_an_unreadable_tags_source_is_ignored(world):
+    """No tags file is published, so the tags URL fails. The releases answer
+    stands on its own and the check still completes.
+    """
+    world.publish("v1.4")
+    r = world.run()
+
+    assert r.returncode == CHECKED, r.stdout + r.stderr
+    assert world.announced == "v1.4"
+
+
+def test_non_semver_tag_names_are_ignored(world):
+    world.publish("v2.0.0")
+    world.publish_tags("nightly", "v9", "v2.0.0-rc1")
+    world.run()
+
+    assert world.announced == "v2.0.0"
