@@ -206,3 +206,37 @@ def test_heavy_denied(cmd):
 ])
 def test_heavy_allowed(cmd):
     assert heavy.evaluate(cmd) is None, cmd
+
+
+# ---- force push of HEAD ------------------------------------------------
+
+def _repo_on(tmp_path, branch):
+    repo = tmp_path / "pushrepo"
+    repo.mkdir()
+    def git(*args):
+        subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.invalid", *args],
+                       check=True, capture_output=True)
+    git("init", "-b", "main")
+    git("commit", "--allow-empty", "-m", "x")
+    if branch != "main":
+        git("checkout", "-b", branch)
+    return repo
+
+
+@pytest.mark.parametrize("cmd", [
+    "git push --force origin HEAD", "git push -f origin HEAD", "git push --force origin +HEAD",
+])
+def test_force_push_of_head_on_main_is_denied(cmd, env, tmp_path):
+    repo = _repo_on(tmp_path, "main")
+    res = ev(cmd, env, repo)
+    assert res is not None and res[0] == "git-force-push-main"
+
+
+def test_force_push_of_head_on_a_feature_branch_is_allowed(env, tmp_path):
+    repo = _repo_on(tmp_path, "feature")
+    assert ev("git push --force origin HEAD", env, repo) is None
+
+
+def test_plain_push_of_head_on_main_is_not_a_force_push(env, tmp_path):
+    repo = _repo_on(tmp_path, "main")
+    assert ev("git push origin HEAD", env, repo) is None
