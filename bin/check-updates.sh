@@ -62,6 +62,9 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib/paths.sh"
 
 KARAKOS_REPO="${KARAKOS_REPO:-mcarmody/karakos-package}"
 RELEASES_URL="${KARAKOS_RELEASES_URL:-https://api.github.com/repos/${KARAKOS_REPO}/releases/latest}"
+# Tags API, read in addition to the releases API because Release objects are not
+# created for every tag. Overridable only so the tests can serve a local file.
+TAGS_URL="${KARAKOS_TAGS_URL:-https://api.github.com/repos/${KARAKOS_REPO}/tags?per_page=100}"
 
 # Overridable only so the tests can watch the real call happen against a
 # recording stand-in; the command name and arguments stay production ones.
@@ -162,6 +165,19 @@ fetch_latest_release() {
         "$RELEASES_URL" 2>/dev/null
 }
 
+# Highest vX.Y.Z tag in the tags API response, or nothing when it cannot be read.
+# Never fails the check: the releases API stays the primary source.
+fetch_newest_tag() {
+    local body
+    body=$(curl -sSf --max-time 20 \
+        -H 'Accept: application/vnd.github+json' \
+        "$TAGS_URL" 2>/dev/null) || return 0
+    { jq -r 'if type == "array" then .[] | (.name? // empty) | select(type == "string") else empty end' \
+        <<< "$body" 2>/dev/null || true; } \
+        | { grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true; } \
+        | sort -V | tail -n1
+}
+
 json_string() {
     local field="$2"
     jq -r --arg f "$field" \
@@ -190,6 +206,15 @@ run_check() {
     release_url=$(json_string "$latest_json" html_url)
     [[ -n "$release_url" ]] || \
         release_url="https://github.com/${KARAKOS_REPO}/releases/tag/${latest_tag}"
+
+    local newest_tag
+    newest_tag=$(fetch_newest_tag)
+    if [[ -n "$newest_tag" ]] && is_version "$latest_tag" \
+            && newer "$(strip_v "$newest_tag")" "$(strip_v "$latest_tag")"; then
+        log "newest tag $newest_tag is newer than the newest GitHub release $latest_tag; announcing the tag"
+        latest_tag="$newest_tag"
+        release_url="https://github.com/${KARAKOS_REPO}/releases/tag/${newest_tag}"
+    fi
 
     local pinned=false
     is_version "$current" && pinned=true
