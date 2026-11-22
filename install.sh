@@ -178,8 +178,14 @@ if [ -d "$INSTALL_DIR" ]; then
     fi
     REPLY=n
     if [ -z "$ANSWERS_FILE" ]; then
-        read -p "  Overwrite existing karakos install? (y/N) " -n 1 -r
-        echo
+        # Under `curl ... | bash` stdin is the script text, so ask on the terminal.
+        # With no terminal at all the answer stays "n": keep the existing install.
+        if (: < /dev/tty) 2>/dev/null; then
+            read -p "  Overwrite existing karakos install? (y/N) " -n 1 -r < /dev/tty || REPLY=n
+            echo
+        else
+            log "No terminal to ask on; keeping the existing installation."
+        fi
     fi
     if [[ $REPLY =~ ^[Yy]$ ]]; then
         rm -rf "$INSTALL_DIR"
